@@ -870,6 +870,16 @@ END;
         let yielding = to == TaskState::Pending
             && (task.state == TaskState::Running
                 || (task.state == TaskState::Pending && task.executor_affinity.is_some()));
+        if !yielding
+            && details
+                .as_ref()
+                .and_then(|details| details.get("checkpoint_handoff"))
+                .is_some_and(|handoff| !handoff.is_null())
+        {
+            return Err(StorageError::Invariant(
+                "checkpoint handoff requires a running or yielded pending task transitioning to pending".into(),
+            ));
+        }
         if yielding {
             if task.owner.as_deref() != Some(actor) {
                 return Err(StorageError::Invariant(ONLY_OWNER_MAY_TRANSITION.into()));
@@ -886,10 +896,9 @@ END;
                 .as_ref()
                 .ok_or_else(|| StorageError::Invariant("yield requires details.reason".into()))?;
             bounded_json(details)?;
-            let parsed: YieldDetails =
-                serde_json::from_value(details.clone()).map_err(|error| {
-                    StorageError::Invariant(format!("invalid yield details: {error}"))
-                })?;
+            let parsed: YieldDetails = YieldDetails::deserialize(details).map_err(|error| {
+                StorageError::Invariant(format!("invalid yield details: {error}"))
+            })?;
             if parsed.reason.trim().is_empty() {
                 return Err(StorageError::Invariant(
                     "yield requires non-empty details.reason".into(),
@@ -1861,6 +1870,92 @@ mod tests {
             .expect("yields");
         assert_eq!(resumed, 1);
         assert_eq!(yields, 2);
+    }
+
+    #[test]
+    fn yield_rejects_handoffs_outside_the_yield_path_without_mutation() {
+        for affine in [false, true] {
+            let (_dir, s) = store();
+            let task = task(&s);
+            let mut running = applied_task(
+                s.claim_task(&task.task_id, "worker-a", 0, Duration::minutes(1)).expect("claim"),
+            );
+            if affine {
+                let yielded = yield_task(&s, &running);
+                running = applied_task(
+                    s.claim_task(&task.task_id, "worker-a", yielded.revision, Duration::minutes(1))
+                        .expect("resume"),
+                );
+            }
+            let input = applied_task(
+                s.transition_task(
+                    &task.task_id,
+                    "worker-a",
+                    running.revision,
+                    TaskState::InputRequired,
+                    None,
+                )
+                .expect("human wait"),
+            );
+            let artifact = s
+                .put_artifact(&NewArtifact {
+                    task_id: task.task_id.clone(),
+                    created_by: "worker-a".into(),
+                    role: "checkpoint".into(),
+                    media_type: "application/json".into(),
+                    content: "{}".into(),
+                    idempotency_key: "handoff".into(),
+                })
+                .expect("checkpoint");
+            let details = serde_json::json!({"reason":"transfer", "checkpoint_handoff":{"executor":"worker-b","artifact_id":artifact.artifact_id}});
+            let conn = s.connection().expect("connection");
+            let before: i64 = conn
+                .query_row("SELECT count(*) FROM coordination_events", [], |r| r.get(0))
+                .expect("events");
+            for state in [TaskState::Pending, TaskState::Running, TaskState::Cancelled] {
+                let error = s
+                    .transition_task(
+                        &task.task_id,
+                        "worker-a",
+                        input.revision,
+                        state,
+                        Some(details.clone()),
+                    )
+                    .expect_err("unsupported handoff");
+                assert!(error.to_string().contains("checkpoint handoff requires"));
+                assert_eq!(s.get_task(&task.task_id).expect("get"), Some(input.clone()));
+            }
+            let after: i64 = conn
+                .query_row("SELECT count(*) FROM coordination_events", [], |r| r.get(0))
+                .expect("events");
+            assert_eq!(before, after, "rejected handoffs must not enter the audit trail");
+            let pending = applied_task(
+                s.transition_task(
+                    &task.task_id,
+                    "worker-a",
+                    input.revision,
+                    TaskState::Pending,
+                    Some(serde_json::json!({"checkpoint_handoff":null})),
+                )
+                .expect("ordinary transition still accepts null"),
+            );
+            let resumed = applied_task(
+                s.claim_task(&task.task_id, "worker-a", pending.revision, Duration::minutes(1))
+                    .expect("claim"),
+            );
+            let handed = applied_task(
+                s.transition_task(
+                    &task.task_id,
+                    "worker-a",
+                    resumed.revision,
+                    TaskState::Pending,
+                    Some(details),
+                )
+                .expect("handoff on supported path"),
+            );
+            assert_eq!(handed.owner.as_deref(), Some("worker-b"));
+            assert!(handed.lease_expires_at.is_none());
+        }
     }
 
     #[test]

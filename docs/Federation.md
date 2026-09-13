@@ -1054,7 +1054,9 @@ with `details: {"reason":"next stage"}`. This emits `task_yielded`; a subsequent
 claim by the assigned executor emits `task_resumed`. Affinity survives lease expiry.
 
 An optional `details.checkpoint_handoff` object contains string fields `executor`
-and `artifact_id`; null means no handoff. The artifact must have role `checkpoint`
+and `artifact_id`; null means no handoff. Non-null handoffs outside the yield
+path (running or affine pending to pending) return 400, including from
+`input_required`, without changing the task or recording a transition. The artifact must have role `checkpoint`
 and belong to the task. The current owner explicitly chooses the checkpoint and
 is responsible for its freshness and usability. The target must be the authenticated
 token identity or `token-name:worker-name` within the same token namespace. Bare

@@ -3610,6 +3610,21 @@ fn resolve_coordination_actor(
     }
 }
 
+/// Whether a fully qualified handoff target is reachable under this token.
+/// Reuse actor resolution so changes to its encoding also apply to handoffs.
+fn in_identity_namespace(identity: &str, candidate: &str) -> bool {
+    if candidate == identity {
+        return true;
+    }
+    let Some(claim) = candidate.strip_prefix(identity).and_then(|suffix| suffix.strip_prefix(':'))
+    else {
+        return false;
+    };
+    !claim.trim().is_empty()
+        && resolve_coordination_actor(identity, &Some(claim.to_owned()))
+            .is_ok_and(|resolved| resolved == candidate)
+}
+
 /// Resolves the acknowledging actor for `POST /v1/coordination/messages/{id}/ack`.
 /// See the module-level "Actor identity" note for why this cannot reuse
 /// [`resolve_coordination_actor`] unconditionally: storage requires the final
@@ -4054,15 +4069,10 @@ where
         .and_then(Value::as_str)
     {
         let identity = auth.0.0.as_str();
-        let same_namespace = executor == identity
-            || executor
-                .strip_prefix(identity)
-                .and_then(|suffix| suffix.strip_prefix(':'))
-                .is_some_and(|claim| !claim.trim().is_empty() && !claim.contains(':'));
-        if !same_namespace {
-            return Err(ServerError::InvalidParams(
-                "checkpoint_handoff.executor must be the authenticated identity or identity:worker in its namespace".into(),
-            ));
+        if !in_identity_namespace(identity, executor) {
+            return Err(ServerError::InvalidParams(format!(
+                "checkpoint_handoff.executor must be {identity} or {identity}:<worker> in the authenticated namespace",
+            )));
         }
     }
     let expected_revision = body.expected_revision;
@@ -10918,6 +10928,7 @@ mod tests {
                 json!({"expected_revision":1,"state":"pending","details":{"reason":"move","checkpoint_handoff":{"executor":executor,"artifact_id":artifact["artifact_id"]}}}),
             )).await.unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{executor}");
+            assert!(body_json(response).await.to_string().contains("coord_alpha:<worker>"));
         }
         // Same-token identities, including the bare token itself, are valid targets.
         for (revision, executor, actor) in

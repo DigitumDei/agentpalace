@@ -95,7 +95,9 @@ already yielded task to pending) with:
 }
 ```
 
-Pass that object as `details`. AgentPalace verifies the artifact exists, has the
+Pass that object as `details`. A non-null handoff on any transition outside the
+yield path is rejected, including `input_required → pending`; first return to
+pending and claim a live lease, then yield with the handoff. AgentPalace verifies the artifact exists, has the
 checkpoint role, and belongs to the same task, then atomically assigns owner and
 affinity to the target, releases the lease, and records
 `task_checkpoint_handed_off` with the reason and artifact reference. Only the
@@ -157,7 +159,7 @@ diary and unscoped wings before pagination; explicitly filtering an excluded
 wing returns an empty page, not 403. Local MCP reads use trusted visibility.
 
 Each `TaskListItem` contains `task_id`, `wing`, `state`, `revision`, `title`,
-`title_truncated`, `owner`, `executor_affinity`, `lease_expires_at`, `parent_id`, `dependency_count`,
+`title_truncated`, `owner`, `executor_affinity` (omitted when absent), `lease_expires_at`, `parent_id`, `dependency_count`,
 `created_by`, `created_at`, and `expires_at`. Title prefixes are limited to 1,024
 UTF-8 bytes without splitting a character. Description, budget and dependency
 IDs are omitted. A zero dependency count means no declared dependencies; a
