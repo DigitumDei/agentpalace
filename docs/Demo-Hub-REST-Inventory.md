@@ -1,6 +1,6 @@
 # Demo Hub: Canonical Remote REST Inventory and Implementation Contract
 
-**Document Version:** 1.1.10<br>
+**Document Version:** 1.1.11<br>
 **Release Series:** 0.2.0 (`release/version.toml`)<br>
 **Federation API Version:** 1 (`agentpalace_federation::FEDERATION_API_VERSION`)<br>
 **Status:** Approved Implementation Contract for AgentPalace #160 (parent issue #159)<br>
@@ -839,6 +839,7 @@ Implemented in `crates/agentpalace-core/src/provenance.rs`, the engine provides 
 
 ## 6. Document Revision and Verification History
 
+- **2026-09-17:** Version 1.1.11 pre-publication static verification for Issue #160. Reviewed the complete retained diff against `origin/main` for production-path coverage, test coverage, documentation consistency, dependency changes, provenance claims, formatting artifacts, and merge-conflict markers. Confirmed the router inventory still covers all 34 production method/path registrations and that no Cargo manifest or lockfile changes were introduced. `git diff --check` and targeted source/document searches passed. Compilation, Rust tests, `rustfmt`, and Clippy were not run because Rust commands are disabled by VM policy; GitHub CI remains the required authority for those checks. This evidence does not claim durable attribution is complete; that remains deferred to the storage slice, and issue #157 remains open.
 - **2026-09-17:** Version 1.1.10 updated for Issue #160. Reconciled provenance terminology and visibility with the implementation: the `TokenScopeEntry` type is module-private, while `AuthIdentity::new` and `AuthIdentity::scopes` are crate-private. Clarified immutable creator versus later submitters/modifiers, source attribution versus authenticated ownership, explicit legacy/unknown ownership, stable owner identity across credential rotation, and owner-scoped receipt/recovery behavior. Preserved implementation-accurate wire representations, validation limits, the complete 34-route inventory, and the statement that durable attribution remains deferred to the storage slice.
 - **2026-09-17:** Version 1.1.9 updated for Issue #160. Audited the 34 production method/path registrations in `build_router`, explicitly excluded test-only routes, `/mcp`, local-only diaries, and MCP-only operations, and documented that every numbered route retains privilege, durable store, idempotency/receipt behavior, recovery invariant, and provenance retrieval status. Unlisted method/path pairs remain outside the demo allowlist and fail closed.
 - **2026-09-17:** Version 1.1.8 updated for Issue #160. Reconciled published contract and implementation:
