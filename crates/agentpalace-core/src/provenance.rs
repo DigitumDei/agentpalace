@@ -2243,17 +2243,12 @@ impl<'de> Deserialize<'de> for ProvenanceEnvelope {
             envelope = envelope.with_actor(actor);
         }
         if let Some(op) = raw.operation_id {
-            let scoped = if op.owner_id().is_none() {
-                if let Some(owner_id) = envelope.owner.owner_id() {
-                    OwnerScopedKey::new(Some(owner_id.clone()), op.raw_key())
-                        .map_err(de::Error::custom)?
-                } else {
-                    op
-                }
-            } else {
-                op
-            };
-            envelope = envelope.with_operation_key(scoped).map_err(de::Error::custom)?;
+            // Do not infer authenticated ownership from an unscoped wire key.
+            // In particular, this keeps owner-less, `legacy:`, and `unknown:`
+            // keys ambiguous instead of fabricating an owner during restore.
+            // `with_operation_key` rejects that ambiguity for authenticated
+            // envelopes and preserves it for genuinely unknown owners.
+            envelope = envelope.with_operation_key(op).map_err(de::Error::custom)?;
         }
         if let Some(source_author) = raw.source_author {
             envelope = envelope.with_source_author(source_author);
@@ -2855,6 +2850,67 @@ mod tests {
             }
         }"#;
         assert!(serde_json::from_str::<ProvenanceEnvelope>(unknown_with_auth_op).is_err());
+    }
+
+    #[test]
+    fn authenticated_envelope_rejects_ambiguous_operation_keys() {
+        let owner = r#"{
+            "id": "usr_01J8Y",
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com"
+        }"#;
+
+        for operation_id in [
+            r#""op_ownerless""#,
+            r#""legacy:op_legacy""#,
+            r#""unknown:op_unknown""#,
+        ] {
+            let json = format!(
+                r#"{{
+                    "owner": {owner},
+                    "recorded_at": "2026-09-17T11:04:27Z",
+                    "origin": {{"kind": "local", "origin_id": "local"}},
+                    "operation_id": {operation_id}
+                }}"#
+            );
+            assert!(
+                serde_json::from_str::<ProvenanceEnvelope>(&json).is_err(),
+                "authenticated envelope must reject ambiguous operation key {operation_id}"
+            );
+        }
+
+        let ownerless_object = format!(
+            r#"{{
+                "owner": {owner},
+                "recorded_at": "2026-09-17T11:04:27Z",
+                "origin": {{"kind": "local", "origin_id": "local"}},
+                "operation_id": {{"raw_key": "op_ownerless"}}
+            }}"#
+        );
+        assert!(serde_json::from_str::<ProvenanceEnvelope>(&ownerless_object).is_err());
+    }
+
+    #[test]
+    fn unknown_envelope_preserves_ambiguous_operation_keys() {
+        for operation_id in [
+            r#""op_ownerless""#,
+            r#""legacy:op_legacy""#,
+            r#""unknown:op_unknown""#,
+        ] {
+            let json = format!(
+                r#"{{
+                    "owner": {{"status": "unknown"}},
+                    "recorded_at": "2026-09-17T11:04:27Z",
+                    "origin": {{"kind": "local", "origin_id": "local"}},
+                    "operation_id": {operation_id}
+                }}"#
+            );
+            let envelope: ProvenanceEnvelope = serde_json::from_str(&json).unwrap();
+            let key = envelope.operation_id().unwrap();
+            assert_eq!(key.owner_id(), None);
+            assert!(!key.is_authenticated());
+        }
     }
 
     #[test]
