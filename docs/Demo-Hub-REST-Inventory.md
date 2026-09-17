@@ -771,8 +771,39 @@ Under the Demo Hub design:
 3. **Legacy Preservation:** Standard static tokens without owner metadata continue to function identically to legacy installations. Ownership is marked explicitly as unknown (`None`), never fabricated.
 4. **Owner-Scoped Idempotency:** The downstream storage slice must update the receipt and idempotency indices so that deduplication keys are scoped to `(owner_id, operation_id)` or `(owner_id, created_by, idempotency_key)`. This guarantees that one user's retried requests cannot collide with or replay another user's operations.
 
+### 5.2 Shared Engine Provenance Value Types (`agentpalace-core::provenance`)
+
+Implemented in `crates/agentpalace-core/src/provenance.rs`, the engine provides provider-neutral domain types with bounded validation and explicit wire semantics:
+
+| Type | Bounds & Character Rules | Wire Representation / Notes |
+|---|---|---|
+| `OwnerId` | 1–128 chars; ASCII alphanumeric, `_`, `-`, `.` | Transparent string (e.g. `"usr_01J8Y..."`). Immutable across rotation. |
+| `Issuer` | 1–256 chars; printable ASCII (`33..=126`) | Transparent string (e.g. `"https://accounts.google.com"`). |
+| `Subject` | 1–256 chars; printable ASCII (`33..=126`) | Transparent string (e.g. `"104928190283019283019"`). |
+| `SubjectBinding` | Holds `(issuer, subject)` | Composite `{ "issuer": "...", "subject": "..." }`. |
+| `EmailAtWrite` | 3–254 chars; valid `local@domain` format | Transparent string (e.g. `"tester@example.com"`). Informational/audit only. |
+| `AuthenticatedOwner` / `OwnerMetadata` | Validated `(id, issuer, subject, email_at_write)` | Wire JSON: `{ "id": "...", "issuer": "...", "subject": "...", "email_at_write": "..." }`. |
+| `LegacyUnknownOwner` | Unit struct sentinel | Explicit unknown representation. |
+| `OwnerIdentity` | Enum: `Unknown` \| `Authenticated(AuthenticatedOwner)` | Serializes `Unknown` as `{ "status": "unknown" }` and `Authenticated` as the owner JSON. Deserializes both bare owner objects, tagged objects, and `null`. |
+| `AgentName` | 1–128 chars; ASCII alphanumeric, `_`, `-`, `.`, `/`, `:` | Transparent string (e.g. `"codex"`, `"agy"`). |
+| `AgentAssurance` | Enum: `CallerAsserted` | Wire string `"caller_asserted"`. |
+| `AgentAttribution` | `agent_name` + `assurance` | Wire JSON: `{ "agent_name": "codex", "assurance": "caller_asserted" }`. |
+| `SourceAuthor` | 1–256 chars; non-empty, trimmed, no ASCII control chars | Transparent string (e.g. `"Alice <alice@example.com>"`). Separate from submitting owner. |
+| `SourceReference` | 1–2048 chars; non-empty, trimmed, no ASCII control chars | Transparent string (e.g. `"crates/agentpalace-core/src/lib.rs"`). Max 128 references per envelope. |
+| `StorageOrigin` | Enum: `Local { origin_id }` \| `Federated { origin_id, original_record_id }` | Tagged wire JSON: `{ "kind": "local", "origin_id": "..." }` or `{ "kind": "federated", "origin_id": "...", "original_record_id": "..." }`. |
+| `RecordingTime` | Wrapped UTC `OffsetDateTime`, max 64 chars RFC 3339 | Formatted RFC 3339 UTC string (e.g. `"2026-09-17T11:04:27Z"`). |
+| `OwnerScopedKey` | Holds `(Option<OwnerId>, raw_key)` (raw key max 128 chars) | Generates scoped storage key `"{owner_id}:{raw_key}"` or `"legacy:{raw_key}"`. |
+| `ProvenanceEnvelope` | Full top-level metadata envelope | Unites owner, actor, recorded_at, origin, operation_id, source_author, and source_refs. |
+
+#### Invariants Enforced by Construction
+
+1. **Server-Assigned Provenance:** `reject_payload_owner_claim` explicitly errors if any writable request payload supplies an `owner` field.
+2. **First-Class Unknown Representation:** Legacy installations without owner metadata explicitly serialize as `{ "status": "unknown" }` or deserialize from `null` without fabricating identities.
+3. **Boundary Separation:** Evidence status (claim truth) and execution authority (roles/permissions) remain outside these types, preserving issue #157 separation.
+
 ---
 
 ## 6. Document Revision and Verification History
 
+- **2026-09-17:** Version 1.1.0 updated for Issue #160. Added §5.2 defining shared engine provenance value types in `crates/agentpalace-core/src/provenance.rs`.
 - **2026-09-17:** Version 1.0.0 published for Issue #160. Verified against `crates/agentpalace-server/src/lib.rs` (34 method/path pairs), `crates/agentpalace-federation/src/lib.rs` (wire DTOs), and `docs/Demo-Hub-Design.md`.
