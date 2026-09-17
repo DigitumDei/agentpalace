@@ -6528,7 +6528,7 @@ mod tests {
             Some("alice@domain.org")
         );
         assert_eq!(
-            auth_owned.subject_binding().map(|sb| sb.issuer.into_string()),
+            auth_owned.subject_binding().map(|sb| sb.issuer.to_string()),
             Some("https://accounts.google.com".to_string())
         );
 
