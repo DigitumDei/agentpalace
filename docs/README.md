@@ -32,6 +32,7 @@ see [Migration](Migration.md) before upgrading a MemPalace installation.
 - [Low-CPU Operator Guide](Operator-Low-CPU.md) — constrained environments
 - [Cloud Environment](Cloud-Environment.md) — building and testing in a cloud sandbox or CI runner
 - [Release Operations](Release-Operations.md) — signed candidate and stable release runbook
+- [Claude Review Diagnostics](Claude-Review-Diagnostics.md) — sanitized artifacts for investigating incomplete automated reviews
 - [Packaging And Validation](Packaging-And-Validation.md) — release artifacts and gate rows
 - [Deferred CLI Commands](rust-phase-plans/Phase09-Deferred-Commands.md) — rationale and boundary for `split` and `compress`
 
