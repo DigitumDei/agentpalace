@@ -1,6 +1,6 @@
 # Demo Hub: Canonical Remote REST Inventory and Implementation Contract
 
-**Document Version:** 1.0.0<br>
+**Document Version:** 1.1.9<br>
 **Release Series:** 0.2.0 (`release/version.toml`)<br>
 **Federation API Version:** 1 (`agentpalace_federation::FEDERATION_API_VERSION`)<br>
 **Status:** Approved Implementation Contract for AgentPalace #160 (parent issue #159)<br>
@@ -16,7 +16,7 @@ This document defines the canonical inventory of all remote REST operations expo
 ### 1.1 Strict Allowlist and Fail-Closed Policy
 
 The remote REST routes enumerated in this document constitute the **complete, closed allowlist** of remote operations supported by the AgentPalace server.
-- **Fail-closed rule:** Any HTTP method, path, or operation not explicitly listed in this inventory is **not demo-enabled** and must be rejected with `404 Not Found` or `403 Forbidden`.
+- **Fail-closed rule:** Any HTTP method, path, or operation not explicitly listed in this inventory is **not demo-enabled** and must be rejected rather than forwarded (normally `404 Not Found`; an unsupported method may surface as `405 Method Not Allowed`, and authorization failures as `403 Forbidden`).
 - **Gateway enforcement:** The Demo Hub gateway acts as an authenticating reverse proxy and must reject or fail closed on any request attempting to reach unlisted or unsupported paths before forwarding upstream.
 
 ### 1.2 Explicit Exclusions
@@ -124,6 +124,30 @@ The table below catalogs every current method/path pair registered in `build_rou
 | 32 | `POST` | `/v1/coordination/results` | `coordination_write` | B (Task wing) | `write`, `admin` | SQLite (`coordination_task_results`) | `(created_by, idempotency_key)` | Creator namespaced |
 | 33 | `GET` | `/v1/coordination/results/{id}` | `coordination_read` | B (Task wing) | `readonly`, `write`, `admin` | SQLite (`coordination_task_results`) | Naturally idempotent | Creator namespaced |
 | 34 | `GET` | `/v1/coordination/events` | `coordination_read` | C (Aggregate) | `readonly`, `write`, `admin` | SQLite (`coordination_events`) | Naturally idempotent | `actor` in event DTO |
+
+### 3.1 Route-registration audit
+
+This inventory was checked against the production `build_router` registration in
+`crates/agentpalace-server/src/lib.rs` on 2026-09-17. The audit found exactly 34
+production method/path pairs: 2 infrastructure/discovery, 6 drawer/search, 5
+knowledge-graph, 4 taxonomy/change-feed, 2 ingest, 6 coordination-task/lease,
+4 messaging/inbox, and 5 artifact/result/event routes. The two ingest routes are
+included even though they are assembled in their own body-limited sub-router.
+
+The `/test/*` routes registered only by test helpers are not production routes and
+are not part of this demo inventory. `/mcp` and all MCP-only operations are also
+outside the remote REST router. Consequently, a method/path pair absent from the
+34-row table is not demo-enabled, even if an internal handler or test helper exists
+for it; the gateway and server must fail closed rather than forward it (normally
+`404 Not Found`; unsupported methods may surface as `405 Method Not Allowed`).
+
+Each numbered route specification below preserves the same contract fields:
+operation privilege and scope authorization, request and retrieval surfaces,
+durable store, receipt/idempotency behavior, crash/recovery invariant, and the
+currently available versus deferred provenance retrieval path. This makes the
+summary table an allowlist and the detailed sections the implementation contract,
+including POST search, writes, batches, invalidation, deletion, ingest, and all
+coordination reads and mutations.
 
 ---
 
@@ -812,6 +836,7 @@ Implemented in `crates/agentpalace-core/src/provenance.rs`, the engine provides 
 
 ## 6. Document Revision and Verification History
 
+- **2026-09-17:** Version 1.1.9 updated for Issue #160. Audited the 34 production method/path registrations in `build_router`, explicitly excluded test-only routes, `/mcp`, local-only diaries, and MCP-only operations, and documented that every numbered route retains privilege, durable store, idempotency/receipt behavior, recovery invariant, and provenance retrieval status. Unlisted method/path pairs remain outside the demo allowlist and fail closed.
 - **2026-09-17:** Version 1.1.8 updated for Issue #160. Reconciled published contract and implementation:
   - Ensured `AuthenticatedOwnerContext::from_request_parts` extracts the coherent middleware-inserted `AuthenticatedOwnerContext` or derives all fields exclusively from `AuthIdentity`, preventing mismatched request extensions from cross-contaminating owner identities.
   - Added regression test suite (`mismatched_extensions_cannot_cross_contaminate_owner_context`) verifying mutual consistency across multi-owner contradictory extensions and legacy static tokens.
