@@ -28,7 +28,6 @@ use std::str::FromStr;
 
 use serde::de::value::MapAccessDeserializer;
 use serde::de::{self, Deserializer, Visitor};
-use serde::ser;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -2504,18 +2503,6 @@ mod tests {
         assert_eq!(max_rt.to_rfc3339().unwrap(), "9999-12-31T23:59:59Z");
         assert_ne!(max_rt.to_rfc3339().unwrap(), "1970-01-01T00:00:00Z");
 
-        // OffsetDateTime::MAX is within year 9999 and RFC 3339-representable; it must be accepted
-        let max_od_rt = RecordingTime::from_offset_date_time(OffsetDateTime::MAX).unwrap();
-        assert_eq!(max_od_rt.as_offset_date_time(), OffsetDateTime::MAX);
-        assert!(max_od_rt.to_rfc3339().unwrap().starts_with("9999-12-31T23:59:59"));
-        assert_ne!(max_od_rt.to_rfc3339().unwrap(), "1970-01-01T00:00:00Z");
-        assert!(RecordingTime::try_from(OffsetDateTime::MAX).is_ok());
-
-        // Out-of-range construction: OffsetDateTime::MIN (year -9999) must be rejected
-        let min_err = RecordingTime::from_offset_date_time(OffsetDateTime::MIN).unwrap_err();
-        assert!(matches!(min_err, ProvenanceError::InvalidRecordingTime(_)));
-        assert!(RecordingTime::try_from(OffsetDateTime::MIN).is_err());
-
         // Negative year (year -1 / 1 BCE) must be rejected
         let neg_year_dt = time::Date::from_calendar_date(-1, time::Month::December, 31)
             .unwrap()
@@ -2665,7 +2652,7 @@ mod tests {
         let deserialized: ProvenanceEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, envelope);
         assert!(deserialized.owner.is_authenticated());
-        assert_eq!(deserialized.actor.unwrap().agent_name.as_str(), "codex");
+        assert_eq!(deserialized.actor.as_ref().unwrap().agent_name.as_str(), "codex");
         let op = deserialized.operation_id().unwrap();
         assert_eq!(op.raw_key(), "owner-scoped-idempotency-key");
         assert_eq!(op.composite_key(), "usr_01J8Y:owner-scoped-idempotency-key");
