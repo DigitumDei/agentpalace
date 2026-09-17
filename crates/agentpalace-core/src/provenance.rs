@@ -133,6 +133,15 @@ pub enum ProvenanceError {
         /// Actual owner identifier or scope.
         actual: String,
     },
+
+    /// Identifier uses a reserved sentinel value.
+    #[error("{field} `{value}` is a reserved sentinel identifier and cannot be used for authenticated owners")]
+    ReservedIdentifier {
+        /// Name of the field.
+        field: &'static str,
+        /// Reserved value attempted.
+        value: String,
+    },
 }
 
 // ─── Owner identity and provider binding ─────────────────────────────────────
@@ -146,6 +155,13 @@ fn validate_owner_id(s: &str) -> Result<(), ProvenanceError> {
             field: "owner_id",
             len: s.len(),
             max: MAX_OWNER_ID_CHARS,
+        });
+    }
+    let s_lower = s.to_ascii_lowercase();
+    if matches!(s_lower.as_str(), "legacy" | "unknown" | "none" | "null") {
+        return Err(ProvenanceError::ReservedIdentifier {
+            field: "owner_id",
+            value: s.to_string(),
         });
     }
     for ch in s.chars() {
@@ -758,38 +774,60 @@ impl<'de> Deserialize<'de> for OwnerIdentity {
         match RawOwnerIdentityEnum::deserialize(deserializer)? {
             RawOwnerIdentityEnum::Null => Ok(Self::Unknown),
             RawOwnerIdentityEnum::Str(s) => {
-                if s == "unknown" || s == "legacy" {
+                let s_lower = s.to_ascii_lowercase();
+                if s_lower == "unknown" || s_lower == "legacy" {
                     Ok(Self::Unknown)
                 } else {
                     Err(de::Error::custom(format!(
-                        "unrecognized owner identity status string `{s}`"
+                        "unrecognized owner identity string `{s}`: expected 'unknown' or 'legacy'"
                     )))
                 }
             }
             RawOwnerIdentityEnum::Object(raw) => {
-                if let Some(status) = raw.status.as_deref() {
-                    if status == "unknown" || status == "legacy" {
-                        return Ok(Self::Unknown);
+                let has_any_auth = raw.id.is_some()
+                    || raw.issuer.is_some()
+                    || raw.subject.is_some()
+                    || raw.email_at_write.is_some();
+                let full_auth = match (raw.id, raw.issuer, raw.subject, raw.email_at_write) {
+                    (Some(id), Some(issuer), Some(subject), Some(email)) => {
+                        Some(AuthenticatedOwner::new(id, issuer, subject, email))
                     }
-                }
-                if let (Some(id), Some(issuer), Some(subject), Some(email_at_write)) = (
-                    raw.id,
-                    raw.issuer,
-                    raw.subject,
-                    raw.email_at_write,
-                ) {
-                    Ok(Self::Authenticated(AuthenticatedOwner::new(
-                        id,
-                        issuer,
-                        subject,
-                        email_at_write,
-                    )))
-                } else if raw.status.as_deref() == Some("unknown") {
-                    Ok(Self::Unknown)
-                } else {
-                    Err(de::Error::custom(
-                        "invalid owner identity: expected {status: \"unknown\"} or authenticated owner object with id, issuer, subject, email_at_write",
-                    ))
+                    _ => None,
+                };
+
+                match raw.status.as_deref() {
+                    Some(status) => {
+                        let status_lower = status.to_ascii_lowercase();
+                        match status_lower.as_str() {
+                            "unknown" | "legacy" => {
+                                if has_any_auth {
+                                    Err(de::Error::custom(format!(
+                                        "contradictory owner identity: status '{status}' cannot be combined with authenticated owner fields (id, issuer, subject, email_at_write)"
+                                    )))
+                                } else {
+                                    Ok(Self::Unknown)
+                                }
+                            }
+                            "authenticated" => match full_auth {
+                                Some(owner) => Ok(Self::Authenticated(owner)),
+                                None => Err(de::Error::custom(
+                                    "incomplete authenticated owner: status 'authenticated' requires all fields: id, issuer, subject, email_at_write",
+                                )),
+                            },
+                            _ => Err(de::Error::custom(format!(
+                                "unrecognized owner identity status '{status}': expected 'unknown', 'legacy', or 'authenticated'"
+                            ))),
+                        }
+                    }
+                    None => match full_auth {
+                        Some(owner) => Ok(Self::Authenticated(owner)),
+                        None if has_any_auth => Err(de::Error::custom(
+                            "incomplete owner identity: authenticated owner object requires all fields: id, issuer, subject, email_at_write",
+                        )),
+                        None => Err(de::Error::custom(
+                            "invalid owner identity: expected {status: \"unknown\"} or authenticated owner object with id, issuer, subject, email_at_write",
+                        )),
+                    },
                 }
             }
         }
@@ -1449,6 +1487,10 @@ impl OwnerScopedKey {
     ///
     /// If an owner is present: `"{owner_id}:{raw_key}"`.
     /// For legacy/unknown owners: `"legacy:{raw_key}"`.
+    ///
+    /// Because sentinel identifiers (`legacy`, `unknown`, `none`, `null`) are
+    /// strictly reserved and rejected as authenticated [`OwnerId`] values, the
+    /// `"legacy:"` prefix is unambiguous and collision-free.
     pub fn composite_key(&self) -> String {
         match &self.owner_id {
             Some(owner) => format!("{}:{}", owner.as_str(), self.raw_key),
@@ -1471,7 +1513,8 @@ impl FromStr for OwnerScopedKey {
             return Err(ProvenanceError::EmptyField { field: "raw_key" });
         }
         if let Some((prefix, rest)) = trimmed.split_once(':') {
-            if prefix == "legacy" {
+            let prefix_lower = prefix.to_ascii_lowercase();
+            if prefix_lower == "legacy" || prefix_lower == "unknown" {
                 Self::new(None, rest)
             } else {
                 let owner = OwnerId::new(prefix)?;
@@ -2201,6 +2244,167 @@ mod tests {
         assert!(matches!(
             envelope.with_operation_id("a".repeat(MAX_OPERATION_ID_CHARS + 1)),
             Err(ProvenanceError::ValueTooLong { field: "raw_key", .. })
+        ));
+    }
+
+    #[test]
+    fn negative_owner_id_sentinel_rejection() {
+        for sentinel in &["legacy", "unknown", "none", "null", "LEGACY", "UNKNOWN", "None", "Null"] {
+            assert!(matches!(
+                OwnerId::new(*sentinel),
+                Err(ProvenanceError::ReservedIdentifier { field: "owner_id", .. })
+            ));
+            assert!(OwnerId::from_str(sentinel).is_err());
+            let json = format!(r#""{sentinel}""#);
+            assert!(serde_json::from_str::<OwnerId>(&json).is_err());
+        }
+    }
+
+    #[test]
+    fn owner_scoped_key_collision_tests() {
+        // Unknown owner with key "x" produces composite key "legacy:x"
+        let unknown_key = OwnerScopedKey::new(None, "x").unwrap();
+        assert_eq!(unknown_key.composite_key(), "legacy:x");
+
+        // Authenticated owner with key "x" produces "{owner_id}:x"
+        let auth_id = OwnerId::new("usr_01J8Y").unwrap();
+        let auth_key = OwnerScopedKey::new(Some(auth_id.clone()), "x").unwrap();
+        assert_eq!(auth_key.composite_key(), "usr_01J8Y:x");
+
+        // They can never collide
+        assert_ne!(unknown_key.composite_key(), auth_key.composite_key());
+
+        // Sentinel owner IDs cannot be created to forge legacy keys
+        assert!(OwnerId::new("legacy").is_err());
+        assert!(OwnerId::new("unknown").is_err());
+
+        // Both legacy and unknown string prefixes parse cleanly to None owner_id
+        let from_legacy_str: OwnerScopedKey = serde_json::from_str(r#""legacy:x""#).unwrap();
+        assert_eq!(from_legacy_str.owner_id(), None);
+        assert_eq!(from_legacy_str.raw_key(), "x");
+
+        let from_unknown_str: OwnerScopedKey = serde_json::from_str(r#""unknown:x""#).unwrap();
+        assert_eq!(from_unknown_str.owner_id(), None);
+        assert_eq!(from_unknown_str.raw_key(), "x");
+
+        let from_legacy_upper: OwnerScopedKey = serde_json::from_str(r#""LEGACY:x""#).unwrap();
+        assert_eq!(from_legacy_upper.owner_id(), None);
+        assert_eq!(from_legacy_upper.raw_key(), "x");
+
+        // Authenticated scoped string parses to Some(owner_id)
+        let from_auth_str: OwnerScopedKey = serde_json::from_str(r#""usr_01J8Y:x""#).unwrap();
+        assert_eq!(from_auth_str.owner_id(), Some(&auth_id));
+        assert_eq!(from_auth_str.raw_key(), "x");
+
+        // Deserializing struct with sentinel owner_id must be rejected
+        assert!(serde_json::from_str::<OwnerScopedKey>(r#"{"owner_id":"legacy","raw_key":"x"}"#).is_err());
+        assert!(serde_json::from_str::<OwnerScopedKey>(r#"{"owner_id":"unknown","raw_key":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn negative_owner_identity_deserialization_tests() {
+        // 1. Unknown / unrecognized status values must be rejected even when all fields exist
+        let bogus_status_with_fields = r#"{
+            "status": "some_bogus_status",
+            "id": "usr_01J8Y",
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com"
+        }"#;
+        assert!(serde_json::from_str::<OwnerIdentity>(bogus_status_with_fields).is_err());
+
+        assert!(serde_json::from_str::<OwnerIdentity>(r#"{"status":"active"}"#).is_err());
+        assert!(serde_json::from_str::<OwnerIdentity>(r#"{"status":"verified"}"#).is_err());
+        assert!(serde_json::from_str::<OwnerIdentity>(r#""some_bogus_status""#).is_err());
+
+        // 2. Contradictory object shapes: status "unknown" or "legacy" with authenticated fields must be rejected
+        assert!(serde_json::from_str::<OwnerIdentity>(
+            r#"{"status":"unknown","id":"usr_01J8Y"}"#
+        ).is_err());
+
+        assert!(serde_json::from_str::<OwnerIdentity>(
+            r#"{"status":"unknown","issuer":"https://accounts.google.com"}"#
+        ).is_err());
+
+        assert!(serde_json::from_str::<OwnerIdentity>(
+            r#"{"status":"unknown","subject":"104928190283019283019"}"#
+        ).is_err());
+
+        assert!(serde_json::from_str::<OwnerIdentity>(
+            r#"{"status":"unknown","email_at_write":"tester@example.com"}"#
+        ).is_err());
+
+        let unknown_with_all = r#"{
+            "status": "unknown",
+            "id": "usr_01J8Y",
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com"
+        }"#;
+        assert!(serde_json::from_str::<OwnerIdentity>(unknown_with_all).is_err());
+
+        let legacy_with_all = r#"{
+            "status": "legacy",
+            "id": "usr_01J8Y",
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com"
+        }"#;
+        assert!(serde_json::from_str::<OwnerIdentity>(legacy_with_all).is_err());
+
+        // 3. Incomplete authenticated shapes must be rejected
+        assert!(serde_json::from_str::<OwnerIdentity>(
+            r#"{"status":"authenticated","id":"usr_01J8Y"}"#
+        ).is_err());
+        assert!(serde_json::from_str::<OwnerIdentity>(
+            r#"{"status":"authenticated"}"#
+        ).is_err());
+        assert!(serde_json::from_str::<OwnerIdentity>(
+            r#"{"id":"usr_01J8Y"}"#
+        ).is_err());
+        assert!(serde_json::from_str::<OwnerIdentity>("{}").is_err());
+        assert!(serde_json::from_str::<OwnerIdentity>(r#""""#).is_err());
+
+        // 4. Positive fail-closed compatibility checks
+        assert_eq!(
+            serde_json::from_str::<OwnerIdentity>(r#"{"status":"legacy"}"#).unwrap(),
+            OwnerIdentity::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<OwnerIdentity>(r#"{"status":"UNKNOWN"}"#).unwrap(),
+            OwnerIdentity::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<OwnerIdentity>(r#"{"status":"LEGACY"}"#).unwrap(),
+            OwnerIdentity::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<OwnerIdentity>(r#""unknown""#).unwrap(),
+            OwnerIdentity::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<OwnerIdentity>(r#""legacy""#).unwrap(),
+            OwnerIdentity::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<OwnerIdentity>(r#""UNKNOWN""#).unwrap(),
+            OwnerIdentity::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<OwnerIdentity>(r#""LEGACY""#).unwrap(),
+            OwnerIdentity::Unknown
+        );
+
+        let tagged_upper = r#"{
+            "status": "AUTHENTICATED",
+            "id": "usr_01J8Y",
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com"
+        }"#;
+        assert!(matches!(
+            serde_json::from_str::<OwnerIdentity>(tagged_upper).unwrap(),
+            OwnerIdentity::Authenticated(_)
         ));
     }
 }

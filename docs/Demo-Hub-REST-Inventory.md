@@ -777,14 +777,14 @@ Implemented in `crates/agentpalace-core/src/provenance.rs`, the engine provides 
 
 | Type | Bounds & Character Rules | Wire Representation / Notes |
 |---|---|---|
-| `OwnerId` | 1–128 chars; ASCII alphanumeric, `_`, `-`, `.` | Transparent string (e.g. `"usr_01J8Y..."`). Immutable across rotation. |
+| `OwnerId` | 1–128 chars; ASCII alphanumeric, `_`, `-`, `.`; rejects reserved sentinels (`legacy`, `unknown`, `none`, `null`) | Transparent string (e.g. `"usr_01J8Y..."`). Immutable across rotation. Guaranteed collision-free with legacy scopes. |
 | `Issuer` | 1–256 chars; printable ASCII (`33..=126`) | Transparent string (e.g. `"https://accounts.google.com"`). |
 | `Subject` | 1–256 chars; printable ASCII (`33..=126`) | Transparent string (e.g. `"104928190283019283019"`). |
 | `SubjectBinding` | Holds `(issuer, subject)` | Composite `{ "issuer": "...", "subject": "..." }`. |
 | `EmailAtWrite` | 3–254 chars; valid `local@domain` format | Transparent string (e.g. `"tester@example.com"`). Informational/audit only. |
 | `AuthenticatedOwner` / `OwnerMetadata` | Validated `(id, issuer, subject, email_at_write)` | Wire JSON: `{ "id": "...", "issuer": "...", "subject": "...", "email_at_write": "..." }`. |
 | `LegacyUnknownOwner` | Unit struct sentinel | Explicit unknown representation. |
-| `OwnerIdentity` | Enum: `Unknown` \| `Authenticated(AuthenticatedOwner)` | Serializes `Unknown` as `{ "status": "unknown" }` and `Authenticated` as the owner JSON. Deserializes both bare owner objects, tagged objects, and `null`. |
+| `OwnerIdentity` | Enum: `Unknown` \| `Authenticated(AuthenticatedOwner)` | Serializes `Unknown` as `{ "status": "unknown" }` and `Authenticated` as the owner JSON. Fail-closed deserialization: rejects unknown `status` values, rejects contradictory shapes (`status: "unknown"` with authenticated owner fields), and requires all four fields (`id`, `issuer`, `subject`, `email_at_write`) for authenticated owners. Accepts bare owner objects, tagged objects, explicit strings `"unknown"`/`"legacy"`, and `null`. |
 | `AgentName` | 1–128 chars; ASCII alphanumeric, `_`, `-`, `.`, `/`, `:` | Transparent string (e.g. `"codex"`, `"agy"`). |
 | `AgentAssurance` | Enum: `CallerAsserted` | Wire string `"caller_asserted"`. |
 | `AgentAttribution` | `agent_name` + `assurance` | Wire JSON: `{ "agent_name": "codex", "assurance": "caller_asserted" }`. |
@@ -792,7 +792,7 @@ Implemented in `crates/agentpalace-core/src/provenance.rs`, the engine provides 
 | `SourceReference` | 1–2048 chars; non-empty, trimmed, no ASCII control chars | Transparent string (e.g. `"crates/agentpalace-core/src/lib.rs"`). Max 128 references per envelope. |
 | `StorageOrigin` | Enum: `Local { origin_id }` \| `Federated { origin_id, original_record_id }` | Tagged wire JSON: `{ "kind": "local", "origin_id": "..." }` or `{ "kind": "federated", "origin_id": "...", "original_record_id": "..." }`. |
 | `RecordingTime` | Wrapped UTC `OffsetDateTime`, max 64 chars RFC 3339 | Formatted RFC 3339 UTC string (e.g. `"2026-09-17T11:04:27Z"`). |
-| `OwnerScopedKey` | Holds `(Option<OwnerId>, raw_key)` (raw key max 128 chars, non-empty, trimmed) | Scoped storage key `"{owner_id}:{raw_key}"` or `"legacy:{raw_key}"`. Validates non-empty normalization and bounded length on both construction and deserialization. |
+| `OwnerScopedKey` | Holds `(Option<OwnerId>, raw_key)` (raw key max 128 chars, non-empty, trimmed) | Scoped storage key `"{owner_id}:{raw_key}"` or `"legacy:{raw_key}"`. Unambiguous and collision-free due to reserved sentinel owner IDs. Validates non-empty normalization and bounded length on both construction and deserialization. |
 | `ProvenanceEnvelope` | Full top-level metadata envelope | Unites owner, actor, recorded_at, origin, operation_id (`Option<OwnerScopedKey>`), source_author, and source_refs (max 128). Enforces owner-scoping alignment and bounded validation on deserialization. |
 
 #### Invariants Enforced by Construction
@@ -802,11 +802,13 @@ Implemented in `crates/agentpalace-core/src/provenance.rs`, the engine provides 
 3. **Owner-Scoped Operation Identity:** `ProvenanceEnvelope::operation_id` uses the validated `OwnerScopedKey` type. The builder `with_operation_id` normalizes non-empty raw keys and automatically binds them to the envelope's owner. Deserialization validates that any explicit `operation_id.owner_id` strictly matches the envelope's `owner`.
 4. **First-Class Unknown Representation:** Legacy installations without owner metadata explicitly serialize as `{ "status": "unknown" }` or deserialize from `null` without fabricating identities. Deserialization uses provider-neutral Serde visitors/helpers without runtime dependencies on format-specific libraries in core domain logic.
 5. **Boundary Separation:** Evidence status (claim truth) and execution authority (roles/permissions) remain outside these types, preserving issue #157 separation.
+6. **Collision-Resistant Owner Scoping:** Sentinel identifiers (`legacy`, `unknown`, `none`, `null`) are strictly reserved and rejected by `validate_owner_id`. This guarantees that `OwnerScopedKey::composite_key()` never produces colliding keys between authenticated owners and legacy/unknown scopes.
 
 ---
 
 ## 6. Document Revision and Verification History
 
+- **2026-09-17:** Version 1.1.2 updated for Issue #160. Hardened `OwnerIdentity` deserialization to fail-closed against unknown status values and contradictory object shapes; reserved sentinel owner IDs (`legacy`, `unknown`, `none`, `null`) to guarantee collision-free `OwnerScopedKey::composite_key()` storage indexing; removed `serde_json` from non-test crate dependencies; added exhaustive negative and collision unit tests.
 - **2026-09-17:** Version 1.1.1 updated for Issue #160. Added validating Serde deserialization across all domain types, enforced owner-scoped operation ID contracts on `ProvenanceEnvelope`, added negative wire-format test coverage, and eliminated library runtime dependencies on `serde_json`.
 - **2026-09-17:** Version 1.1.0 updated for Issue #160. Added §5.2 defining shared engine provenance value types in `crates/agentpalace-core/src/provenance.rs`.
 - **2026-09-17:** Version 1.0.0 published for Issue #160. Verified against `crates/agentpalace-server/src/lib.rs` (34 method/path pairs), `crates/agentpalace-federation/src/lib.rs` (wire DTOs), and `docs/Demo-Hub-Design.md`.
