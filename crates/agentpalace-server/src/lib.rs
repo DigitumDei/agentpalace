@@ -1047,23 +1047,17 @@ where
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> std::result::Result<Self, Self::Rejection> {
+        if let Some(ctx) = parts.extensions.get::<AuthenticatedOwnerContext>() {
+            return Ok(ctx.clone());
+        }
+
         let identity = parts
             .extensions
             .get::<AuthIdentity>()
             .cloned()
             .ok_or(ServerError::Unauthorized)?;
-        let owner_identity = parts
-            .extensions
-            .get::<OwnerIdentity>()
-            .cloned()
-            .ok_or(ServerError::Unauthorized)?;
-        let owner_metadata = parts.extensions.get::<OwnerMetadata>().cloned();
 
-        Ok(Self {
-            identity,
-            owner_identity,
-            owner_metadata,
-        })
+        Ok(Self::from_identity(identity))
     }
 }
 
@@ -6244,6 +6238,127 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(info_resp2.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mismatched_extensions_cannot_cross_contaminate_owner_context() {
+        use axum::extract::FromRequestParts;
+
+        // Construct two distinct owners
+        let owner_alice = OwnerMetadata::parse(
+            "usr_01J8Y_ALICE_LEGIT",
+            "https://accounts.google.com",
+            "sub_alice",
+            "alice@example.com",
+        )
+        .unwrap();
+
+        let owner_mallory = OwnerMetadata::parse(
+            "usr_01J8Y_MALLORY_ATTACKER",
+            "https://accounts.google.com",
+            "sub_mallory",
+            "mallory@example.com",
+        )
+        .unwrap();
+
+        // 1. When a coherent AuthenticatedOwnerContext is present in extensions,
+        // it cannot be subverted even if conflicting AuthIdentity, OwnerIdentity,
+        // or OwnerMetadata extensions are present.
+        let coherent_ctx =
+            AuthenticatedOwnerContext::from_identity(AuthIdentity::with_owner("alice", owner_alice.clone()));
+
+        let mut req_coherent = Request::builder()
+            .uri("/dummy")
+            .body(Body::empty())
+            .unwrap();
+        // Insert legitimate context
+        req_coherent.extensions_mut().insert(coherent_ctx);
+        // Attacker attempts to pollute extensions with Mallory's credentials
+        req_coherent.extensions_mut().insert(AuthIdentity::with_owner("mallory", owner_mallory.clone()));
+        req_coherent.extensions_mut().insert(OwnerIdentity::Authenticated(owner_mallory.clone()));
+        req_coherent.extensions_mut().insert(owner_mallory.clone());
+
+        let (mut parts_coherent, _) = req_coherent.into_parts();
+        let extracted_coherent = AuthenticatedOwnerContext::from_request_parts(&mut parts_coherent, &())
+            .await
+            .unwrap();
+
+        assert_eq!(extracted_coherent.name(), "alice");
+        assert_eq!(
+            extracted_coherent.owner_id().map(|id| id.as_str()),
+            Some("usr_01J8Y_ALICE_LEGIT")
+        );
+        let key_coherent = extracted_coherent.owner_scoped_key("op_1").unwrap();
+        assert_eq!(key_coherent.composite_key(), "usr_01J8Y_ALICE_LEGIT:op_1");
+
+        // 2. When AuthenticatedOwnerContext extension is absent, the extractor derives
+        // the context exclusively from the single AuthIdentity extension, completely ignoring
+        // conflicting standalone OwnerIdentity and OwnerMetadata extensions.
+        let mut req_derived = Request::builder()
+            .uri("/dummy")
+            .body(Body::empty())
+            .unwrap();
+        // Authenticated token identity is Alice
+        req_derived.extensions_mut().insert(AuthIdentity::with_owner("alice", owner_alice.clone()));
+        // Standalone extensions are maliciously set or mismatched to Mallory
+        req_derived.extensions_mut().insert(OwnerIdentity::Authenticated(owner_mallory.clone()));
+        req_derived.extensions_mut().insert(owner_mallory.clone());
+
+        let (mut parts_derived, _) = req_derived.into_parts();
+        let extracted_derived = AuthenticatedOwnerContext::from_request_parts(&mut parts_derived, &())
+            .await
+            .unwrap();
+
+        // Extracted context remains Alice across all accessors and scoped keys
+        assert_eq!(extracted_derived.name(), "alice");
+        assert_eq!(
+            extracted_derived.owner_id().map(|id| id.as_str()),
+            Some("usr_01J8Y_ALICE_LEGIT")
+        );
+        assert_eq!(
+            extracted_derived.issuer().map(|i| i.as_str()),
+            Some("https://accounts.google.com")
+        );
+        assert_eq!(
+            extracted_derived.subject().map(|s| s.as_str()),
+            Some("sub_alice")
+        );
+        assert_eq!(
+            extracted_derived.email_at_write().map(|e| e.as_str()),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            *extracted_derived.owner_identity(),
+            OwnerIdentity::Authenticated(owner_alice.clone())
+        );
+
+        let key_derived = extracted_derived.owner_scoped_key("op_2").unwrap();
+        assert_eq!(key_derived.composite_key(), "usr_01J8Y_ALICE_LEGIT:op_2");
+        assert_ne!(key_derived.composite_key(), "usr_01J8Y_MALLORY_ATTACKER:op_2");
+
+        // 3. Static legacy token: conflicting OwnerIdentity or OwnerMetadata extensions
+        // cannot cause a static token to claim authenticated ownership.
+        let mut req_static = Request::builder()
+            .uri("/dummy")
+            .body(Body::empty())
+            .unwrap();
+        req_static.extensions_mut().insert(AuthIdentity::unrestricted("static_service"));
+        req_static.extensions_mut().insert(OwnerIdentity::Authenticated(owner_mallory.clone()));
+        req_static.extensions_mut().insert(owner_mallory.clone());
+
+        let (mut parts_static, _) = req_static.into_parts();
+        let extracted_static = AuthenticatedOwnerContext::from_request_parts(&mut parts_static, &())
+            .await
+            .unwrap();
+
+        assert_eq!(extracted_static.name(), "static_service");
+        assert_eq!(*extracted_static.owner_identity(), OwnerIdentity::Unknown);
+        assert!(!extracted_static.has_owner());
+        assert_eq!(extracted_static.owner_id(), None);
+        assert_eq!(extracted_static.owner(), None);
+        let key_static = extracted_static.owner_scoped_key("op_3").unwrap();
+        assert_eq!(key_static.composite_key(), "legacy:op_3");
+        assert!(key_static.is_legacy());
     }
 
     #[tokio::test]
