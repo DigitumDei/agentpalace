@@ -35,6 +35,11 @@ see [Migration](Migration.md) before upgrading a MemPalace installation.
 - [Packaging And Validation](Packaging-And-Validation.md) — release artifacts and gate rows
 - [Deferred CLI Commands](rust-phase-plans/Phase09-Deferred-Commands.md) — rationale and boundary for `split` and `compress`
 
+### Proposals
+
+- [Demo Hub Design](Demo-Hub-Design.md) — proposed local Docker learning demo with Google login, email roles, and owner provenance; not implemented
+- [Demo Hub Google Setup](Demo-Hub-Google-Setup.md) — tester-owned OAuth preparation for the proposed localhost example
+
 ### Historical
 
 - [Validation Evidence](Validation-Evidence.md) — a dated record of one validation pass, kept as evidence rather than as current reference
