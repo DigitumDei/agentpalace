@@ -777,7 +777,7 @@ pub struct AuthIdentity(
 
 impl AuthIdentity {
     /// Create a new `AuthIdentity` with optional scopes and optional owner metadata.
-    pub fn new(
+    pub(crate) fn new(
         name: impl Into<String>,
         scopes: Option<Vec<TokenScopeEntry>>,
         owner: Option<OwnerMetadata>,
@@ -806,7 +806,7 @@ impl AuthIdentity {
     }
 
     /// View resolved token scope entries, or `None` if unrestricted.
-    pub fn scopes(&self) -> Option<&[TokenScopeEntry]> {
+    pub(crate) fn scopes(&self) -> Option<&[TokenScopeEntry]> {
         self.1.as_deref()
     }
 
