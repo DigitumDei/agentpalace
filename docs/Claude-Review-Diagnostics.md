@@ -26,8 +26,14 @@ publishing raw data. Force-cancelled jobs may not get to run their cleanup steps
 
 The artifact is retained for seven days. Full execution output stays disabled.
 The workflow does not broaden Claude's tool permissions to collect diagnostics.
-A later retry runs against the workflow available to that run; pushing this
-workflow change to an open PR triggers a fresh review with capture enabled.
+The action's workflow validation requires the review workflow to match the
+repository's default branch. A PR that changes this workflow triggers a run,
+but Claude skips its review until the same workflow is on the default branch.
+The capture/upload steps still run; the artifact reports file_missing when
+the skipped action did not create an execution file. Check the action log for
+the workflow-validation warning, even if the job is green.
+
+After the workflow change lands, retry a run that includes the capture steps.
 Re-running an older workflow alone does not add these steps.
 
 Local verification:
