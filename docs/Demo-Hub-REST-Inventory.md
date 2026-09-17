@@ -792,18 +792,21 @@ Implemented in `crates/agentpalace-core/src/provenance.rs`, the engine provides 
 | `SourceReference` | 1–2048 chars; non-empty, trimmed, no ASCII control chars | Transparent string (e.g. `"crates/agentpalace-core/src/lib.rs"`). Max 128 references per envelope. |
 | `StorageOrigin` | Enum: `Local { origin_id }` \| `Federated { origin_id, original_record_id }` | Tagged wire JSON: `{ "kind": "local", "origin_id": "..." }` or `{ "kind": "federated", "origin_id": "...", "original_record_id": "..." }`. |
 | `RecordingTime` | Wrapped UTC `OffsetDateTime`, max 64 chars RFC 3339 | Formatted RFC 3339 UTC string (e.g. `"2026-09-17T11:04:27Z"`). |
-| `OwnerScopedKey` | Holds `(Option<OwnerId>, raw_key)` (raw key max 128 chars) | Generates scoped storage key `"{owner_id}:{raw_key}"` or `"legacy:{raw_key}"`. |
-| `ProvenanceEnvelope` | Full top-level metadata envelope | Unites owner, actor, recorded_at, origin, operation_id, source_author, and source_refs. |
+| `OwnerScopedKey` | Holds `(Option<OwnerId>, raw_key)` (raw key max 128 chars, non-empty, trimmed) | Scoped storage key `"{owner_id}:{raw_key}"` or `"legacy:{raw_key}"`. Validates non-empty normalization and bounded length on both construction and deserialization. |
+| `ProvenanceEnvelope` | Full top-level metadata envelope | Unites owner, actor, recorded_at, origin, operation_id (`Option<OwnerScopedKey>`), source_author, and source_refs (max 128). Enforces owner-scoping alignment and bounded validation on deserialization. |
 
 #### Invariants Enforced by Construction
 
 1. **Server-Assigned Provenance:** `reject_payload_owner_claim` explicitly errors if any writable request payload supplies an `owner` field.
-2. **First-Class Unknown Representation:** Legacy installations without owner metadata explicitly serialize as `{ "status": "unknown" }` or deserialize from `null` without fabricating identities.
-3. **Boundary Separation:** Evidence status (claim truth) and execution authority (roles/permissions) remain outside these types, preserving issue #157 separation.
+2. **Validating Deserialization (Unbypassable):** All domain value types (`OwnerId`, `Issuer`, `Subject`, `EmailAtWrite`, `AgentName`, `SourceAuthor`, `SourceReference`, `StorageOrigin`, `OwnerScopedKey`, `ProvenanceEnvelope`) implement validating Serde deserialization. Malformed, whitespace-only, or oversized wire inputs cannot bypass domain constructors.
+3. **Owner-Scoped Operation Identity:** `ProvenanceEnvelope::operation_id` uses the validated `OwnerScopedKey` type. The builder `with_operation_id` normalizes non-empty raw keys and automatically binds them to the envelope's owner. Deserialization validates that any explicit `operation_id.owner_id` strictly matches the envelope's `owner`.
+4. **First-Class Unknown Representation:** Legacy installations without owner metadata explicitly serialize as `{ "status": "unknown" }` or deserialize from `null` without fabricating identities. Deserialization uses provider-neutral Serde visitors/helpers without runtime dependencies on format-specific libraries in core domain logic.
+5. **Boundary Separation:** Evidence status (claim truth) and execution authority (roles/permissions) remain outside these types, preserving issue #157 separation.
 
 ---
 
 ## 6. Document Revision and Verification History
 
+- **2026-09-17:** Version 1.1.1 updated for Issue #160. Added validating Serde deserialization across all domain types, enforced owner-scoped operation ID contracts on `ProvenanceEnvelope`, added negative wire-format test coverage, and eliminated library runtime dependencies on `serde_json`.
 - **2026-09-17:** Version 1.1.0 updated for Issue #160. Added §5.2 defining shared engine provenance value types in `crates/agentpalace-core/src/provenance.rs`.
 - **2026-09-17:** Version 1.0.0 published for Issue #160. Verified against `crates/agentpalace-server/src/lib.rs` (34 method/path pairs), `crates/agentpalace-federation/src/lib.rs` (wire DTOs), and `docs/Demo-Hub-Design.md`.

@@ -26,6 +26,7 @@ use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 use std::str::FromStr;
 
+use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -123,6 +124,15 @@ pub enum ProvenanceError {
     /// Rejection of unauthenticated or spoofed owner claims in writable request fields.
     #[error("authenticated owner cannot be claimed in writable request payloads: {0}")]
     UnauthenticatedOwnerClaim(String),
+
+    /// Owner-scoping mismatch on operation key or envelope.
+    #[error("owner scoping mismatch: expected {expected}, got {actual}")]
+    OwnerScopeMismatch {
+        /// Expected owner identifier or scope.
+        expected: String,
+        /// Actual owner identifier or scope.
+        actual: String,
+    },
 }
 
 // ─── Owner identity and provider binding ─────────────────────────────────────
@@ -155,7 +165,7 @@ fn validate_owner_id(s: &str) -> Result<(), ProvenanceError> {
 /// verified credentials (e.g. Google ID token subject or OIDC claims).
 /// Remains stable across credential rotation and email address renames.
 /// Never accepted from writable request payload fields.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct OwnerId(String);
 
@@ -207,6 +217,39 @@ impl TryFrom<&str> for OwnerId {
     }
 }
 
+impl<'de> Deserialize<'de> for OwnerId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OwnerIdVisitor;
+
+        impl<'de> Visitor<'de> for OwnerIdVisitor {
+            type Value = OwnerId;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a valid owner ID string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                OwnerId::new(v).map_err(de::Error::custom)
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                OwnerId::new(v).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(OwnerIdVisitor)
+    }
+}
+
 fn validate_issuer(s: &str) -> Result<(), ProvenanceError> {
     if s.is_empty() {
         return Err(ProvenanceError::EmptyField { field: "issuer" });
@@ -233,7 +276,7 @@ fn validate_issuer(s: &str) -> Result<(), ProvenanceError> {
 ///
 /// Provider-neutral (e.g. `<https://accounts.google.com>`, `<https://github.com/login/oauth>`,
 /// or an internal OIDC issuer URL).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Issuer(String);
 
@@ -271,6 +314,39 @@ impl FromStr for Issuer {
     }
 }
 
+impl<'de> Deserialize<'de> for Issuer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct IssuerVisitor;
+
+        impl<'de> Visitor<'de> for IssuerVisitor {
+            type Value = Issuer;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a valid issuer string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Issuer::new(v).map_err(de::Error::custom)
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Issuer::new(v).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(IssuerVisitor)
+    }
+}
+
 fn validate_subject(s: &str) -> Result<(), ProvenanceError> {
     if s.is_empty() {
         return Err(ProvenanceError::EmptyField { field: "subject" });
@@ -297,7 +373,7 @@ fn validate_subject(s: &str) -> Result<(), ProvenanceError> {
 ///
 /// Provider-neutral identifier unique to the issuer (e.g. Google subject `"104928190283019283019"`).
 /// Kept stable across credential rotation and account renames.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Subject(String);
 
@@ -332,6 +408,39 @@ impl FromStr for Subject {
     type Err = ProvenanceError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::new(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Subject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SubjectVisitor;
+
+        impl<'de> Visitor<'de> for SubjectVisitor {
+            type Value = Subject;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a valid subject string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Subject::new(v).map_err(de::Error::custom)
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Subject::new(v).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(SubjectVisitor)
     }
 }
 
@@ -409,7 +518,7 @@ fn validate_email(s: &str) -> Result<(), ProvenanceError> {
 /// Used for human display, auditing, and contact in collaborative environments.
 /// Because emails can change or be recycled, the immutable [`OwnerId`] and
 /// [`Subject`] remain authoritative for identity and authorization.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct EmailAtWrite(String);
 
@@ -444,6 +553,39 @@ impl FromStr for EmailAtWrite {
     type Err = ProvenanceError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::new(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for EmailAtWrite {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct EmailAtWriteVisitor;
+
+        impl<'de> Visitor<'de> for EmailAtWriteVisitor {
+            type Value = EmailAtWrite;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a valid email address string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                EmailAtWrite::new(v).map_err(de::Error::custom)
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                EmailAtWrite::new(v).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(EmailAtWriteVisitor)
     }
 }
 
@@ -586,58 +728,70 @@ impl Serialize for OwnerIdentity {
     }
 }
 
+#[derive(Deserialize)]
+struct RawOwnerIdentity {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    id: Option<OwnerId>,
+    #[serde(default)]
+    issuer: Option<Issuer>,
+    #[serde(default)]
+    subject: Option<Subject>,
+    #[serde(default)]
+    email_at_write: Option<EmailAtWrite>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawOwnerIdentityEnum {
+    Object(RawOwnerIdentity),
+    Str(String),
+    Null,
+}
+
 impl<'de> Deserialize<'de> for OwnerIdentity {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        struct RawOwnerHelper {
-            #[serde(default)]
-            status: Option<String>,
-            #[serde(default)]
-            id: Option<String>,
-            #[serde(default)]
-            issuer: Option<String>,
-            #[serde(default)]
-            subject: Option<String>,
-            #[serde(default)]
-            email_at_write: Option<String>,
-        }
-
-        let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-        let Some(val) = value else {
-            return Ok(Self::Unknown);
-        };
-
-        if val.is_null() {
-            return Ok(Self::Unknown);
-        }
-
-        let helper: RawOwnerHelper =
-            serde_json::from_value(val).map_err(serde::de::Error::custom)?;
-
-        if let Some(status) = helper.status.as_deref() {
-            if status == "unknown" || status == "legacy" {
-                return Ok(Self::Unknown);
+        match RawOwnerIdentityEnum::deserialize(deserializer)? {
+            RawOwnerIdentityEnum::Null => Ok(Self::Unknown),
+            RawOwnerIdentityEnum::Str(s) => {
+                if s == "unknown" || s == "legacy" {
+                    Ok(Self::Unknown)
+                } else {
+                    Err(de::Error::custom(format!(
+                        "unrecognized owner identity status string `{s}`"
+                    )))
+                }
             }
-        }
-
-        if let (Some(id), Some(issuer), Some(subject), Some(email_at_write)) = (
-            helper.id,
-            helper.issuer,
-            helper.subject,
-            helper.email_at_write,
-        ) {
-            let owner = AuthenticatedOwner::parse(id, issuer, subject, email_at_write)
-                .map_err(serde::de::Error::custom)?;
-            Ok(Self::Authenticated(owner))
-        } else if helper.status.as_deref() == Some("unknown") {
-            Ok(Self::Unknown)
-        } else {
-            Err(serde::de::Error::custom(
-                "invalid owner identity: expected {status: \"unknown\"} or authenticated owner object with id, issuer, subject, email_at_write",
-            ))
+            RawOwnerIdentityEnum::Object(raw) => {
+                if let Some(status) = raw.status.as_deref() {
+                    if status == "unknown" || status == "legacy" {
+                        return Ok(Self::Unknown);
+                    }
+                }
+                if let (Some(id), Some(issuer), Some(subject), Some(email_at_write)) = (
+                    raw.id,
+                    raw.issuer,
+                    raw.subject,
+                    raw.email_at_write,
+                ) {
+                    Ok(Self::Authenticated(AuthenticatedOwner::new(
+                        id,
+                        issuer,
+                        subject,
+                        email_at_write,
+                    )))
+                } else if raw.status.as_deref() == Some("unknown") {
+                    Ok(Self::Unknown)
+                } else {
+                    Err(de::Error::custom(
+                        "invalid owner identity: expected {status: \"unknown\"} or authenticated owner object with id, issuer, subject, email_at_write",
+                    ))
+                }
+            }
         }
     }
 }
@@ -694,7 +848,7 @@ fn validate_agent_name(s: &str) -> Result<(), ProvenanceError> {
 ///
 /// Stored in request payloads (`added_by`, `created_by`, `sender`, `actor`).
 /// Remains caller-asserted unless independently verified.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct AgentName(String);
 
@@ -729,6 +883,39 @@ impl FromStr for AgentName {
     type Err = ProvenanceError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::new(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct AgentNameVisitor;
+
+        impl<'de> Visitor<'de> for AgentNameVisitor {
+            type Value = AgentName;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a valid agent name string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                AgentName::new(v).map_err(de::Error::custom)
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                AgentName::new(v).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(AgentNameVisitor)
     }
 }
 
@@ -799,7 +986,7 @@ fn validate_source_author(s: &str) -> Result<(), ProvenanceError> {
 ///
 /// Examples: git commit author ("Alice <alice@example.com>"), document author,
 /// or external publication author.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SourceAuthor(String);
 
@@ -838,6 +1025,39 @@ impl FromStr for SourceAuthor {
     }
 }
 
+impl<'de> Deserialize<'de> for SourceAuthor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SourceAuthorVisitor;
+
+        impl<'de> Visitor<'de> for SourceAuthorVisitor {
+            type Value = SourceAuthor;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a valid source author string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                SourceAuthor::new(v).map_err(de::Error::custom)
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                SourceAuthor::new(v).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(SourceAuthorVisitor)
+    }
+}
+
 fn validate_source_reference(s: &str) -> Result<(), ProvenanceError> {
     if s.is_empty() {
         return Err(ProvenanceError::EmptyField {
@@ -865,7 +1085,7 @@ fn validate_source_reference(s: &str) -> Result<(), ProvenanceError> {
 /// Reference to an original source artifact, commit, file path, URL, or citation.
 ///
 /// Distinct from the submitting owner and server storage identity.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SourceReference(String);
 
@@ -904,6 +1124,39 @@ impl FromStr for SourceReference {
     }
 }
 
+impl<'de> Deserialize<'de> for SourceReference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SourceReferenceVisitor;
+
+        impl<'de> Visitor<'de> for SourceReferenceVisitor {
+            type Value = SourceReference;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a valid source reference string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                SourceReference::new(v).map_err(de::Error::custom)
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                SourceReference::new(v).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(SourceReferenceVisitor)
+    }
+}
+
 // ─── Storage origin ───────────────────────────────────────────────────────────
 
 fn validate_origin_id(s: &str) -> Result<(), ProvenanceError> {
@@ -932,7 +1185,7 @@ fn validate_origin_id(s: &str) -> Result<(), ProvenanceError> {
 ///
 /// Distinguishes records created directly on this local palace node/host
 /// from those federated, imported, or replicated from remote instances.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StorageOrigin {
     /// Created directly on this local palace node or instance.
@@ -948,6 +1201,37 @@ pub enum StorageOrigin {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         original_record_id: Option<String>,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RawStorageOrigin {
+    Local {
+        origin_id: String,
+    },
+    Federated {
+        origin_id: String,
+        #[serde(default)]
+        original_record_id: Option<String>,
+    },
+}
+
+impl<'de> Deserialize<'de> for StorageOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawStorageOrigin::deserialize(deserializer)?;
+        match raw {
+            RawStorageOrigin::Local { origin_id } => {
+                StorageOrigin::local(origin_id).map_err(de::Error::custom)
+            }
+            RawStorageOrigin::Federated {
+                origin_id,
+                original_record_id,
+            } => StorageOrigin::federated(origin_id, original_record_id).map_err(de::Error::custom),
+        }
+    }
 }
 
 impl StorageOrigin {
@@ -1085,10 +1369,10 @@ impl Serialize for RecordingTime {
 impl<'de> Deserialize<'de> for RecordingTime {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        RecordingTime::from_rfc3339(&s).map_err(serde::de::Error::custom)
+        RecordingTime::from_rfc3339(&s).map_err(de::Error::custom)
     }
 }
 
@@ -1099,7 +1383,7 @@ impl<'de> Deserialize<'de> for RecordingTime {
 /// Scoping receipt lookups and idempotency keys to `(owner_id, operation_id)`
 /// ensures that one user's retries or client-supplied IDs cannot collide with
 /// or replay another user's operations.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct OwnerScopedKey {
     /// Authenticated owner ID, or None for legacy/unauthenticated scopes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1109,7 +1393,7 @@ pub struct OwnerScopedKey {
 }
 
 impl OwnerScopedKey {
-    /// Construct a new [`OwnerScopedKey`].
+    /// Construct and validate a new [`OwnerScopedKey`].
     pub fn new(
         owner_id: Option<OwnerId>,
         raw_key: impl Into<String>,
@@ -1132,6 +1416,35 @@ impl OwnerScopedKey {
         })
     }
 
+    /// Validate bounded invariants.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        let trimmed = self.raw_key.trim();
+        if trimmed.is_empty() {
+            return Err(ProvenanceError::EmptyField { field: "raw_key" });
+        }
+        if trimmed.len() > MAX_OPERATION_ID_CHARS {
+            return Err(ProvenanceError::ValueTooLong {
+                field: "raw_key",
+                len: trimmed.len(),
+                max: MAX_OPERATION_ID_CHARS,
+            });
+        }
+        if let Some(ref owner) = self.owner_id {
+            validate_owner_id(owner.as_str())?;
+        }
+        Ok(())
+    }
+
+    /// View raw operation key string.
+    pub fn raw_key(&self) -> &str {
+        &self.raw_key
+    }
+
+    /// View owner ID, if scoped to an authenticated owner.
+    pub fn owner_id(&self) -> Option<&OwnerId> {
+        self.owner_id.as_ref()
+    }
+
     /// Generate composite key string suitable for storage indexes.
     ///
     /// If an owner is present: `"{owner_id}:{raw_key}"`.
@@ -1140,6 +1453,60 @@ impl OwnerScopedKey {
         match &self.owner_id {
             Some(owner) => format!("{}:{}", owner.as_str(), self.raw_key),
             None => format!("legacy:{}", self.raw_key),
+        }
+    }
+}
+
+impl Display for OwnerScopedKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.composite_key())
+    }
+}
+
+impl FromStr for OwnerScopedKey {
+    type Err = ProvenanceError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err(ProvenanceError::EmptyField { field: "raw_key" });
+        }
+        if let Some((prefix, rest)) = trimmed.split_once(':') {
+            if prefix == "legacy" {
+                Self::new(None, rest)
+            } else {
+                let owner = OwnerId::new(prefix)?;
+                Self::new(Some(owner), rest)
+            }
+        } else {
+            Self::new(None, trimmed)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawScopedKeyHelper {
+    Struct {
+        #[serde(default)]
+        owner_id: Option<OwnerId>,
+        raw_key: String,
+    },
+    Str(String),
+}
+
+impl<'de> Deserialize<'de> for OwnerScopedKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawScopedKeyHelper::deserialize(deserializer)?;
+        match raw {
+            RawScopedKeyHelper::Struct { owner_id, raw_key } => {
+                OwnerScopedKey::new(owner_id, raw_key).map_err(de::Error::custom)
+            }
+            RawScopedKeyHelper::Str(s) => {
+                OwnerScopedKey::from_str(&s).map_err(de::Error::custom)
+            }
         }
     }
 }
@@ -1153,13 +1520,13 @@ impl OwnerScopedKey {
 /// - Caller-asserted agent attribution ([`AgentAttribution`])
 /// - Server-assigned recording timestamp ([`RecordingTime`])
 /// - Storage origin ([`StorageOrigin`])
-/// - Owner-scoped idempotency receipt key (`operation_id`)
+/// - Owner-scoped idempotency receipt key ([`OwnerScopedKey`])
 /// - Original source author ([`SourceAuthor`])
 /// - Original source references ([`SourceReference`])
 ///
 /// Note: Evidence status (claim truth/verification) and execution authority
 /// (roles/permissions) are intentionally excluded from this slice.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProvenanceEnvelope {
     /// Authenticated owner identity, or explicitly unknown/legacy.
     pub owner: OwnerIdentity,
@@ -1172,7 +1539,7 @@ pub struct ProvenanceEnvelope {
     pub origin: StorageOrigin,
     /// Optional owner-scoped operation / idempotency key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation_id: Option<String>,
+    pub operation_id: Option<OwnerScopedKey>,
     /// Original source author, distinct from the submitting owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_author: Option<SourceAuthor>,
@@ -1201,20 +1568,24 @@ impl ProvenanceEnvelope {
         self
     }
 
-    /// Attach owner-scoped operation / idempotency receipt key.
+    /// Attach owner-scoped operation / idempotency receipt key from raw string.
+    ///
+    /// Automatically normalizes the key (rejecting empty/whitespace-only values and bounding length)
+    /// and scopes it to the envelope's authenticated owner identity (or legacy if unknown).
     pub fn with_operation_id(
         mut self,
-        operation_id: impl Into<String>,
+        raw_key: impl Into<String>,
     ) -> Result<Self, ProvenanceError> {
-        let op = operation_id.into();
-        if op.len() > MAX_OPERATION_ID_CHARS {
-            return Err(ProvenanceError::ValueTooLong {
-                field: "operation_id",
-                len: op.len(),
-                max: MAX_OPERATION_ID_CHARS,
-            });
-        }
-        self.operation_id = Some(op);
+        let key = OwnerScopedKey::new(self.owner.owner_id().cloned(), raw_key)?;
+        self.operation_id = Some(key);
+        Ok(self)
+    }
+
+    /// Attach explicit [`OwnerScopedKey`], validating that its owner scope matches this envelope.
+    pub fn with_operation_key(mut self, key: OwnerScopedKey) -> Result<Self, ProvenanceError> {
+        key.validate()?;
+        self.check_owner_scope(&key)?;
+        self.operation_id = Some(key);
         Ok(self)
     }
 
@@ -1239,7 +1610,39 @@ impl ProvenanceEnvelope {
         Ok(self)
     }
 
-    /// Validate the envelope's bounded constraints.
+    /// View the owner-scoped operation key, if present.
+    pub fn operation_id(&self) -> Option<&OwnerScopedKey> {
+        self.operation_id.as_ref()
+    }
+
+    fn check_owner_scope(&self, key: &OwnerScopedKey) -> Result<(), ProvenanceError> {
+        match (&self.owner, &key.owner_id) {
+            (OwnerIdentity::Authenticated(owner), Some(op_owner)) => {
+                if &owner.id != op_owner {
+                    return Err(ProvenanceError::OwnerScopeMismatch {
+                        expected: owner.id.to_string(),
+                        actual: op_owner.to_string(),
+                    });
+                }
+            }
+            (OwnerIdentity::Authenticated(owner), None) => {
+                return Err(ProvenanceError::OwnerScopeMismatch {
+                    expected: owner.id.to_string(),
+                    actual: "unscoped/legacy".to_string(),
+                });
+            }
+            (OwnerIdentity::Unknown, Some(op_owner)) => {
+                return Err(ProvenanceError::OwnerScopeMismatch {
+                    expected: "unknown".to_string(),
+                    actual: op_owner.to_string(),
+                });
+            }
+            (OwnerIdentity::Unknown, None) => {}
+        }
+        Ok(())
+    }
+
+    /// Validate the envelope's bounded constraints and owner-scoping invariants.
     pub fn validate(&self) -> Result<(), ProvenanceError> {
         if self.source_refs.len() > MAX_SOURCE_REFS {
             return Err(ProvenanceError::TooManySourceRefs {
@@ -1247,16 +1650,57 @@ impl ProvenanceEnvelope {
                 max: MAX_SOURCE_REFS,
             });
         }
-        if let Some(ref op_id) = self.operation_id {
-            if op_id.len() > MAX_OPERATION_ID_CHARS {
-                return Err(ProvenanceError::ValueTooLong {
-                    field: "operation_id",
-                    len: op_id.len(),
-                    max: MAX_OPERATION_ID_CHARS,
-                });
-            }
+        if let Some(ref key) = self.operation_id {
+            key.validate()?;
+            self.check_owner_scope(key)?;
         }
         Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct RawProvenanceEnvelope {
+    owner: OwnerIdentity,
+    #[serde(default)]
+    actor: Option<AgentAttribution>,
+    recorded_at: RecordingTime,
+    origin: StorageOrigin,
+    #[serde(default)]
+    operation_id: Option<OwnerScopedKey>,
+    #[serde(default)]
+    source_author: Option<SourceAuthor>,
+    #[serde(default)]
+    source_refs: Vec<SourceReference>,
+}
+
+impl<'de> Deserialize<'de> for ProvenanceEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawProvenanceEnvelope::deserialize(deserializer)?;
+        let mut envelope = ProvenanceEnvelope {
+            owner: raw.owner,
+            actor: raw.actor,
+            recorded_at: raw.recorded_at,
+            origin: raw.origin,
+            operation_id: raw.operation_id,
+            source_author: raw.source_author,
+            source_refs: raw.source_refs,
+        };
+
+        // If operation_id was deserialized without an owner_id (e.g. from a raw string),
+        // scope it to the envelope's owner if authenticated.
+        if let Some(ref mut op) = envelope.operation_id {
+            if op.owner_id.is_none() {
+                if let Some(owner_id) = envelope.owner.owner_id() {
+                    op.owner_id = Some(owner_id.clone());
+                }
+            }
+        }
+
+        envelope.validate().map_err(de::Error::custom)?;
+        Ok(envelope)
     }
 }
 
@@ -1468,13 +1912,30 @@ mod tests {
     }
 
     #[test]
-    fn owner_scoped_key_generation() {
+    fn owner_scoped_key_generation_and_serde() {
         let owner_id = OwnerId::new("usr_01J8Y").unwrap();
-        let key = OwnerScopedKey::new(Some(owner_id), "op_add_drawer_1").unwrap();
+        let key = OwnerScopedKey::new(Some(owner_id.clone()), "op_add_drawer_1").unwrap();
         assert_eq!(key.composite_key(), "usr_01J8Y:op_add_drawer_1");
+        assert_eq!(key.raw_key(), "op_add_drawer_1");
+        assert_eq!(key.owner_id(), Some(&owner_id));
 
         let legacy_key = OwnerScopedKey::new(None, "op_legacy_2").unwrap();
         assert_eq!(legacy_key.composite_key(), "legacy:op_legacy_2");
+        assert_eq!(legacy_key.raw_key(), "op_legacy_2");
+        assert_eq!(legacy_key.owner_id(), None);
+
+        // Deserialization from struct
+        let json_struct = r#"{"owner_id":"usr_01J8Y","raw_key":"op_add_drawer_1"}"#;
+        let from_struct: OwnerScopedKey = serde_json::from_str(json_struct).unwrap();
+        assert_eq!(from_struct, key);
+
+        // Deserialization from scoped string
+        let from_str: OwnerScopedKey = serde_json::from_str(r#""usr_01J8Y:op_add_drawer_1""#).unwrap();
+        assert_eq!(from_str, key);
+
+        // Deserialization from legacy string
+        let from_legacy_str: OwnerScopedKey = serde_json::from_str(r#""legacy:op_legacy_2""#).unwrap();
+        assert_eq!(from_legacy_str, legacy_key);
     }
 
     #[test]
@@ -1504,6 +1965,9 @@ mod tests {
         assert_eq!(deserialized, envelope);
         assert!(deserialized.owner.is_authenticated());
         assert_eq!(deserialized.actor.unwrap().agent_name.as_str(), "codex");
+        let op = deserialized.operation_id().unwrap();
+        assert_eq!(op.raw_key(), "owner-scoped-idempotency-key");
+        assert_eq!(op.composite_key(), "usr_01J8Y:owner-scoped-idempotency-key");
     }
 
     #[test]
@@ -1512,6 +1976,231 @@ mod tests {
         assert!(matches!(
             reject_payload_owner_claim(Some("spoofed_owner")),
             Err(ProvenanceError::UnauthenticatedOwnerClaim(_))
+        ));
+    }
+
+    // ─── Negative Wire-Format Validation Tests ─────────────────────────────────
+
+    #[test]
+    fn negative_wire_owner_id_validation() {
+        // Empty string
+        assert!(serde_json::from_str::<OwnerId>(r#""""#).is_err());
+        // Oversized (> 128)
+        let long_id = format!(r#""{}""#, "a".repeat(MAX_OWNER_ID_CHARS + 1));
+        assert!(serde_json::from_str::<OwnerId>(&long_id).is_err());
+        // Invalid characters
+        assert!(serde_json::from_str::<OwnerId>(r#""usr with space""#).is_err());
+        assert!(serde_json::from_str::<OwnerId>(r#""usr@invalid""#).is_err());
+    }
+
+    #[test]
+    fn negative_wire_issuer_and_subject_validation() {
+        // Issuer empty
+        assert!(serde_json::from_str::<Issuer>(r#""""#).is_err());
+        // Issuer oversized (> 256)
+        let long_issuer = format!(r#""https://example.com/{}""#, "a".repeat(MAX_ISSUER_CHARS));
+        assert!(serde_json::from_str::<Issuer>(&long_issuer).is_err());
+        // Issuer non-graphic / whitespace
+        assert!(serde_json::from_str::<Issuer>(r#""https://exam ple.com""#).is_err());
+
+        // Subject empty
+        assert!(serde_json::from_str::<Subject>(r#""""#).is_err());
+        // Subject oversized (> 256)
+        let long_sub = format!(r#""{}""#, "a".repeat(MAX_SUBJECT_CHARS + 1));
+        assert!(serde_json::from_str::<Subject>(&long_sub).is_err());
+        // Subject non-graphic / whitespace
+        assert!(serde_json::from_str::<Subject>(r#""sub with space""#).is_err());
+    }
+
+    #[test]
+    fn negative_wire_email_at_write_validation() {
+        // Empty string
+        assert!(serde_json::from_str::<EmailAtWrite>(r#""""#).is_err());
+        // Whitespace only
+        assert!(serde_json::from_str::<EmailAtWrite>(r#""   ""#).is_err());
+        // Missing @
+        assert!(serde_json::from_str::<EmailAtWrite>(r#""not-an-email""#).is_err());
+        // Missing local part
+        assert!(serde_json::from_str::<EmailAtWrite>(r#""@example.com""#).is_err());
+        // Missing domain
+        assert!(serde_json::from_str::<EmailAtWrite>(r#""user@""#).is_err());
+        // Domain starts with dot
+        assert!(serde_json::from_str::<EmailAtWrite>(r#""user@.com""#).is_err());
+        // Oversized (> 254)
+        let long_email = format!(r#""user@{}""#, "a".repeat(MAX_EMAIL_CHARS));
+        assert!(serde_json::from_str::<EmailAtWrite>(&long_email).is_err());
+    }
+
+    #[test]
+    fn negative_wire_agent_name_validation() {
+        // Empty string
+        assert!(serde_json::from_str::<AgentName>(r#""""#).is_err());
+        // Whitespace
+        assert!(serde_json::from_str::<AgentName>(r#""agent name""#).is_err());
+        // Invalid characters
+        assert!(serde_json::from_str::<AgentName>(r#""agent!""#).is_err());
+        // Oversized (> 128)
+        let long_name = format!(r#""{}""#, "a".repeat(MAX_AGENT_NAME_CHARS + 1));
+        assert!(serde_json::from_str::<AgentName>(&long_name).is_err());
+    }
+
+    #[test]
+    fn negative_wire_source_author_and_reference_validation() {
+        // SourceAuthor empty or whitespace
+        assert!(serde_json::from_str::<SourceAuthor>(r#""""#).is_err());
+        assert!(serde_json::from_str::<SourceAuthor>(r#""   ""#).is_err());
+        // SourceAuthor control character
+        assert!(serde_json::from_str::<SourceAuthor>(r#""Alice\u0000Bob""#).is_err());
+        // SourceAuthor oversized (> 256)
+        let long_author = format!(r#""{}""#, "a".repeat(MAX_SOURCE_AUTHOR_CHARS + 1));
+        assert!(serde_json::from_str::<SourceAuthor>(&long_author).is_err());
+
+        // SourceReference empty or whitespace
+        assert!(serde_json::from_str::<SourceReference>(r#""""#).is_err());
+        assert!(serde_json::from_str::<SourceReference>(r#"" \t ""#).is_err());
+        // SourceReference control char
+        assert!(serde_json::from_str::<SourceReference>(r#""path/\u0001/file""#).is_err());
+        // SourceReference oversized (> 2048)
+        let long_ref = format!(r#""{}""#, "a".repeat(MAX_SOURCE_REF_CHARS + 1));
+        assert!(serde_json::from_str::<SourceReference>(&long_ref).is_err());
+    }
+
+    #[test]
+    fn negative_wire_storage_origin_validation() {
+        // Local with empty origin_id
+        assert!(serde_json::from_str::<StorageOrigin>(r#"{"kind":"local","origin_id":""}"#).is_err());
+        // Local with whitespace origin_id
+        assert!(serde_json::from_str::<StorageOrigin>(r#"{"kind":"local","origin_id":"has space"}"#).is_err());
+        // Local oversized origin_id (> 256)
+        let long_id = "a".repeat(MAX_ORIGIN_ID_CHARS + 1);
+        let json = format!(r#"{{"kind":"local","origin_id":"{long_id}"}}"#);
+        assert!(serde_json::from_str::<StorageOrigin>(&json).is_err());
+
+        // Federated with empty origin_id
+        assert!(serde_json::from_str::<StorageOrigin>(r#"{"kind":"federated","origin_id":""}"#).is_err());
+        // Federated with oversized original_record_id (> 256)
+        let long_rec = "r".repeat(MAX_RECORD_ID_CHARS + 1);
+        let fed_json = format!(r#"{{"kind":"federated","origin_id":"https://remote.palace","original_record_id":"{long_rec}"}}"#);
+        assert!(serde_json::from_str::<StorageOrigin>(&fed_json).is_err());
+    }
+
+    #[test]
+    fn negative_wire_owner_scoped_key_validation() {
+        // Struct with empty raw_key
+        assert!(serde_json::from_str::<OwnerScopedKey>(r#"{"raw_key":""}"#).is_err());
+        // Struct with whitespace raw_key
+        assert!(serde_json::from_str::<OwnerScopedKey>(r#"{"raw_key":"   "}"#).is_err());
+        // Struct with oversized raw_key (> 128)
+        let long_key = "k".repeat(MAX_OPERATION_ID_CHARS + 1);
+        let json = format!(r#"{{"raw_key":"{long_key}"}}"#);
+        assert!(serde_json::from_str::<OwnerScopedKey>(&json).is_err());
+
+        // String with empty value
+        assert!(serde_json::from_str::<OwnerScopedKey>(r#""""#).is_err());
+        // String with whitespace
+        assert!(serde_json::from_str::<OwnerScopedKey>(r#""   ""#).is_err());
+        // String with oversized value
+        let str_json = format!(r#""{long_key}""#);
+        assert!(serde_json::from_str::<OwnerScopedKey>(&str_json).is_err());
+    }
+
+    #[test]
+    fn negative_wire_provenance_envelope_operation_id_validation() {
+        let base_json = r#"{
+            "owner": {"status": "unknown"},
+            "recorded_at": "2026-09-17T11:04:27Z",
+            "origin": {"kind": "local", "origin_id": "local"},
+            "operation_id": "   "
+        }"#;
+        // Whitespace operation_id must be rejected
+        assert!(serde_json::from_str::<ProvenanceEnvelope>(base_json).is_err());
+
+        let empty_json = r#"{
+            "owner": {"status": "unknown"},
+            "recorded_at": "2026-09-17T11:04:27Z",
+            "origin": {"kind": "local", "origin_id": "local"},
+            "operation_id": ""
+        }"#;
+        // Empty operation_id must be rejected
+        assert!(serde_json::from_str::<ProvenanceEnvelope>(empty_json).is_err());
+
+        let long_op = "x".repeat(MAX_OPERATION_ID_CHARS + 1);
+        let oversized_json = format!(r#"{{
+            "owner": {{"status": "unknown"}},
+            "recorded_at": "2026-09-17T11:04:27Z",
+            "origin": {{"kind": "local", "origin_id": "local"}},
+            "operation_id": "{long_op}"
+        }}"#);
+        // Oversized operation_id must be rejected
+        assert!(serde_json::from_str::<ProvenanceEnvelope>(&oversized_json).is_err());
+    }
+
+    #[test]
+    fn negative_wire_provenance_envelope_owner_scope_mismatch() {
+        // Authenticated owner with operation_id claiming a different owner_id
+        let mismatch_json = r#"{
+            "owner": {
+                "id": "usr_01J8Y",
+                "issuer": "https://accounts.google.com",
+                "subject": "104928190283019283019",
+                "email_at_write": "tester@example.com"
+            },
+            "recorded_at": "2026-09-17T11:04:27Z",
+            "origin": {"kind": "local", "origin_id": "local"},
+            "operation_id": {
+                "owner_id": "usr_other_hacker",
+                "raw_key": "op_steal"
+            }
+        }"#;
+        assert!(serde_json::from_str::<ProvenanceEnvelope>(mismatch_json).is_err());
+
+        // Unknown owner with operation_id claiming an authenticated owner_id
+        let unknown_with_auth_op = r#"{
+            "owner": {"status": "unknown"},
+            "recorded_at": "2026-09-17T11:04:27Z",
+            "origin": {"kind": "local", "origin_id": "local"},
+            "operation_id": {
+                "owner_id": "usr_claimed",
+                "raw_key": "op_legacy"
+            }
+        }"#;
+        assert!(serde_json::from_str::<ProvenanceEnvelope>(unknown_with_auth_op).is_err());
+    }
+
+    #[test]
+    fn negative_wire_provenance_envelope_source_refs_bound() {
+        let refs: Vec<String> = (0..=MAX_SOURCE_REFS)
+            .map(|i| format!(r#""ref_{i}""#))
+            .collect();
+        let refs_json = refs.join(",");
+        let json = format!(r#"{{
+            "owner": {{"status": "unknown"}},
+            "recorded_at": "2026-09-17T11:04:27Z",
+            "origin": {{"kind": "local", "origin_id": "local"}},
+            "source_refs": [{refs_json}]
+        }}"#);
+        // Exceeds MAX_SOURCE_REFS (128) -> deserialization must fail
+        assert!(serde_json::from_str::<ProvenanceEnvelope>(&json).is_err());
+    }
+
+    #[test]
+    fn builder_rejects_empty_and_whitespace_operation_id() {
+        let owner = OwnerIdentity::Unknown;
+        let recorded_at = RecordingTime::from_rfc3339("2026-09-17T11:04:27Z").unwrap();
+        let origin = StorageOrigin::local_default();
+        let envelope = ProvenanceEnvelope::new(owner, recorded_at, origin);
+
+        assert!(matches!(
+            envelope.clone().with_operation_id(""),
+            Err(ProvenanceError::EmptyField { field: "raw_key" })
+        ));
+        assert!(matches!(
+            envelope.clone().with_operation_id("   "),
+            Err(ProvenanceError::EmptyField { field: "raw_key" })
+        ));
+        assert!(matches!(
+            envelope.with_operation_id("a".repeat(MAX_OPERATION_ID_CHARS + 1)),
+            Err(ProvenanceError::ValueTooLong { field: "raw_key", .. })
         ));
     }
 }
