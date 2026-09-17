@@ -1,10 +1,10 @@
 # Demo Hub: Canonical Remote REST Inventory and Implementation Contract
 
-**Document Version:** 1.0.0  
-**Release Series:** 0.2.0 (`release/version.toml`)  
-**Federation API Version:** 1 (`agentpalace_federation::FEDERATION_API_VERSION`)  
-**Status:** Approved Implementation Contract for AgentPalace #160 (parent issue #159)  
-**Date:** 2026-09-17  
+**Document Version:** 1.0.0<br>
+**Release Series:** 0.2.0 (`release/version.toml`)<br>
+**Federation API Version:** 1 (`agentpalace_federation::FEDERATION_API_VERSION`)<br>
+**Status:** Approved Implementation Contract for AgentPalace #160 (parent issue #159)<br>
+**Date:** 2026-09-17
 **Authoritative Sources:** `crates/agentpalace-server/src/lib.rs`, `crates/agentpalace-federation/src/lib.rs`, `docs/Demo-Hub-Design.md`
 
 ---
