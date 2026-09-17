@@ -791,7 +791,7 @@ Implemented in `crates/agentpalace-core/src/provenance.rs`, the engine provides 
 | `SourceAuthor` | 1–256 chars; non-empty, trimmed, no ASCII control chars | Transparent string (e.g. `"Alice <alice@example.com>"`). Separate from submitting owner. |
 | `SourceReference` | 1–2048 chars; non-empty, trimmed, no ASCII control chars | Transparent string (e.g. `"crates/agentpalace-core/src/lib.rs"`). Max 128 references per envelope. |
 | `StorageOrigin` | Enum: `Local { origin_id }` \| `Federated { origin_id, original_record_id }` | Tagged wire JSON: `{ "kind": "local", "origin_id": "..." }` or `{ "kind": "federated", "origin_id": "...", "original_record_id": "..." }`. |
-| `RecordingTime` | Wrapped UTC `OffsetDateTime`, max 64 chars RFC 3339 | Formatted RFC 3339 UTC string (e.g. `"2026-09-17T11:04:27Z"`). |
+| `RecordingTime` | Wrapped UTC `OffsetDateTime`, max 64 chars RFC 3339, strictly bounded to RFC 3339 representable UTC range (year `0000..=9999`) | Formatted RFC 3339 UTC string (e.g. `"2026-09-17T11:04:27Z"`). Construction enforces UTC normalization and RFC 3339 range; formatting and serialization explicitly propagate errors without silent Unix-epoch fallback. |
 | `OwnerScopedKey` | Holds `(Option<OwnerId>, raw_key)` (raw key max 128 chars, non-empty, trimmed) | Scoped storage key `"{owner_id}:{raw_key}"` or `"legacy:{raw_key}"`. Unambiguous and collision-free due to reserved sentinel owner IDs. Validates non-empty normalization and bounded length on both construction and deserialization. |
 | `ProvenanceEnvelope` | Full top-level metadata envelope | Unites owner, actor, recorded_at, origin, operation_id (`Option<OwnerScopedKey>`), source_author, and source_refs (max 128). Enforces owner-scoping alignment and bounded validation on deserialization. |
 
@@ -803,11 +803,13 @@ Implemented in `crates/agentpalace-core/src/provenance.rs`, the engine provides 
 4. **First-Class Unknown Representation:** Legacy installations without owner metadata explicitly serialize as `{ "status": "unknown" }` or deserialize from `null` without fabricating identities. Deserialization uses provider-neutral Serde visitors/helpers without runtime dependencies on format-specific libraries in core domain logic.
 5. **Boundary Separation:** Evidence status (claim truth) and execution authority (roles/permissions) remain outside these types, preserving issue #157 separation.
 6. **Collision-Resistant Owner Scoping:** Sentinel identifiers (`legacy`, `unknown`, `none`, `null`) are strictly reserved and rejected by `validate_owner_id`. This guarantees that `OwnerScopedKey::composite_key()` never produces colliding keys between authenticated owners and legacy/unknown scopes.
+7. **Strict Recording Time Boundaries:** `RecordingTime` enforces that only RFC 3339-representable UTC timestamps (calendar years `0000..=9999`) can be constructed. Construction via `from_offset_date_time` or `from_rfc3339` rejects out-of-range timestamps and non-representable offset shifts. Serialization and formatting propagate errors explicitly, preventing silent fallback to the Unix epoch (1970-01-01).
 
 ---
 
 ## 6. Document Revision and Verification History
 
+- **2026-09-17:** Version 1.1.3 updated for Issue #160. Hardened `RecordingTime` construction and serialization: enforced invariant that only RFC 3339-representable UTC values (year `0000..=9999`) can be constructed, eliminated silent Unix-epoch fallback in favor of explicit error propagation, and added boundary test coverage.
 - **2026-09-17:** Version 1.1.2 updated for Issue #160. Hardened `OwnerIdentity` deserialization to fail-closed against unknown status values and contradictory object shapes; reserved sentinel owner IDs (`legacy`, `unknown`, `none`, `null`) to guarantee collision-free `OwnerScopedKey::composite_key()` storage indexing; removed `serde_json` from non-test crate dependencies; added exhaustive negative and collision unit tests.
 - **2026-09-17:** Version 1.1.1 updated for Issue #160. Added validating Serde deserialization across all domain types, enforced owner-scoped operation ID contracts on `ProvenanceEnvelope`, added negative wire-format test coverage, and eliminated library runtime dependencies on `serde_json`.
 - **2026-09-17:** Version 1.1.0 updated for Issue #160. Added §5.2 defining shared engine provenance value types in `crates/agentpalace-core/src/provenance.rs`.

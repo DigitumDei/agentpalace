@@ -1332,23 +1332,56 @@ impl StorageOrigin {
 
 /// Server-assigned UTC recording time.
 ///
-/// Enforces RFC 3339 serialization wire format and UTC normalization.
+/// Enforces RFC 3339 serialization wire format, UTC normalization, and the invariant
+/// that only RFC 3339-representable timestamps (UTC year `0000..=9999`) can be constructed.
 /// Reuses the `time` crate conventions from `agentpalace-core`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RecordingTime(OffsetDateTime);
 
 impl RecordingTime {
+    /// Validates that an [`OffsetDateTime`] can be normalized to UTC and represented in RFC 3339 format.
+    ///
+    /// The normalized UTC timestamp must have a 4-digit calendar year in the range `0000..=9999`
+    /// and successfully format as RFC 3339.
+    fn validate_and_normalize(dt: OffsetDateTime) -> Result<OffsetDateTime, ProvenanceError> {
+        let utc = dt
+            .checked_to_offset(time::UtcOffset::UTC)
+            .ok_or_else(|| {
+                ProvenanceError::InvalidRecordingTime(format!(
+                    "recording time year {} with offset {} cannot be represented in UTC RFC 3339 range (0000..=9999)",
+                    dt.year(),
+                    dt.offset()
+                ))
+            })?;
+        let year = utc.year();
+        if !(0..=9999).contains(&year) {
+            return Err(ProvenanceError::InvalidRecordingTime(format!(
+                "UTC recording time year {year} is out of RFC 3339 representable range (0000..=9999)"
+            )));
+        }
+        utc.format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| ProvenanceError::InvalidRecordingTime(e.to_string()))?;
+        Ok(utc)
+    }
+
     /// Create a new recording time with current server UTC time.
     pub fn now_utc() -> Self {
         Self(OffsetDateTime::now_utc())
     }
 
     /// Construct from an existing [`OffsetDateTime`], normalized to UTC.
-    pub fn from_offset_date_time(dt: OffsetDateTime) -> Self {
-        Self(dt.to_offset(time::UtcOffset::UTC))
+    ///
+    /// Returns [`ProvenanceError::InvalidRecordingTime`] if the normalized UTC timestamp
+    /// is not representable in RFC 3339 format (i.e. UTC year outside `0000..=9999`).
+    pub fn from_offset_date_time(dt: OffsetDateTime) -> Result<Self, ProvenanceError> {
+        let utc = Self::validate_and_normalize(dt)?;
+        Ok(Self(utc))
     }
 
     /// Parse an RFC 3339 string into UTC recording time.
+    ///
+    /// Validates length bounds, RFC 3339 format, and that the normalized UTC timestamp
+    /// is within the representable RFC 3339 range (UTC year `0000..=9999`).
     pub fn from_rfc3339(s: &str) -> Result<Self, ProvenanceError> {
         let trimmed = s.trim();
         if trimmed.is_empty() {
@@ -1366,7 +1399,8 @@ impl RecordingTime {
         let parsed =
             OffsetDateTime::parse(trimmed, &time::format_description::well_known::Rfc3339)
                 .map_err(|e| ProvenanceError::InvalidRecordingTime(e.to_string()))?;
-        Ok(Self(parsed.to_offset(time::UtcOffset::UTC)))
+        let utc = Self::validate_and_normalize(parsed)?;
+        Ok(Self(utc))
     }
 
     /// View inner [`OffsetDateTime`].
@@ -1374,17 +1408,39 @@ impl RecordingTime {
         self.0
     }
 
+    /// Convert into inner [`OffsetDateTime`].
+    pub fn into_offset_date_time(self) -> OffsetDateTime {
+        self.0
+    }
+
     /// Format as RFC 3339 string.
-    pub fn to_rfc3339(&self) -> String {
+    ///
+    /// Propagates any formatting error instead of substituting Unix epoch fallback.
+    pub fn to_rfc3339(&self) -> Result<String, ProvenanceError> {
         self.0
             .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+            .map_err(|e| ProvenanceError::InvalidRecordingTime(e.to_string()))
+    }
+}
+
+impl TryFrom<OffsetDateTime> for RecordingTime {
+    type Error = ProvenanceError;
+
+    fn try_from(dt: OffsetDateTime) -> Result<Self, Self::Error> {
+        Self::from_offset_date_time(dt)
+    }
+}
+
+impl From<RecordingTime> for OffsetDateTime {
+    fn from(rt: RecordingTime) -> Self {
+        rt.0
     }
 }
 
 impl Display for RecordingTime {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.to_rfc3339())
+        let formatted = self.to_rfc3339().map_err(|_| std::fmt::Error)?;
+        f.write_str(&formatted)
     }
 }
 
@@ -1400,7 +1456,10 @@ impl Serialize for RecordingTime {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.to_rfc3339())
+        let formatted = self
+            .to_rfc3339()
+            .map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(&formatted)
     }
 }
 
@@ -1942,7 +2001,8 @@ mod tests {
     #[test]
     fn recording_time_rfc3339() {
         let ts = RecordingTime::from_rfc3339("2026-09-17T11:04:27Z").unwrap();
-        assert_eq!(ts.to_rfc3339(), "2026-09-17T11:04:27Z");
+        assert_eq!(ts.to_rfc3339().unwrap(), "2026-09-17T11:04:27Z");
+        assert_eq!(ts.to_string(), "2026-09-17T11:04:27Z");
 
         let json = serde_json::to_string(&ts).unwrap();
         assert_eq!(json, r#""2026-09-17T11:04:27Z""#);
@@ -1952,6 +2012,99 @@ mod tests {
 
         assert!(RecordingTime::from_rfc3339("invalid-date").is_err());
         assert!(RecordingTime::from_rfc3339("").is_err());
+    }
+
+    #[test]
+    fn recording_time_boundary_and_range_validation() {
+        // Legitimate Unix epoch (1970-01-01T00:00:00Z) formats and serializes correctly
+        let epoch = RecordingTime::from_offset_date_time(OffsetDateTime::UNIX_EPOCH).unwrap();
+        assert_eq!(epoch.to_rfc3339().unwrap(), "1970-01-01T00:00:00Z");
+        assert_eq!(epoch.to_string(), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            serde_json::to_string(&epoch).unwrap(),
+            r#""1970-01-01T00:00:00Z""#
+        );
+
+        // Lower boundary: year 0000 UTC
+        let min_dt = time::Date::from_calendar_date(0, time::Month::January, 1)
+            .unwrap()
+            .midnight()
+            .assume_utc();
+        let min_rt = RecordingTime::from_offset_date_time(min_dt).unwrap();
+        assert_eq!(min_rt.to_rfc3339().unwrap(), "0000-01-01T00:00:00Z");
+        assert_ne!(min_rt.to_rfc3339().unwrap(), "1970-01-01T00:00:00Z");
+
+        // Upper boundary: year 9999 UTC
+        let max_dt = time::Date::from_calendar_date(9999, time::Month::December, 31)
+            .unwrap()
+            .with_time(time::Time::from_hms(23, 59, 59).unwrap())
+            .assume_utc();
+        let max_rt = RecordingTime::from_offset_date_time(max_dt).unwrap();
+        assert_eq!(max_rt.to_rfc3339().unwrap(), "9999-12-31T23:59:59Z");
+        assert_ne!(max_rt.to_rfc3339().unwrap(), "1970-01-01T00:00:00Z");
+
+        // OffsetDateTime::MAX is within year 9999 and RFC 3339-representable; it must be accepted
+        let max_od_rt = RecordingTime::from_offset_date_time(OffsetDateTime::MAX).unwrap();
+        assert_eq!(max_od_rt.as_offset_date_time(), OffsetDateTime::MAX);
+        assert!(max_od_rt.to_rfc3339().unwrap().starts_with("9999-12-31T23:59:59"));
+        assert_ne!(max_od_rt.to_rfc3339().unwrap(), "1970-01-01T00:00:00Z");
+        assert!(RecordingTime::try_from(OffsetDateTime::MAX).is_ok());
+
+        // Out-of-range construction: OffsetDateTime::MIN (year -9999) must be rejected
+        let min_err = RecordingTime::from_offset_date_time(OffsetDateTime::MIN).unwrap_err();
+        assert!(matches!(min_err, ProvenanceError::InvalidRecordingTime(_)));
+        assert!(RecordingTime::try_from(OffsetDateTime::MIN).is_err());
+
+        // Negative year (year -1 / 1 BCE) must be rejected
+        let neg_year_dt = time::Date::from_calendar_date(-1, time::Month::December, 31)
+            .unwrap()
+            .midnight()
+            .assume_utc();
+        let neg_err = RecordingTime::from_offset_date_time(neg_year_dt).unwrap_err();
+        assert!(matches!(neg_err, ProvenanceError::InvalidRecordingTime(_)));
+        assert!(RecordingTime::try_from(neg_year_dt).is_err());
+
+        // Constructible offset-crossing: local year 0000 with positive offset shifting into UTC year -1
+        let shift_neg_offset = time::UtcOffset::from_whole_seconds(3600).unwrap();
+        let shift_neg_dt = time::Date::from_calendar_date(0, time::Month::January, 1)
+            .unwrap()
+            .with_time(time::Time::from_hms(0, 30, 0).unwrap())
+            .assume_offset(shift_neg_offset);
+        let shift_neg_err = RecordingTime::from_offset_date_time(shift_neg_dt).unwrap_err();
+        assert!(matches!(shift_neg_err, ProvenanceError::InvalidRecordingTime(_)));
+        assert!(RecordingTime::try_from(shift_neg_dt).is_err());
+
+        // Constructible offset-crossing: local year 9999 with negative offset shifting into UTC year 10000
+        let shift_pos_offset = time::UtcOffset::from_whole_seconds(-3600).unwrap();
+        let shift_pos_dt = time::Date::from_calendar_date(9999, time::Month::December, 31)
+            .unwrap()
+            .with_time(time::Time::from_hms(23, 30, 0).unwrap())
+            .assume_offset(shift_pos_offset);
+        let shift_pos_err = RecordingTime::from_offset_date_time(shift_pos_dt).unwrap_err();
+        assert!(matches!(shift_pos_err, ProvenanceError::InvalidRecordingTime(_)));
+        assert!(RecordingTime::try_from(shift_pos_dt).is_err());
+
+        // Parsed RFC 3339 timezone shift that pushes UTC into year -1 must be rejected
+        // 0000-01-01T00:30:00+01:00 is -0001-12-31T23:30:00Z in UTC
+        let shift_neg = RecordingTime::from_rfc3339("0000-01-01T00:30:00+01:00");
+        assert!(shift_neg.is_err(), "Must reject RFC 3339 shifting into negative UTC year");
+
+        // Parsed RFC 3339 timezone shift that pushes UTC into year 10000 must be rejected
+        // 9999-12-31T23:30:00-01:00 is 10000-01-01T00:30:00Z in UTC
+        let shift_pos = RecordingTime::from_rfc3339("9999-12-31T23:30:00-01:00");
+        assert!(shift_pos.is_err(), "Must reject RFC 3339 shifting into 5-digit UTC year");
+
+        // Serde deserialization must reject out-of-range timestamps rather than defaulting to 1970-01-01
+        assert!(serde_json::from_str::<RecordingTime>(r#""-0001-12-31T23:59:59Z""#).is_err());
+        assert!(serde_json::from_str::<RecordingTime>(r#""0000-01-01T00:30:00+01:00""#).is_err());
+        assert!(serde_json::from_str::<RecordingTime>(r#""10000-01-01T00:00:00Z""#).is_err());
+        assert!(serde_json::from_str::<RecordingTime>(r#""9999-12-31T23:30:00-01:00""#).is_err());
+
+        // now_utc produces a valid RFC 3339 timestamp that formats without fallback
+        let now = RecordingTime::now_utc();
+        let formatted = now.to_rfc3339().unwrap();
+        assert!(formatted.ends_with('Z'));
+        assert_ne!(formatted, "1970-01-01T00:00:00Z");
     }
 
     #[test]
