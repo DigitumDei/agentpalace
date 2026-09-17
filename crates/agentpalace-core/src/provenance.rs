@@ -2897,6 +2897,7 @@ mod tests {
             r#""op_ownerless""#,
             r#""legacy:op_legacy""#,
             r#""unknown:op_unknown""#,
+            r#"{"raw_key":"op_ownerless_object"}"#,
         ] {
             let json = format!(
                 r#"{{
@@ -2907,6 +2908,7 @@ mod tests {
                 }}"#
             );
             let envelope: ProvenanceEnvelope = serde_json::from_str(&json).unwrap();
+            assert!(envelope.owner.owner_id().is_none());
             let key = envelope.operation_id().unwrap();
             assert_eq!(key.owner_id(), None);
             assert!(!key.is_authenticated());
