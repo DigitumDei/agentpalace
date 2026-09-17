@@ -27,6 +27,7 @@ use std::ops::Deref;
 use std::str::FromStr;
 
 use serde::de::{self, Deserializer, Visitor};
+use serde::ser;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -197,6 +198,11 @@ impl OwnerId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Validate bounded invariants.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        validate_owner_id(&self.0)
+    }
 }
 
 impl Deref for OwnerId {
@@ -308,6 +314,11 @@ impl Issuer {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Validate bounded invariants.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        validate_issuer(&self.0)
+    }
 }
 
 impl Deref for Issuer {
@@ -405,6 +416,11 @@ impl Subject {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Validate bounded invariants.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        validate_subject(&self.0)
+    }
 }
 
 impl Deref for Subject {
@@ -462,6 +478,7 @@ impl<'de> Deserialize<'de> for Subject {
 
 /// Provider-neutral issuer/subject pair binding an external identity to an internal owner.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubjectBinding {
     /// Identity provider issuer.
     pub issuer: Issuer,
@@ -484,6 +501,13 @@ impl SubjectBinding {
             issuer: Issuer::new(issuer)?,
             subject: Subject::new(subject)?,
         })
+    }
+
+    /// Validate bounded invariants.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        self.issuer.validate()?;
+        self.subject.validate()?;
+        Ok(())
     }
 }
 
@@ -549,6 +573,11 @@ impl EmailAtWrite {
     /// View as string slice.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Validate bounded invariants.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        validate_email(&self.0)
     }
 }
 
@@ -620,6 +649,7 @@ impl<'de> Deserialize<'de> for EmailAtWrite {
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthenticatedOwner {
     /// Immutable, system-generated owner identifier.
     pub id: OwnerId,
@@ -668,6 +698,15 @@ impl AuthenticatedOwner {
             issuer: self.issuer.clone(),
             subject: self.subject.clone(),
         }
+    }
+
+    /// Validate bounded invariants of all components.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        self.id.validate()?;
+        self.issuer.validate()?;
+        self.subject.validate()?;
+        self.email_at_write.validate()?;
+        Ok(())
     }
 }
 
@@ -724,6 +763,14 @@ impl OwnerIdentity {
             Self::Unknown => None,
         }
     }
+
+    /// Validate bounded invariants.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        match self {
+            Self::Unknown => Ok(()),
+            Self::Authenticated(owner) => owner.validate(),
+        }
+    }
 }
 
 impl Serialize for OwnerIdentity {
@@ -745,6 +792,7 @@ impl Serialize for OwnerIdentity {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawOwnerIdentity {
     #[serde(default)]
     status: Option<String>,
@@ -902,6 +950,11 @@ impl AgentName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Validate bounded invariants.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        validate_agent_name(&self.0)
+    }
 }
 
 impl Deref for AgentName {
@@ -968,6 +1021,7 @@ pub enum AgentAssurance {
 
 /// Caller-asserted agent attribution.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentAttribution {
     /// Name of the acting agent or harness.
     pub agent_name: AgentName,
@@ -991,6 +1045,11 @@ impl AgentAttribution {
             agent_name,
             assurance,
         }
+    }
+
+    /// Validate bounded invariants.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        self.agent_name.validate()
     }
 }
 
@@ -1040,6 +1099,11 @@ impl SourceAuthor {
     /// View as string slice.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Validate bounded invariants.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        validate_source_author(&self.0)
     }
 }
 
@@ -1140,6 +1204,11 @@ impl SourceReference {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Validate bounded invariants.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        validate_source_reference(&self.0)
+    }
 }
 
 impl Deref for SourceReference {
@@ -1219,30 +1288,141 @@ fn validate_origin_id(s: &str) -> Result<(), ProvenanceError> {
     Ok(())
 }
 
+/// Local storage origin data with private fields preventing unchecked construction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct LocalOrigin {
+    origin_id: String,
+}
+
+impl LocalOrigin {
+    /// Construct and validate a local origin.
+    pub fn new(origin_id: impl Into<String>) -> Result<Self, ProvenanceError> {
+        let id = origin_id.into();
+        validate_origin_id(&id)?;
+        Ok(Self { origin_id: id })
+    }
+
+    /// View the local origin identifier.
+    pub fn origin_id(&self) -> &str {
+        &self.origin_id
+    }
+
+    /// Validate bounded invariants.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        validate_origin_id(&self.origin_id)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLocalOrigin {
+    origin_id: String,
+}
+
+impl<'de> Deserialize<'de> for LocalOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawLocalOrigin::deserialize(deserializer)?;
+        LocalOrigin::new(raw.origin_id).map_err(de::Error::custom)
+    }
+}
+
+/// Federated storage origin data with private fields preventing unchecked construction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct FederatedOrigin {
+    origin_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_record_id: Option<String>,
+}
+
+impl FederatedOrigin {
+    /// Construct and validate a federated origin.
+    pub fn new(
+        origin_id: impl Into<String>,
+        original_record_id: Option<String>,
+    ) -> Result<Self, ProvenanceError> {
+        let id = origin_id.into();
+        validate_origin_id(&id)?;
+        if let Some(ref rec_id) = original_record_id {
+            if rec_id.len() > MAX_RECORD_ID_CHARS {
+                return Err(ProvenanceError::ValueTooLong {
+                    field: "original_record_id",
+                    len: rec_id.len(),
+                    max: MAX_RECORD_ID_CHARS,
+                });
+            }
+        }
+        Ok(Self {
+            origin_id: id,
+            original_record_id,
+        })
+    }
+
+    /// View the remote origin identifier or URL.
+    pub fn origin_id(&self) -> &str {
+        &self.origin_id
+    }
+
+    /// View the upstream record identifier on the originating node, if preserved.
+    pub fn original_record_id(&self) -> Option<&str> {
+        self.original_record_id.as_deref()
+    }
+
+    /// Validate bounded invariants.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        validate_origin_id(&self.origin_id)?;
+        if let Some(ref rec_id) = self.original_record_id {
+            if rec_id.len() > MAX_RECORD_ID_CHARS {
+                return Err(ProvenanceError::ValueTooLong {
+                    field: "original_record_id",
+                    len: rec_id.len(),
+                    max: MAX_RECORD_ID_CHARS,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFederatedOrigin {
+    origin_id: String,
+    #[serde(default)]
+    original_record_id: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for FederatedOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawFederatedOrigin::deserialize(deserializer)?;
+        FederatedOrigin::new(raw.origin_id, raw.original_record_id).map_err(de::Error::custom)
+    }
+}
+
 /// Storage origin identifying where a record was originally created.
 ///
 /// Distinguishes records created directly on this local palace node/host
 /// from those federated, imported, or replicated from remote instances.
+///
+/// Variant data is sealed behind validated types ([`LocalOrigin`], [`FederatedOrigin`]),
+/// preventing unchecked external construction and exposing validated constructors
+/// and read-only accessors.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StorageOrigin {
     /// Created directly on this local palace node or instance.
-    Local {
-        /// Local instance or node identifier (e.g. `"local"` or host origin name).
-        origin_id: String,
-    },
+    Local(LocalOrigin),
     /// Ingested or synchronized from a remote or federated palace.
-    Federated {
-        /// Remote origin identity or URL.
-        origin_id: String,
-        /// Upstream record identifier on the originating node, if preserved.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        original_record_id: Option<String>,
-    },
+    Federated(FederatedOrigin),
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum RawStorageOrigin {
     Local {
         origin_id: String,
@@ -1272,19 +1452,29 @@ impl<'de> Deserialize<'de> for StorageOrigin {
     }
 }
 
+impl From<LocalOrigin> for StorageOrigin {
+    fn from(local: LocalOrigin) -> Self {
+        Self::Local(local)
+    }
+}
+
+impl From<FederatedOrigin> for StorageOrigin {
+    fn from(fed: FederatedOrigin) -> Self {
+        Self::Federated(fed)
+    }
+}
+
 impl StorageOrigin {
     /// Create a local storage origin with the default `"local"` identifier.
     pub fn local_default() -> Self {
-        Self::Local {
+        Self::Local(LocalOrigin {
             origin_id: "local".to_string(),
-        }
+        })
     }
 
     /// Create a local storage origin with a specific node/palace identifier.
     pub fn local(origin_id: impl Into<String>) -> Result<Self, ProvenanceError> {
-        let id = origin_id.into();
-        validate_origin_id(&id)?;
-        Ok(Self::Local { origin_id: id })
+        Ok(Self::Local(LocalOrigin::new(origin_id)?))
     }
 
     /// Create a federated storage origin.
@@ -1292,39 +1482,60 @@ impl StorageOrigin {
         origin_id: impl Into<String>,
         original_record_id: Option<String>,
     ) -> Result<Self, ProvenanceError> {
-        let id = origin_id.into();
-        validate_origin_id(&id)?;
-        if let Some(ref rec_id) = original_record_id {
-            if rec_id.len() > MAX_RECORD_ID_CHARS {
-                return Err(ProvenanceError::ValueTooLong {
-                    field: "original_record_id",
-                    len: rec_id.len(),
-                    max: MAX_RECORD_ID_CHARS,
-                });
-            }
-        }
-        Ok(Self::Federated {
-            origin_id: id,
+        Ok(Self::Federated(FederatedOrigin::new(
+            origin_id,
             original_record_id,
-        })
+        )?))
     }
 
     /// View the origin identifier.
     pub fn origin_id(&self) -> &str {
         match self {
-            Self::Local { origin_id } => origin_id,
-            Self::Federated { origin_id, .. } => origin_id,
+            Self::Local(local) => local.origin_id(),
+            Self::Federated(fed) => fed.origin_id(),
+        }
+    }
+
+    /// View the upstream record identifier, if federated and preserved.
+    pub fn original_record_id(&self) -> Option<&str> {
+        match self {
+            Self::Local(_) => None,
+            Self::Federated(fed) => fed.original_record_id(),
         }
     }
 
     /// Returns `true` if this is a local origin.
     pub fn is_local(&self) -> bool {
-        matches!(self, Self::Local { .. })
+        matches!(self, Self::Local(_))
     }
 
     /// Returns `true` if this is a federated origin.
     pub fn is_federated(&self) -> bool {
-        matches!(self, Self::Federated { .. })
+        matches!(self, Self::Federated(_))
+    }
+
+    /// View the inner [`LocalOrigin`] if this is a local origin.
+    pub fn as_local(&self) -> Option<&LocalOrigin> {
+        match self {
+            Self::Local(local) => Some(local),
+            Self::Federated(_) => None,
+        }
+    }
+
+    /// View the inner [`FederatedOrigin`] if this is a federated origin.
+    pub fn as_federated(&self) -> Option<&FederatedOrigin> {
+        match self {
+            Self::Local(_) => None,
+            Self::Federated(fed) => Some(fed),
+        }
+    }
+
+    /// Validate bounded invariants.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        match self {
+            Self::Local(local) => local.validate(),
+            Self::Federated(fed) => fed.validate(),
+        }
     }
 }
 
@@ -1421,6 +1632,11 @@ impl RecordingTime {
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| ProvenanceError::InvalidRecordingTime(e.to_string()))
     }
+
+    /// Validate bounded invariants.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        Self::validate_and_normalize(self.0).map(|_| ())
+    }
 }
 
 impl TryFrom<OffsetDateTime> for RecordingTime {
@@ -1480,13 +1696,16 @@ impl<'de> Deserialize<'de> for RecordingTime {
 /// Scoping receipt lookups and idempotency keys to `(owner_id, operation_id)`
 /// ensures that one user's retries or client-supplied IDs cannot collide with
 /// or replay another user's operations.
+///
+/// Components are sealed behind private fields, preventing unchecked external
+/// construction and guaranteeing invariant validation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct OwnerScopedKey {
     /// Authenticated owner ID, or None for legacy/unauthenticated scopes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_id: Option<OwnerId>,
+    owner_id: Option<OwnerId>,
     /// Raw operation or idempotency key.
-    pub raw_key: String,
+    raw_key: String,
 }
 
 impl OwnerScopedKey {
@@ -1507,10 +1726,18 @@ impl OwnerScopedKey {
                 max: MAX_OPERATION_ID_CHARS,
             });
         }
+        if let Some(ref owner) = owner_id {
+            validate_owner_id(owner.as_str())?;
+        }
         Ok(Self {
             owner_id,
             raw_key: trimmed.to_string(),
         })
+    }
+
+    /// Construct a new [`OwnerScopedKey`] with an updated owner scope while preserving and re-validating the raw key.
+    pub fn with_owner_id(self, owner_id: Option<OwnerId>) -> Result<Self, ProvenanceError> {
+        Self::new(owner_id, self.raw_key)
     }
 
     /// Validate bounded invariants.
@@ -1524,6 +1751,12 @@ impl OwnerScopedKey {
                 field: "raw_key",
                 len: trimmed.len(),
                 max: MAX_OPERATION_ID_CHARS,
+            });
+        }
+        if self.raw_key != trimmed {
+            return Err(ProvenanceError::InvalidCharacter {
+                field: "raw_key",
+                ch: ' ',
             });
         }
         if let Some(ref owner) = self.owner_id {
@@ -1540,6 +1773,16 @@ impl OwnerScopedKey {
     /// View owner ID, if scoped to an authenticated owner.
     pub fn owner_id(&self) -> Option<&OwnerId> {
         self.owner_id.as_ref()
+    }
+
+    /// Returns `true` if this key is scoped to an authenticated owner.
+    pub fn is_authenticated(&self) -> bool {
+        self.owner_id.is_some()
+    }
+
+    /// Returns `true` if this key is unscoped or belongs to a legacy installation.
+    pub fn is_legacy(&self) -> bool {
+        self.owner_id.is_none()
     }
 
     /// Generate composite key string suitable for storage indexes.
@@ -1586,13 +1829,17 @@ impl FromStr for OwnerScopedKey {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawScopedKeyStruct {
+    #[serde(default)]
+    owner_id: Option<OwnerId>,
+    raw_key: String,
+}
+
+#[derive(Deserialize)]
 #[serde(untagged)]
 enum RawScopedKeyHelper {
-    Struct {
-        #[serde(default)]
-        owner_id: Option<OwnerId>,
-        raw_key: String,
-    },
+    Struct(RawScopedKeyStruct),
     Str(String),
 }
 
@@ -1603,8 +1850,8 @@ impl<'de> Deserialize<'de> for OwnerScopedKey {
     {
         let raw = RawScopedKeyHelper::deserialize(deserializer)?;
         match raw {
-            RawScopedKeyHelper::Struct { owner_id, raw_key } => {
-                OwnerScopedKey::new(owner_id, raw_key).map_err(de::Error::custom)
+            RawScopedKeyHelper::Struct(s) => {
+                OwnerScopedKey::new(s.owner_id, s.raw_key).map_err(de::Error::custom)
             }
             RawScopedKeyHelper::Str(s) => {
                 OwnerScopedKey::from_str(&s).map_err(de::Error::custom)
@@ -1628,26 +1875,55 @@ impl<'de> Deserialize<'de> for OwnerScopedKey {
 ///
 /// Note: Evidence status (claim truth/verification) and execution authority
 /// (roles/permissions) are intentionally excluded from this slice.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenanceEnvelope {
     /// Authenticated owner identity, or explicitly unknown/legacy.
     pub owner: OwnerIdentity,
     /// Caller-asserted agent or runtime harness identity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<AgentAttribution>,
     /// Server-assigned recording timestamp in UTC.
     pub recorded_at: RecordingTime,
     /// Storage origin (local or federated).
     pub origin: StorageOrigin,
     /// Optional owner-scoped operation / idempotency key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<OwnerScopedKey>,
     /// Original source author, distinct from the submitting owner.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_author: Option<SourceAuthor>,
     /// Original source references (file paths, commit SHAs, URLs, citations).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_refs: Vec<SourceReference>,
+}
+
+impl Serialize for ProvenanceEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        #[derive(Serialize)]
+        struct RawEnvelopeRef<'a> {
+            owner: &'a OwnerIdentity,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            actor: Option<&'a AgentAttribution>,
+            recorded_at: RecordingTime,
+            origin: &'a StorageOrigin,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            operation_id: Option<&'a OwnerScopedKey>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            source_author: Option<&'a SourceAuthor>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            source_refs: &'a Vec<SourceReference>,
+        }
+        let raw = RawEnvelopeRef {
+            owner: &self.owner,
+            actor: self.actor.as_ref(),
+            recorded_at: self.recorded_at,
+            origin: &self.origin,
+            operation_id: self.operation_id.as_ref(),
+            source_author: self.source_author.as_ref(),
+            source_refs: &self.source_refs,
+        };
+        raw.serialize(serializer)
+    }
 }
 
 impl ProvenanceEnvelope {
@@ -1708,6 +1984,9 @@ impl ProvenanceEnvelope {
                 max: MAX_SOURCE_REFS,
             });
         }
+        for r in &refs {
+            r.validate()?;
+        }
         self.source_refs = refs;
         Ok(self)
     }
@@ -1718,7 +1997,7 @@ impl ProvenanceEnvelope {
     }
 
     fn check_owner_scope(&self, key: &OwnerScopedKey) -> Result<(), ProvenanceError> {
-        match (&self.owner, &key.owner_id) {
+        match (&self.owner, key.owner_id()) {
             (OwnerIdentity::Authenticated(owner), Some(op_owner)) => {
                 if &owner.id != op_owner {
                     return Err(ProvenanceError::OwnerScopeMismatch {
@@ -1744,13 +2023,25 @@ impl ProvenanceEnvelope {
         Ok(())
     }
 
-    /// Validate the envelope's bounded constraints and owner-scoping invariants.
+    /// Validate the envelope's bounded constraints, storage origin, and owner-scoping invariants.
     pub fn validate(&self) -> Result<(), ProvenanceError> {
+        self.owner.validate()?;
+        if let Some(ref actor) = self.actor {
+            actor.validate()?;
+        }
+        self.recorded_at.validate()?;
+        self.origin.validate()?;
         if self.source_refs.len() > MAX_SOURCE_REFS {
             return Err(ProvenanceError::TooManySourceRefs {
                 count: self.source_refs.len(),
                 max: MAX_SOURCE_REFS,
             });
+        }
+        for r in &self.source_refs {
+            r.validate()?;
+        }
+        if let Some(ref author) = self.source_author {
+            author.validate()?;
         }
         if let Some(ref key) = self.operation_id {
             key.validate()?;
@@ -1761,6 +2052,7 @@ impl ProvenanceEnvelope {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawProvenanceEnvelope {
     owner: OwnerIdentity,
     #[serde(default)]
@@ -1781,26 +2073,29 @@ impl<'de> Deserialize<'de> for ProvenanceEnvelope {
         D: Deserializer<'de>,
     {
         let raw = RawProvenanceEnvelope::deserialize(deserializer)?;
-        let mut envelope = ProvenanceEnvelope {
-            owner: raw.owner,
-            actor: raw.actor,
-            recorded_at: raw.recorded_at,
-            origin: raw.origin,
-            operation_id: raw.operation_id,
-            source_author: raw.source_author,
-            source_refs: raw.source_refs,
-        };
-
-        // If operation_id was deserialized without an owner_id (e.g. from a raw string),
-        // scope it to the envelope's owner if authenticated.
-        if let Some(ref mut op) = envelope.operation_id {
-            if op.owner_id.is_none() {
-                if let Some(owner_id) = envelope.owner.owner_id() {
-                    op.owner_id = Some(owner_id.clone());
-                }
-            }
+        let mut envelope = ProvenanceEnvelope::new(raw.owner, raw.recorded_at, raw.origin);
+        if let Some(actor) = raw.actor {
+            envelope = envelope.with_actor(actor);
         }
-
+        if let Some(op) = raw.operation_id {
+            let scoped = if op.owner_id().is_none() {
+                if let Some(owner_id) = envelope.owner.owner_id() {
+                    OwnerScopedKey::new(Some(owner_id.clone()), op.raw_key())
+                        .map_err(de::Error::custom)?
+                } else {
+                    op
+                }
+            } else {
+                op
+            };
+            envelope = envelope.with_operation_key(scoped).map_err(de::Error::custom)?;
+        }
+        if let Some(source_author) = raw.source_author {
+            envelope = envelope.with_source_author(source_author);
+        }
+        if !raw.source_refs.is_empty() {
+            envelope = envelope.with_source_refs(raw.source_refs).map_err(de::Error::custom)?;
+        }
         envelope.validate().map_err(de::Error::custom)?;
         Ok(envelope)
     }
@@ -2559,5 +2854,191 @@ mod tests {
             serde_json::from_str::<OwnerIdentity>(tagged_upper).unwrap(),
             OwnerIdentity::Authenticated(_)
         ));
+    }
+
+    #[test]
+    fn sealed_storage_origin_inaccessible_unchecked_construction_and_accessors() {
+        // Valid local construction via StorageOrigin and LocalOrigin
+        let local_origin = LocalOrigin::new("node-primary").unwrap();
+        assert_eq!(local_origin.origin_id(), "node-primary");
+        local_origin.validate().unwrap();
+
+        let storage_local = StorageOrigin::local("node-primary").unwrap();
+        assert!(storage_local.is_local());
+        assert!(!storage_local.is_federated());
+        assert_eq!(storage_local.origin_id(), "node-primary");
+        assert_eq!(storage_local.original_record_id(), None);
+        assert_eq!(storage_local.as_local().unwrap().origin_id(), "node-primary");
+        assert!(storage_local.as_federated().is_none());
+        storage_local.validate().unwrap();
+
+        // From<LocalOrigin> conversion
+        let from_local: StorageOrigin = local_origin.into();
+        assert_eq!(from_local, storage_local);
+
+        // Pattern matching on StorageOrigin variants
+        match &storage_local {
+            StorageOrigin::Local(l) => assert_eq!(l.origin_id(), "node-primary"),
+            StorageOrigin::Federated(_) => panic!("expected Local variant"),
+        }
+
+        // Invalid LocalOrigin inputs
+        assert!(LocalOrigin::new("").is_err());
+        assert!(LocalOrigin::new("   ").is_err());
+        assert!(LocalOrigin::new("bad space").is_err());
+        assert!(LocalOrigin::new("a".repeat(MAX_ORIGIN_ID_CHARS + 1)).is_err());
+
+        // Valid federated construction via StorageOrigin and FederatedOrigin
+        let fed_origin = FederatedOrigin::new("https://remote.palace", Some("rec_123".to_string())).unwrap();
+        assert_eq!(fed_origin.origin_id(), "https://remote.palace");
+        assert_eq!(fed_origin.original_record_id(), Some("rec_123"));
+        fed_origin.validate().unwrap();
+
+        let storage_fed = StorageOrigin::federated("https://remote.palace", Some("rec_123".to_string())).unwrap();
+        assert!(storage_fed.is_federated());
+        assert!(!storage_fed.is_local());
+        assert_eq!(storage_fed.origin_id(), "https://remote.palace");
+        assert_eq!(storage_fed.original_record_id(), Some("rec_123"));
+        assert_eq!(storage_fed.as_federated().unwrap().origin_id(), "https://remote.palace");
+        assert_eq!(storage_fed.as_federated().unwrap().original_record_id(), Some("rec_123"));
+        assert!(storage_fed.as_local().is_none());
+        storage_fed.validate().unwrap();
+
+        // From<FederatedOrigin> conversion
+        let from_fed: StorageOrigin = fed_origin.into();
+        assert_eq!(from_fed, storage_fed);
+
+        // Pattern matching on Federated variant
+        match &storage_fed {
+            StorageOrigin::Federated(f) => {
+                assert_eq!(f.origin_id(), "https://remote.palace");
+                assert_eq!(f.original_record_id(), Some("rec_123"));
+            }
+            StorageOrigin::Local(_) => panic!("expected Federated variant"),
+        }
+
+        // Invalid FederatedOrigin inputs
+        assert!(FederatedOrigin::new("", None).is_err());
+        assert!(FederatedOrigin::new("https://remote palace", None).is_err());
+        assert!(FederatedOrigin::new("a".repeat(MAX_ORIGIN_ID_CHARS + 1), None).is_err());
+        assert!(FederatedOrigin::new("https://remote.palace", Some("r".repeat(MAX_RECORD_ID_CHARS + 1))).is_err());
+
+        // Deserialization of LocalOrigin and FederatedOrigin directly
+        let loc_de: LocalOrigin = serde_json::from_str(r#"{"origin_id":"node-primary"}"#).unwrap();
+        assert_eq!(loc_de.origin_id(), "node-primary");
+        assert!(serde_json::from_str::<LocalOrigin>(r#"{"origin_id":"bad space"}"#).is_err());
+        assert!(serde_json::from_str::<LocalOrigin>(r#"{"origin_id":"node-primary","extra":1}"#).is_err());
+
+        let fed_de: FederatedOrigin = serde_json::from_str(r#"{"origin_id":"https://remote.palace","original_record_id":"rec_123"}"#).unwrap();
+        assert_eq!(fed_de.origin_id(), "https://remote.palace");
+        assert_eq!(fed_de.original_record_id(), Some("rec_123"));
+        assert!(serde_json::from_str::<FederatedOrigin>(r#"{"origin_id":""}"#).is_err());
+        assert!(serde_json::from_str::<FederatedOrigin>(r#"{"origin_id":"https://remote.palace","extra":1}"#).is_err());
+    }
+
+    #[test]
+    fn sealed_owner_scoped_key_accessors_and_scope_transition() {
+        let owner_id = OwnerId::new("usr_01J8Y").unwrap();
+
+        // Legacy key
+        let legacy_key = OwnerScopedKey::new(None, "op_sync").unwrap();
+        assert!(legacy_key.is_legacy());
+        assert!(!legacy_key.is_authenticated());
+        assert_eq!(legacy_key.raw_key(), "op_sync");
+        assert_eq!(legacy_key.owner_id(), None);
+        assert_eq!(legacy_key.composite_key(), "legacy:op_sync");
+        legacy_key.validate().unwrap();
+
+        // Transition from legacy to authenticated via with_owner_id
+        let authed_key = legacy_key.with_owner_id(Some(owner_id.clone())).unwrap();
+        assert!(authed_key.is_authenticated());
+        assert!(!authed_key.is_legacy());
+        assert_eq!(authed_key.raw_key(), "op_sync");
+        assert_eq!(authed_key.owner_id(), Some(&owner_id));
+        assert_eq!(authed_key.composite_key(), "usr_01J8Y:op_sync");
+        authed_key.validate().unwrap();
+
+        // Transition back to legacy
+        let de_authed = authed_key.with_owner_id(None).unwrap();
+        assert!(de_authed.is_legacy());
+        assert_eq!(de_authed.composite_key(), "legacy:op_sync");
+
+        // Leading/trailing whitespace trimmed on construction
+        let trimmed_key = OwnerScopedKey::new(None, "  op_trimmed  ").unwrap();
+        assert_eq!(trimmed_key.raw_key(), "op_trimmed");
+    }
+
+    #[test]
+    fn fail_closed_unknown_and_misspelled_fields_rejection() {
+        // StorageOrigin rejects unknown fields
+        assert!(serde_json::from_str::<StorageOrigin>(r#"{"kind":"local","origin_id":"local","unknown_field":"bad"}"#).is_err());
+        assert!(serde_json::from_str::<StorageOrigin>(r#"{"kind":"federated","origin_id":"https://remote.palace","unknown_field":"bad"}"#).is_err());
+
+        // OwnerScopedKey rejects unknown fields
+        assert!(serde_json::from_str::<OwnerScopedKey>(r#"{"raw_key":"op_1","unknown_field":"bad"}"#).is_err());
+        assert!(serde_json::from_str::<OwnerScopedKey>(r#"{"owner_id":"usr_01J8Y","raw_key":"op_1","extra":1}"#).is_err());
+
+        // OwnerIdentity rejects unknown/misspelled fields
+        assert!(serde_json::from_str::<OwnerIdentity>(r#"{"status":"unknown","unknown_field":1}"#).is_err());
+        assert!(serde_json::from_str::<OwnerIdentity>(r#"{
+            "status": "authenticated",
+            "id": "usr_01J8Y",
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com",
+            "unknown_extra": true
+        }"#).is_err());
+
+        // Misspelled field in AuthenticatedOwner / OwnerIdentity
+        assert!(serde_json::from_str::<OwnerIdentity>(r#"{
+            "id": "usr_01J8Y",
+            "issur": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com"
+        }"#).is_err());
+
+        assert!(serde_json::from_str::<AuthenticatedOwner>(r#"{
+            "id": "usr_01J8Y",
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com",
+            "extra_field": 42
+        }"#).is_err());
+
+        // ProvenanceEnvelope rejects unknown fields
+        assert!(serde_json::from_str::<ProvenanceEnvelope>(r#"{
+            "owner": {"status": "unknown"},
+            "recorded_at": "2026-09-17T11:04:27Z",
+            "origin": {"kind": "local", "origin_id": "local"},
+            "unknown_envelope_field": "disallowed"
+        }"#).is_err());
+    }
+
+    #[test]
+    fn persistence_boundary_validation_on_serialization_and_envelope() {
+        let other_id = OwnerId::new("usr_other").unwrap();
+        let auth_owner = AuthenticatedOwner::parse(
+            "usr_01J8Y",
+            "https://accounts.google.com",
+            "104928190283019283019",
+            "tester@example.com",
+        )
+        .unwrap();
+        let recorded_at = RecordingTime::from_rfc3339("2026-09-17T11:04:27Z").unwrap();
+        let origin = StorageOrigin::local_default();
+
+        // Mismatched operation key cannot be attached via with_operation_key
+        let mismatched_key = OwnerScopedKey::new(Some(other_id), "op_1").unwrap();
+        let env_result = ProvenanceEnvelope::new(auth_owner.clone().into(), recorded_at, origin.clone())
+            .with_operation_key(mismatched_key.clone());
+        assert!(matches!(env_result, Err(ProvenanceError::OwnerScopeMismatch { .. })));
+
+        // If an envelope is created with mismatched operation_id manually,
+        // envelope.validate() and serialization both reject it at the boundary
+        let mut corrupted_env = ProvenanceEnvelope::new(auth_owner.into(), recorded_at, origin);
+        corrupted_env.operation_id = Some(mismatched_key);
+
+        assert!(corrupted_env.validate().is_err());
+        assert!(serde_json::to_string(&corrupted_env).is_err());
     }
 }
