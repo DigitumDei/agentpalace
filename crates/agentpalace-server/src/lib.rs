@@ -22,6 +22,8 @@
 //! # }
 //! ```
 
+#![deny(private_interfaces)]
+
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::SystemTime;
