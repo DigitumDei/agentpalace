@@ -24,8 +24,11 @@ The remote REST routes enumerated in this document constitute the **complete, cl
 The following subsystems and operations are strictly outside the remote REST demo surface:
 1. **Local-Only Diaries:**
    - Diaries are personal, local-first continuity records.
-   - All drawer and coordination endpoints reject diary-shaped requests (`is_diary_wing_or_room`, `wing_agents`, or `__agentpalace_diary_` topic prefix) with `422 Unprocessable Entity` (`ServerError::DiaryNotFederated`).
    - The remote REST API does not expose diary reads, writes, or searches.
+   - Rather than a blanket rejection across all endpoints, actual behavior varies by interaction pattern:
+     - **Collection/search reads** filter diary records (`POST /v1/drawers/search`, `POST /v1/drawers/check_duplicate`, `GET /v1/drawers`, `GET /v1/changes`, `GET /v1/taxonomy`, `GET /v1/rooms`, `GET /v1/coordination/tasks`, `GET /v1/coordination/inbox`, `GET /v1/coordination/events`).
+     - **Resource lookups** mask them as `404 Not Found` (`GET /v1/drawers/{id}`, `DELETE /v1/drawers/{id}`, and coordination resource lookups such as `GET /v1/coordination/tasks/{id}`) to eliminate existence oracles.
+     - **Relevant mutation inputs** are rejected with `422 Unprocessable Entity` (`ServerError::DiaryNotFederated`) when diary wings, rooms, or topics are targeted (`POST /v1/drawers`, `POST /v1/ingest/preflight`, `POST /v1/ingest/batch`, `POST /v1/coordination/tasks`, and mutation/claim attempts targeting diary-owned coordination tasks).
 2. **HTTP MCP Transport:**
    - Model Context Protocol (MCP) transport (`/mcp`) is handled locally by `agentpalace-cli/transport.rs` and remains on the client side.
    - The demo hub gateway loopback proxy does not publish, forward, or expose `/mcp`.
@@ -266,7 +269,7 @@ The table below catalogs every current method/path pair registered in `build_rou
 #### 8. `DELETE /v1/drawers/{id}`
 - **Operation Gate:** `delete`.
 - **Wing Authorization:** Category B (Lookup-then-authorize).
-  - Resolves drawer to find wing. Rejects diary drawers. Verifies `auth.allows_wing(Operation::Delete, drawer.wing)` -> `404 Not Found` on mismatch.
+  - Resolves drawer to find wing. Masks diary drawers as `404 Not Found`. Verifies `auth.allows_wing(Operation::Delete, drawer.wing)` -> `404 Not Found` on mismatch.
 - **Demo Role Eligibility:** `admin` only (denied to `readonly` and `write` in Demo Hub).
 - **Request Surface:** `DELETE /v1/drawers/{id}`, path parameter `id`, query parameter `operation_id` (Option<string>).
 - **Retrieval Surface:** `200 OK`, JSON `{"success": true, "drawer_id": id, "wing": wing, "room": room}`.
@@ -549,7 +552,7 @@ The table below catalogs every current method/path pair registered in `build_rou
 
 #### 22. `GET /v1/coordination/tasks/{id}`
 - **Operation Gate:** `coordination_read`.
-- **Wing Authorization:** Category B (Lookup-then-authorize). Resolves task; returns `404 Not Found` if missing or if caller lacks `CoordinationRead` on task's wing.
+- **Wing Authorization:** Category B (Lookup-then-authorize). Resolves task; returns `404 Not Found` if missing, if in a diary wing (`wing_agents`), or if caller lacks `CoordinationRead` on task's wing.
 - **Demo Role Eligibility:** `readonly`, `write`, `admin`.
 - **Request Surface:** `GET /v1/coordination/tasks/{id}`, path parameter `id`.
 - **Retrieval Surface:** `200 OK`, JSON `CoordinationTaskDto`.
