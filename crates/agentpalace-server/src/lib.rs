@@ -584,8 +584,10 @@ struct TokenRegistryInner {
 impl TokenRegistry {
     /// Loads the token registry from `path`.
     ///
-    /// The file must be a JSON array of `{"token","name","enabled"}` objects.
-    /// Returns `Err` if the file exists but cannot be parsed.
+    /// The file must be a JSON array of token objects. Each object may include
+    /// optional `scopes` and validated `owner` metadata; absent or null owner
+    /// metadata preserves legacy static-token behavior. Returns `Err` if the
+    /// file exists but cannot be parsed or validated.
     pub fn load(path: PathBuf) -> Result<Self, ServerError> {
         let inner = Self::read_file(&path)?;
         Ok(Self { path, inner: RwLock::new(inner) })
@@ -5843,6 +5845,16 @@ mod tests {
                 "subject": "sub1",
                 "email_at_write": "test@example.com"
             }),
+            // Contradictory ownership status: an authenticated owner object
+            // cannot declare itself unknown while carrying authenticated
+            // fields. This must not be interpreted as legacy ownership.
+            serde_json::json!({
+                "status": "unknown",
+                "id": "usr_01J8Y000000000000000000000",
+                "issuer": "https://accounts.google.com",
+                "subject": "sub1",
+                "email_at_write": "test@example.com"
+            }),
         ];
 
         for (idx, malformed) in malformed_owners.iter().enumerate() {
@@ -5867,6 +5879,38 @@ mod tests {
             assert!(
                 res.is_err(),
                 "case {idx} with malformed owner {malformed:?} must fail load, got: {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_file_rejects_non_object_owner_values() {
+        // `owner: null` is the one intentional non-object representation. Any
+        // other scalar/array value is malformed and must not downgrade a
+        // configured token to an unauthenticated legacy token.
+        for malformed in [
+            serde_json::json!("unknown"),
+            serde_json::json!(42),
+            serde_json::json!([]),
+        ] {
+            let tempdir = TempDir::new().unwrap();
+            let token_file = tempdir.path().join("tokens.json");
+            std::fs::write(
+                &token_file,
+                serde_json::to_string(&serde_json::json!([{
+                    "token": "tok",
+                    "name": "tester",
+                    "enabled": true,
+                    "owner": malformed
+                }]))
+                .unwrap(),
+            )
+            .unwrap();
+            restrict_token_file(&token_file);
+
+            assert!(
+                TokenRegistry::load(token_file).is_err(),
+                "non-null owner value {malformed:?} must fail closed"
             );
         }
     }
