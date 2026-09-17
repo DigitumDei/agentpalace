@@ -1,6 +1,6 @@
 # Demo Hub: Canonical Remote REST Inventory and Implementation Contract
 
-**Document Version:** 1.1.11<br>
+**Document Version:** 1.1.12<br>
 **Release Series:** 0.2.0 (`release/version.toml`)<br>
 **Federation API Version:** 1 (`agentpalace_federation::FEDERATION_API_VERSION`)<br>
 **Status:** Approved Implementation Contract for AgentPalace #160 (parent issue #159)<br>
@@ -149,6 +149,49 @@ currently available versus deferred provenance retrieval path. This makes the
 summary table an allowlist and the detailed sections the implementation contract,
 including POST search, writes, batches, invalidation, deletion, ingest, and all
 coordination reads and mutations.
+
+### 3.2 Reconfirmation audit ledger
+
+The 2026-09-17 reconfirmation read the complete production registration in
+`build_router` (including the separately assembled, body-limited ingest router)
+and matched every method/path pair to one and only one numbered row above:
+
+| Registration set | Count | Required privilege | Contract check |
+|---|---:|---|---|
+| Public liveness | 1 | none | Stateless health response; no receipt or provenance |
+| Authenticated discovery | 1 | authenticated token | Config/runtime read; no mutation receipt |
+| Read-gated REST | 18 | `read` or `coordination_read` | Read-only store access; cursor/filtered retrieval where applicable |
+| Standard writes | 3 | `write` | KG/drawer receipts and recovery rules are specified per route |
+| Deletion | 1 | `delete` | Owner-scope lookup, receipt detail capture, and delete-event recovery |
+| Ingest | 2 | `ingest` | Checkout/read validation or resumable `record_id` batch recovery |
+| Coordination claims | 3 | `coordination_claim` | Revision CAS and lease/transition recovery rules |
+| Coordination writes | 5 | `coordination_write` | Task/message/artifact/result transaction and replay rules |
+| **Total** | **34** |  | **No unlisted production method/path pair is demo-enabled** |
+
+For each row, the audit checked the gate attached at registration, the handler's
+wing or lookup authorization, the durable store actually called by the handler,
+whether the operation is naturally idempotent or has a receipt/CAS key, the
+state left visible after a crash, and the route through which attribution can be
+retrieved. The provenance crosswalk is intentionally bounded:
+
+- Drawer list/get return stored `added_by` and `filed_at`; drawer search exposes
+  the response fields but currently returns those provenance fields as `null`.
+  The change feed exposes the current actor for drawer writes/deletes.
+- KG writes and invalidations expose their result and actor through the change
+  feed; KG query/timeline/stats do not fabricate an owner envelope.
+- Ingest returns per-file status only; attribution is retrieved from the
+  resulting drawer rows and change feed after a successful batch.
+- Coordination DTOs and coordination events expose namespaced agent/actor,
+  creator, sender, recipient, worker, or owner strings as specified in the
+  route rows. They do not yet expose verified human-owner metadata.
+- Health and info have no durable resource provenance. Token owner introspection
+  remains a gateway/storage-slice concern, and no route in this inventory claims
+  durable human-owner attribution before that slice lands.
+
+This audit deliberately does not count local-only diaries, the local HTTP MCP
+transport, MCP-only operations, or test-helper routes. A method/path absent from
+the table remains outside the allowlist and must fail closed; a handler existing
+in the crate is not by itself a remote contract.
 
 ---
 
@@ -839,6 +882,7 @@ Implemented in `crates/agentpalace-core/src/provenance.rs`, the engine provides 
 
 ## 6. Document Revision and Verification History
 
+- **2026-09-17:** Version 1.1.12 reconfirmed all 34 production method/path registrations against the route table, including POST search, writes, KG invalidation, deletion, both ingest routes, and every coordination read/write/claim operation. Added the privilege/store/receipt-recovery count ledger and an explicit provenance retrieval crosswalk. Reconfirmed that local diaries, MCP-only operations, and test routes are excluded, unlisted routes remain fail-closed, and durable human-owner attribution remains deferred to the storage slice.
 - **2026-09-17:** Version 1.1.11 pre-publication static verification for Issue #160. Reviewed the complete retained diff against `origin/main` for production-path coverage, test coverage, documentation consistency, dependency changes, provenance claims, formatting artifacts, and merge-conflict markers. Confirmed the router inventory still covers all 34 production method/path registrations and that no Cargo manifest or lockfile changes were introduced. `git diff --check` and targeted source/document searches passed. Compilation, Rust tests, `rustfmt`, and Clippy were not run because Rust commands are disabled by VM policy; GitHub CI remains the required authority for those checks. This evidence does not claim durable attribution is complete; that remains deferred to the storage slice, and issue #157 remains open.
 - **2026-09-17:** Version 1.1.10 updated for Issue #160. Reconciled provenance terminology and visibility with the implementation: the `TokenScopeEntry` type is module-private, while `AuthIdentity::new` and `AuthIdentity::scopes` are crate-private. Clarified immutable creator versus later submitters/modifiers, source attribution versus authenticated ownership, explicit legacy/unknown ownership, stable owner identity across credential rotation, and owner-scoped receipt/recovery behavior. Preserved implementation-accurate wire representations, validation limits, the complete 34-route inventory, and the statement that durable attribution remains deferred to the storage slice.
 - **2026-09-17:** Version 1.1.9 updated for Issue #160. Audited the 34 production method/path registrations in `build_router`, explicitly excluded test-only routes, `/mcp`, local-only diaries, and MCP-only operations, and documented that every numbered route retains privilege, durable store, idempotency/receipt behavior, recovery invariant, and provenance retrieval status. Unlisted method/path pairs remain outside the demo allowlist and fail closed.

@@ -1253,6 +1253,11 @@ where
     // operation that route requires. `/v1/info` carries no gate: any
     // authenticated token may call it.
     //
+    // This is the closed remote REST allowlist. Keep new remote operations
+    // explicit here and add them to docs/Demo-Hub-REST-Inventory.md; paths
+    // handled elsewhere (including `/mcp` and test-only routes) are not
+    // implicitly demo-enabled and therefore fail closed at the router.
+    //
     // Ingest batch/preflight get a 16 MiB body limit (vs axum's 2 MiB default)
     // through this separate sub-router; other routes keep the default.
     let ingest_route = Router::new()
