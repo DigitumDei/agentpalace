@@ -294,12 +294,26 @@ The table below catalogs every current method/path pair registered in `build_rou
 - **Request Surface:** `POST /v1/kg/query`, JSON `KgQueryRequest`:
   - `entity`: string (mandatory, max 512 bytes)
   - `as_of`: Option<string> (RFC 3339 or `YYYY-MM-DD` date)
-  - `direction`: Option<string> (`"outgoing"`, `"incoming"`, `"both"`)
-- **Retrieval Surface:** `200 OK`, JSON `{"entity": string, "as_of": Option<string>, "facts": Vec<KgFact>, "count": usize}`. Unknown entity returns empty facts list.
+  - `direction`: Option<string> (`"outgoing"`, `"incoming"`, `"both"`, defaults to `"both"`)
+- **Retrieval Surface:** `200 OK`, JSON:
+  - `entity`: string (the queried entity name)
+  - `as_of`: Option<string> (effective query date, if specified)
+  - `facts`: array of `KnowledgeQueryRow` objects:
+    - `direction`: string (`"outgoing"` or `"incoming"`)
+    - `subject`: string
+    - `predicate`: string
+    - `object`: string
+    - `valid_from`: Option<string> (start validity date, e.g., `"YYYY-MM-DD"`)
+    - `valid_to`: Option<string> (end validity date if ended/invalidated, e.g., `"YYYY-MM-DD"`)
+    - `confidence`: f32 (e.g., `1.0`)
+    - `source_closet`: Option<string> (source drawer/closet ID if tracked)
+    - `current`: bool (whether the fact is currently active as of query date)
+  - `count`: usize (number of matching facts returned)
+  *(An unknown entity returns `facts: []` and `count: 0`)*.
 - **Durable Store:** SQLite operational store (`kg_facts`, `kg_entities`).
 - **Idempotency & Receipts:** Naturally idempotent read.
 - **Crash Recovery:** Read-only SQLite query.
-- **Provenance Status:** `KgFact` carries relational fields (`source`, `target`, `relation`, `weight`, `valid_from`, `valid_until`, `epistemic_status`, `source_drawer_id`, `source_file`), but no owner envelope. Fact owner retrieval deferred to storage slice.
+- **Provenance Status:** `KnowledgeQueryRow` returns graph attributes (`direction`, `subject`, `predicate`, `object`, validity dates `valid_from`/`valid_to`, `confidence`, `source_closet`, `current`). It does not include an authenticated human owner envelope (`owner.id`, `email_at_write`). Durable owner attribution and query-time owner envelope retrieval are deferred to the storage slice.
 
 #### 10. `POST /v1/kg/facts`
 - **Operation Gate:** `write`.
@@ -309,17 +323,21 @@ The table below catalogs every current method/path pair registered in `build_rou
   - `subject`: string
   - `predicate`: string
   - `object`: string
-  - `valid_from`: Option<string>
+  - `valid_from`: Option<string> (`YYYY-MM-DD` date)
   - `operation_id`: Option<string>
-- **Retrieval Surface:** `200 OK`, JSON `{"success": true, "fact_id": string}`.
+- **Retrieval Surface:** `200 OK`, JSON:
+  - `success`: bool (`true`)
+  - `triple_id`: string (canonical triple ID, e.g., `"kg:<blake3-hex>"`)
+  - `fact`: string (display formatted string, e.g., `"{subject} → {predicate} → {object}"`)
 - **Durable Store:** SQLite operational store (`kg_facts`, `kg_entities`, `receipts`, `changes`).
 - **Idempotency & Receipts:**
   - Optional `operation_id`.
   - Triple deduplication: `runtime.add_fact()` is naturally idempotent over canonical triples.
   - Receipts prevent duplicate `kg_fact_added` change events on replay.
+  - Replay returns cached JSON containing `success`, `triple_id`, and `fact`.
 - **Crash Recovery:** In recovery mode, re-application of triple is idempotent; missing change event is appended atomically before completing receipt.
 - **Provenance Status:**
-  - *Available now:* Change event records `actor: token_id`. Fact record carries no owner.
+  - *Available now:* Change event records `actor: token_id`. The returned response carries `triple_id` and formatted `fact`, but the underlying `kg_facts` row carries no human owner envelope.
   - *Deferred to storage slice:* Persisting owner envelope on fact rows; retaining original submitter across deduplication.
 
 #### 11. `POST /v1/kg/facts/invalidate`
@@ -332,13 +350,19 @@ The table below catalogs every current method/path pair registered in `build_rou
   - `object`: string
   - `ended`: Option<string> (`YYYY-MM-DD` date)
   - `operation_id`: Option<string>
-- **Retrieval Surface:** `200 OK`, JSON `{"success": true, "invalidated_count": usize}`.
+- **Retrieval Surface:** `200 OK`, JSON:
+  - `success`: bool (`true` for operation-aware requests or when rows were invalidated; `invalidated > 0` for legacy un-keyed requests)
+  - `invalidated`: usize (number of fact rows invalidated in the graph, typically `1` or `0`)
+  - `fact`: string (display formatted string, e.g., `"{subject} → {predicate} → {object}"`)
+  - `ended`: string (effective invalidation date in `"YYYY-MM-DD"` format)
 - **Durable Store:** SQLite operational store (`kg_facts`, `receipts`, `changes`).
 - **Idempotency & Receipts:**
   - Optional `operation_id`. Serialized via `operation_aware_kg_invalidation_lock` to coordinate SQLite writes.
-  - Replay returns cached outcome.
+  - Replay returns cached JSON outcome (`success`, `invalidated`, `fact`, `ended`).
 - **Crash Recovery:** Restores missing `kg_fact_invalidated` change event atomically before receipt completion.
-- **Provenance Status:** `actor: token_id` on change log; fact invalidation attribution deferred.
+- **Provenance Status:**
+  - *Available now:* `actor: token_id` recorded on change log event. Invalidation response returns `invalidated`, `fact`, and `ended`.
+  - *Deferred to storage slice:* Durable attribution of which human owner invalidated the fact; owner-scoped receipt key.
 
 #### 12. `GET /v1/kg/timeline`
 - **Operation Gate:** `read`.
@@ -346,22 +370,37 @@ The table below catalogs every current method/path pair registered in `build_rou
 - **Demo Role Eligibility:** `readonly`, `write`, `admin`.
 - **Request Surface:** `GET /v1/kg/timeline`, query parameters `KgTimelineQuery`:
   - `entity`: Option<string>
-  - `limit`: Option<usize> (default 50, max 200)
-- **Retrieval Surface:** `200 OK`, JSON `{"entity": string, "timeline": Vec<TimelineEvent>, "count": usize, "total_count": usize}`.
+  - `limit`: Option<usize> (default 50, clamped to `[1, 200]`)
+- **Retrieval Surface:** `200 OK`, JSON:
+  - `entity`: string (the queried entity name, or `"all"` if omitted)
+  - `timeline`: array of `KnowledgeTimelineRow` objects:
+    - `subject`: string
+    - `predicate`: string
+    - `object`: string
+    - `valid_from`: Option<string>
+    - `valid_to`: Option<string>
+    - `current`: bool
+  - `count`: usize (number of timeline rows returned after limit)
+  - `total_count`: usize (total timeline events available before limit truncation)
 - **Durable Store:** SQLite operational store (`kg_facts`).
 - **Idempotency & Receipts:** Naturally idempotent read.
 - **Crash Recovery:** Read-only SQLite query.
-- **Provenance Status:** Chronological validity timeline; owner provenance deferred.
+- **Provenance Status:** Chronological validity timeline; owner provenance deferred to storage slice.
 
 #### 13. `GET /v1/kg/stats`
 - **Operation Gate:** `read`.
 - **Wing Authorization:** Category D (Server-wide).
 - **Demo Role Eligibility:** `readonly`, `write`, `admin`.
-- **Request Surface:** `GET /v1/kg/stats`.
-- **Retrieval Surface:** `200 OK`, JSON `GraphStats` (`entity_count`, `fact_count`, `relation_type_count`).
-- **Durable Store:** SQLite operational store.
+- **Request Surface:** `GET /v1/kg/stats`. No query parameters.
+- **Retrieval Surface:** `200 OK`, JSON `KnowledgeGraphStats`:
+  - `entities`: usize (total distinct entity nodes recorded in the knowledge graph)
+  - `triples`: usize (total distinct canonical triples)
+  - `current_facts`: usize (count of active/current facts)
+  - `expired_facts`: usize (count of invalidated or expired historical facts)
+  - `relationship_types`: array of strings (distinct predicate/relationship names present in the graph)
+- **Durable Store:** SQLite operational store (`kg_facts`, `kg_entities`).
 - **Idempotency & Receipts:** Naturally idempotent read.
-- **Crash Recovery:** Read-only.
+- **Crash Recovery:** Read-only aggregation over committed graph tables.
 - **Provenance Status:** N/A (aggregate metrics).
 
 ---
