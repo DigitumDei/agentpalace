@@ -26,6 +26,7 @@ use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 use std::str::FromStr;
 
+use serde::de::value::MapAccessDeserializer;
 use serde::de::{self, Deserializer, Visitor};
 use serde::ser;
 use serde::{Deserialize, Serialize};
@@ -648,8 +649,7 @@ impl<'de> Deserialize<'de> for EmailAtWrite {
 ///   "email_at_write": "tester@example.com"
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct AuthenticatedOwner {
     /// Immutable, system-generated owner identifier.
     pub id: OwnerId,
@@ -659,6 +659,85 @@ pub struct AuthenticatedOwner {
     pub subject: Subject,
     /// Human-readable email captured at write time.
     pub email_at_write: EmailAtWrite,
+}
+
+/// Helper enum for presence-aware field deserialization.
+///
+/// Distinguishes between an absent field (which defaults to [`Presence::Absent`]),
+/// an explicit JSON `null` ([`Presence::Null`]), and a concrete value ([`Presence::Value`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Presence<T> {
+    Absent,
+    Null,
+    Value(T),
+}
+
+impl<T> Default for Presence<T> {
+    fn default() -> Self {
+        Self::Absent
+    }
+}
+
+impl<T> Presence<T> {
+    fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+
+    fn into_value(self) -> Option<T> {
+        match self {
+            Self::Value(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+fn deserialize_presence<'de, T, D>(deserializer: D) -> Result<Presence<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    match Option::<T>::deserialize(deserializer)? {
+        Some(val) => Ok(Presence::Value(val)),
+        None => Ok(Presence::Null),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAuthenticatedOwner {
+    #[serde(default, deserialize_with = "deserialize_presence")]
+    status: Presence<String>,
+    id: OwnerId,
+    issuer: Issuer,
+    subject: Subject,
+    email_at_write: EmailAtWrite,
+}
+
+impl<'de> Deserialize<'de> for AuthenticatedOwner {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawAuthenticatedOwner::deserialize(deserializer)?;
+        match raw.status {
+            Presence::Null => {
+                return Err(de::Error::custom(
+                    "invalid status for authenticated owner: explicit null 'status' is malformed; omit the field for bare authenticated representation or specify 'authenticated'",
+                ));
+            }
+            Presence::Value(ref status) => {
+                if !status.eq_ignore_ascii_case("authenticated") {
+                    return Err(de::Error::custom(format!(
+                        "invalid status for authenticated owner `{status}`: expected 'authenticated'"
+                    )));
+                }
+            }
+            Presence::Absent => {}
+        }
+        let owner = AuthenticatedOwner::new(raw.id, raw.issuer, raw.subject, raw.email_at_write);
+        owner.validate().map_err(de::Error::custom)?;
+        Ok(owner)
+    }
 }
 
 impl AuthenticatedOwner {
@@ -794,24 +873,123 @@ impl Serialize for OwnerIdentity {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawOwnerIdentity {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    id: Option<OwnerId>,
-    #[serde(default)]
-    issuer: Option<Issuer>,
-    #[serde(default)]
-    subject: Option<Subject>,
-    #[serde(default)]
-    email_at_write: Option<EmailAtWrite>,
+    #[serde(default, deserialize_with = "deserialize_presence")]
+    status: Presence<String>,
+    #[serde(default, deserialize_with = "deserialize_presence")]
+    id: Presence<OwnerId>,
+    #[serde(default, deserialize_with = "deserialize_presence")]
+    issuer: Presence<Issuer>,
+    #[serde(default, deserialize_with = "deserialize_presence")]
+    subject: Presence<Subject>,
+    #[serde(default, deserialize_with = "deserialize_presence")]
+    email_at_write: Presence<EmailAtWrite>,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawOwnerIdentityEnum {
-    Object(RawOwnerIdentity),
-    Str(String),
-    Null,
+struct OwnerIdentityVisitor;
+
+impl<'de> Visitor<'de> for OwnerIdentityVisitor {
+    type Value = OwnerIdentity;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an owner identity (null, 'unknown', 'legacy', or owner object)")
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(OwnerIdentity::Unknown)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(OwnerIdentity::Unknown)
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        let s_lower = v.to_ascii_lowercase();
+        if s_lower == "unknown" || s_lower == "legacy" {
+            Ok(OwnerIdentity::Unknown)
+        } else {
+            Err(de::Error::custom(format!(
+                "unrecognized owner identity string `{v}`: expected 'unknown' or 'legacy'"
+            )))
+        }
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(&v)
+    }
+
+    fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
+    where
+        M: de::MapAccess<'de>,
+    {
+        let raw = RawOwnerIdentity::deserialize(MapAccessDeserializer::new(map))?;
+        let has_any_auth = !raw.id.is_absent()
+            || !raw.issuer.is_absent()
+            || !raw.subject.is_absent()
+            || !raw.email_at_write.is_absent();
+        let full_auth = match (
+            raw.id.into_value(),
+            raw.issuer.into_value(),
+            raw.subject.into_value(),
+            raw.email_at_write.into_value(),
+        ) {
+            (Some(id), Some(issuer), Some(subject), Some(email)) => {
+                let owner = AuthenticatedOwner::new(id, issuer, subject, email);
+                owner.validate().map_err(de::Error::custom)?;
+                Some(owner)
+            }
+            _ => None,
+        };
+
+        match raw.status {
+            Presence::Null => Err(de::Error::custom(
+                "invalid owner identity: explicit null 'status' is malformed; omit the field for bare authenticated representation or specify a valid status string",
+            )),
+            Presence::Value(ref status) => {
+                let status_lower = status.to_ascii_lowercase();
+                match status_lower.as_str() {
+                    "unknown" | "legacy" => {
+                        if has_any_auth {
+                            Err(de::Error::custom(format!(
+                                "contradictory owner identity: status '{status}' cannot be combined with authenticated owner fields (id, issuer, subject, email_at_write)"
+                            )))
+                        } else {
+                            Ok(OwnerIdentity::Unknown)
+                        }
+                    }
+                    "authenticated" => match full_auth {
+                        Some(owner) => Ok(OwnerIdentity::Authenticated(owner)),
+                        None => Err(de::Error::custom(
+                            "incomplete authenticated owner: status 'authenticated' requires all fields: id, issuer, subject, email_at_write",
+                        )),
+                    },
+                    _ => Err(de::Error::custom(format!(
+                        "unrecognized owner identity status '{status}': expected 'unknown', 'legacy', or 'authenticated'"
+                    ))),
+                }
+            }
+            Presence::Absent => match full_auth {
+                Some(owner) => Ok(OwnerIdentity::Authenticated(owner)),
+                None if has_any_auth => Err(de::Error::custom(
+                    "incomplete owner identity: authenticated owner object requires all fields: id, issuer, subject, email_at_write",
+                )),
+                None => Err(de::Error::custom(
+                    "invalid owner identity: expected {status: \"unknown\"} or authenticated owner object with id, issuer, subject, email_at_write",
+                )),
+            },
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for OwnerIdentity {
@@ -819,66 +997,7 @@ impl<'de> Deserialize<'de> for OwnerIdentity {
     where
         D: Deserializer<'de>,
     {
-        match RawOwnerIdentityEnum::deserialize(deserializer)? {
-            RawOwnerIdentityEnum::Null => Ok(Self::Unknown),
-            RawOwnerIdentityEnum::Str(s) => {
-                let s_lower = s.to_ascii_lowercase();
-                if s_lower == "unknown" || s_lower == "legacy" {
-                    Ok(Self::Unknown)
-                } else {
-                    Err(de::Error::custom(format!(
-                        "unrecognized owner identity string `{s}`: expected 'unknown' or 'legacy'"
-                    )))
-                }
-            }
-            RawOwnerIdentityEnum::Object(raw) => {
-                let has_any_auth = raw.id.is_some()
-                    || raw.issuer.is_some()
-                    || raw.subject.is_some()
-                    || raw.email_at_write.is_some();
-                let full_auth = match (raw.id, raw.issuer, raw.subject, raw.email_at_write) {
-                    (Some(id), Some(issuer), Some(subject), Some(email)) => {
-                        Some(AuthenticatedOwner::new(id, issuer, subject, email))
-                    }
-                    _ => None,
-                };
-
-                match raw.status.as_deref() {
-                    Some(status) => {
-                        let status_lower = status.to_ascii_lowercase();
-                        match status_lower.as_str() {
-                            "unknown" | "legacy" => {
-                                if has_any_auth {
-                                    Err(de::Error::custom(format!(
-                                        "contradictory owner identity: status '{status}' cannot be combined with authenticated owner fields (id, issuer, subject, email_at_write)"
-                                    )))
-                                } else {
-                                    Ok(Self::Unknown)
-                                }
-                            }
-                            "authenticated" => match full_auth {
-                                Some(owner) => Ok(Self::Authenticated(owner)),
-                                None => Err(de::Error::custom(
-                                    "incomplete authenticated owner: status 'authenticated' requires all fields: id, issuer, subject, email_at_write",
-                                )),
-                            },
-                            _ => Err(de::Error::custom(format!(
-                                "unrecognized owner identity status '{status}': expected 'unknown', 'legacy', or 'authenticated'"
-                            ))),
-                        }
-                    }
-                    None => match full_auth {
-                        Some(owner) => Ok(Self::Authenticated(owner)),
-                        None if has_any_auth => Err(de::Error::custom(
-                            "incomplete owner identity: authenticated owner object requires all fields: id, issuer, subject, email_at_write",
-                        )),
-                        None => Err(de::Error::custom(
-                            "invalid owner identity: expected {status: \"unknown\"} or authenticated owner object with id, issuer, subject, email_at_write",
-                        )),
-                    },
-                }
-            }
-        }
+        deserializer.deserialize_any(OwnerIdentityVisitor)
     }
 }
 
@@ -1836,11 +1955,36 @@ struct RawScopedKeyStruct {
     raw_key: String,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawScopedKeyHelper {
-    Struct(RawScopedKeyStruct),
-    Str(String),
+struct OwnerScopedKeyVisitor;
+
+impl<'de> Visitor<'de> for OwnerScopedKeyVisitor {
+    type Value = OwnerScopedKey;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an owner-scoped key (composite string or object with raw_key)")
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        OwnerScopedKey::from_str(v).map_err(de::Error::custom)
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        OwnerScopedKey::from_str(&v).map_err(de::Error::custom)
+    }
+
+    fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
+    where
+        M: de::MapAccess<'de>,
+    {
+        let s = RawScopedKeyStruct::deserialize(MapAccessDeserializer::new(map))?;
+        OwnerScopedKey::new(s.owner_id, s.raw_key).map_err(de::Error::custom)
+    }
 }
 
 impl<'de> Deserialize<'de> for OwnerScopedKey {
@@ -1848,15 +1992,7 @@ impl<'de> Deserialize<'de> for OwnerScopedKey {
     where
         D: Deserializer<'de>,
     {
-        let raw = RawScopedKeyHelper::deserialize(deserializer)?;
-        match raw {
-            RawScopedKeyHelper::Struct(s) => {
-                OwnerScopedKey::new(s.owner_id, s.raw_key).map_err(de::Error::custom)
-            }
-            RawScopedKeyHelper::Str(s) => {
-                OwnerScopedKey::from_str(&s).map_err(de::Error::custom)
-            }
-        }
+        deserializer.deserialize_any(OwnerScopedKeyVisitor)
     }
 }
 
@@ -2813,6 +2949,11 @@ mod tests {
         assert!(serde_json::from_str::<OwnerIdentity>("{}").is_err());
         assert!(serde_json::from_str::<OwnerIdentity>(r#""""#).is_err());
 
+        // Explicit null status must be rejected as malformed
+        assert!(serde_json::from_str::<OwnerIdentity>(r#"{"status":null}"#).is_err());
+        assert!(serde_json::from_str::<OwnerIdentity>(r#"{"status":null,"id":"usr_01J8Y"}"#).is_err());
+        assert!(serde_json::from_str::<OwnerIdentity>(r#"{"status":"unknown","id":null}"#).is_err());
+
         // 4. Positive fail-closed compatibility checks
         assert_eq!(
             serde_json::from_str::<OwnerIdentity>(r#"{"status":"legacy"}"#).unwrap(),
@@ -2974,12 +3115,14 @@ mod tests {
         assert!(serde_json::from_str::<StorageOrigin>(r#"{"kind":"local","origin_id":"local","unknown_field":"bad"}"#).is_err());
         assert!(serde_json::from_str::<StorageOrigin>(r#"{"kind":"federated","origin_id":"https://remote.palace","unknown_field":"bad"}"#).is_err());
 
-        // OwnerScopedKey rejects unknown fields
-        assert!(serde_json::from_str::<OwnerScopedKey>(r#"{"raw_key":"op_1","unknown_field":"bad"}"#).is_err());
+        // OwnerScopedKey rejects unknown fields with explicit unknown field error
+        let key_err = serde_json::from_str::<OwnerScopedKey>(r#"{"raw_key":"op_1","unknown_field":"bad"}"#).unwrap_err();
+        assert!(key_err.to_string().contains("unknown field"), "got: {key_err}");
         assert!(serde_json::from_str::<OwnerScopedKey>(r#"{"owner_id":"usr_01J8Y","raw_key":"op_1","extra":1}"#).is_err());
 
-        // OwnerIdentity rejects unknown/misspelled fields
-        assert!(serde_json::from_str::<OwnerIdentity>(r#"{"status":"unknown","unknown_field":1}"#).is_err());
+        // OwnerIdentity rejects unknown/misspelled fields with explicit unknown field error
+        let unknown_err = serde_json::from_str::<OwnerIdentity>(r#"{"status":"unknown","unknown_field":1}"#).unwrap_err();
+        assert!(unknown_err.to_string().contains("unknown field"), "got: {unknown_err}");
         assert!(serde_json::from_str::<OwnerIdentity>(r#"{
             "status": "authenticated",
             "id": "usr_01J8Y",
@@ -2990,20 +3133,22 @@ mod tests {
         }"#).is_err());
 
         // Misspelled field in AuthenticatedOwner / OwnerIdentity
-        assert!(serde_json::from_str::<OwnerIdentity>(r#"{
+        let misspelled_err = serde_json::from_str::<OwnerIdentity>(r#"{
             "id": "usr_01J8Y",
             "issur": "https://accounts.google.com",
             "subject": "104928190283019283019",
             "email_at_write": "tester@example.com"
-        }"#).is_err());
+        }"#).unwrap_err();
+        assert!(misspelled_err.to_string().contains("unknown field"), "got: {misspelled_err}");
 
-        assert!(serde_json::from_str::<AuthenticatedOwner>(r#"{
+        let auth_misspelled_err = serde_json::from_str::<AuthenticatedOwner>(r#"{
             "id": "usr_01J8Y",
             "issuer": "https://accounts.google.com",
             "subject": "104928190283019283019",
             "email_at_write": "tester@example.com",
             "extra_field": 42
-        }"#).is_err());
+        }"#).unwrap_err();
+        assert!(auth_misspelled_err.to_string().contains("unknown field"), "got: {auth_misspelled_err}");
 
         // ProvenanceEnvelope rejects unknown fields
         assert!(serde_json::from_str::<ProvenanceEnvelope>(r#"{
@@ -3012,6 +3157,206 @@ mod tests {
             "origin": {"kind": "local", "origin_id": "local"},
             "unknown_envelope_field": "disallowed"
         }"#).is_err());
+    }
+
+    #[test]
+    fn authenticated_owner_and_owner_identity_fail_closed_invariants() {
+        let valid_bare = r#"{
+            "id": "usr_01J8Y",
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com"
+        }"#;
+
+        let valid_tagged = r#"{
+            "status": "authenticated",
+            "id": "usr_01J8Y",
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com"
+        }"#;
+
+        // Both bare and explicitly authenticated parse into AuthenticatedOwner / OwnerMetadata
+        let owner_bare: AuthenticatedOwner = serde_json::from_str(valid_bare).unwrap();
+        let owner_tagged: AuthenticatedOwner = serde_json::from_str(valid_tagged).unwrap();
+        let meta_bare: OwnerMetadata = serde_json::from_str(valid_bare).unwrap();
+        let meta_tagged: OwnerMetadata = serde_json::from_str(valid_tagged).unwrap();
+        assert_eq!(owner_bare, owner_tagged);
+        assert_eq!(owner_bare, meta_bare);
+        assert_eq!(meta_bare, meta_tagged);
+        assert_eq!(owner_bare.id.as_str(), "usr_01J8Y");
+
+        // Case-insensitive status tag
+        let tagged_upper = r#"{
+            "status": "AUTHENTICATED",
+            "id": "usr_01J8Y",
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com"
+        }"#;
+        let owner_upper: AuthenticatedOwner = serde_json::from_str(tagged_upper).unwrap();
+        assert_eq!(owner_bare, owner_upper);
+
+        // Fail-closed rejection of unknown / misspelled fields with explicit error messages
+        let misspelled_issuer = r#"{
+            "id": "usr_01J8Y",
+            "issur": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com"
+        }"#;
+        let err_owner = serde_json::from_str::<AuthenticatedOwner>(misspelled_issuer).unwrap_err();
+        assert!(err_owner.to_string().contains("unknown field"), "got: {err_owner}");
+
+        let err_identity = serde_json::from_str::<OwnerIdentity>(misspelled_issuer).unwrap_err();
+        assert!(err_identity.to_string().contains("unknown field"), "got: {err_identity}");
+
+        let err_meta = serde_json::from_str::<OwnerMetadata>(misspelled_issuer).unwrap_err();
+        assert!(err_meta.to_string().contains("unknown field"), "got: {err_meta}");
+
+        // Rejection of unknown field on explicitly authenticated shape
+        let extra_tagged = r#"{
+            "status": "authenticated",
+            "id": "usr_01J8Y",
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com",
+            "extra_property": "disallowed"
+        }"#;
+        assert!(serde_json::from_str::<AuthenticatedOwner>(extra_tagged).is_err());
+        assert!(serde_json::from_str::<OwnerIdentity>(extra_tagged).is_err());
+        assert!(serde_json::from_str::<OwnerMetadata>(extra_tagged).is_err());
+
+        // Contradictory status values on AuthenticatedOwner
+        assert!(serde_json::from_str::<AuthenticatedOwner>(r#"{"status":"unknown","id":"usr_01J8Y","issuer":"https://accounts.google.com","subject":"104928190283019283019","email_at_write":"tester@example.com"}"#).is_err());
+        assert!(serde_json::from_str::<AuthenticatedOwner>(r#"{"status":"legacy","id":"usr_01J8Y","issuer":"https://accounts.google.com","subject":"104928190283019283019","email_at_write":"tester@example.com"}"#).is_err());
+        assert!(serde_json::from_str::<AuthenticatedOwner>(r#"{"status":"active","id":"usr_01J8Y","issuer":"https://accounts.google.com","subject":"104928190283019283019","email_at_write":"tester@example.com"}"#).is_err());
+
+        // Incomplete shapes rejected
+        assert!(serde_json::from_str::<AuthenticatedOwner>(r#"{"id":"usr_01J8Y","issuer":"https://accounts.google.com","subject":"104928190283019283019"}"#).is_err());
+        assert!(serde_json::from_str::<AuthenticatedOwner>(r#"{"status":"authenticated","id":"usr_01J8Y"}"#).is_err());
+        assert!(serde_json::from_str::<AuthenticatedOwner>("{}").is_err());
+
+        // Malformed email
+        let malformed_email = r#"{
+            "id": "usr_01J8Y",
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "not_an_email"
+        }"#;
+        assert!(serde_json::from_str::<AuthenticatedOwner>(malformed_email).is_err());
+        assert!(serde_json::from_str::<OwnerIdentity>(malformed_email).is_err());
+
+        // Spoofed sentinel IDs rejected
+        for sentinel in ["legacy", "unknown", "none", "null", "LEGACY", "UNKNOWN"] {
+            let spoofed = format!(r#"{{
+                "id": "{sentinel}",
+                "issuer": "https://accounts.google.com",
+                "subject": "104928190283019283019",
+                "email_at_write": "tester@example.com"
+            }}"#);
+            assert!(serde_json::from_str::<AuthenticatedOwner>(&spoofed).is_err());
+            assert!(serde_json::from_str::<OwnerIdentity>(&spoofed).is_err());
+        }
+
+        // Non-object, non-string, non-null types rejected by OwnerIdentity
+        assert!(serde_json::from_str::<OwnerIdentity>("42").is_err());
+        assert!(serde_json::from_str::<OwnerIdentity>("true").is_err());
+        assert!(serde_json::from_str::<OwnerIdentity>("[1, 2]").is_err());
+
+        // SubjectBinding fail-closed
+        assert!(serde_json::from_str::<SubjectBinding>(r#"{"issuer":"https://accounts.google.com","subject":"123"}"#).is_ok());
+        assert!(serde_json::from_str::<SubjectBinding>(r#"{"issur":"https://accounts.google.com","subject":"123"}"#).is_err());
+        assert!(serde_json::from_str::<SubjectBinding>(r#"{"issuer":"https://accounts.google.com","subject":"123","extra":1}"#).is_err());
+    }
+
+    #[test]
+    fn regression_presence_aware_status_rejects_explicit_null_for_all_three_types() {
+        let bare_json = r#"{
+            "id": "usr_01J8Y",
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com"
+        }"#;
+
+        let tagged_json = r#"{
+            "status": "authenticated",
+            "id": "usr_01J8Y",
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com"
+        }"#;
+
+        let null_status_complete = r#"{
+            "status": null,
+            "id": "usr_01J8Y",
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com"
+        }"#;
+
+        let null_status_standalone = r#"{"status": null}"#;
+
+        // 1. Bare authenticated representation (absent status) succeeds for all three types
+        let auth_bare: AuthenticatedOwner = serde_json::from_str(bare_json).unwrap();
+        let meta_bare: OwnerMetadata = serde_json::from_str(bare_json).unwrap();
+        let ident_bare: OwnerIdentity = serde_json::from_str(bare_json).unwrap();
+        assert_eq!(auth_bare, meta_bare);
+        assert_eq!(ident_bare, OwnerIdentity::Authenticated(auth_bare.clone()));
+
+        // 2. Explicitly tagged status succeeds for all three types
+        let auth_tagged: AuthenticatedOwner = serde_json::from_str(tagged_json).unwrap();
+        let meta_tagged: OwnerMetadata = serde_json::from_str(tagged_json).unwrap();
+        let ident_tagged: OwnerIdentity = serde_json::from_str(tagged_json).unwrap();
+        assert_eq!(auth_bare, auth_tagged);
+        assert_eq!(meta_bare, meta_tagged);
+        assert_eq!(ident_bare, ident_tagged);
+
+        // 3. Complete authenticated object with "status": null is REJECTED as malformed across all three types
+        let err_auth = serde_json::from_str::<AuthenticatedOwner>(null_status_complete).unwrap_err();
+        assert!(
+            err_auth.to_string().contains("explicit null 'status' is malformed"),
+            "AuthenticatedOwner should reject explicit null status: {err_auth}"
+        );
+
+        let err_meta = serde_json::from_str::<OwnerMetadata>(null_status_complete).unwrap_err();
+        assert!(
+            err_meta.to_string().contains("explicit null 'status' is malformed"),
+            "OwnerMetadata should reject explicit null status: {err_meta}"
+        );
+
+        let err_ident = serde_json::from_str::<OwnerIdentity>(null_status_complete).unwrap_err();
+        assert!(
+            err_ident.to_string().contains("explicit null 'status' is malformed"),
+            "OwnerIdentity should reject explicit null status: {err_ident}"
+        );
+
+        // 4. Standalone object with "status": null is REJECTED across all three types
+        assert!(serde_json::from_str::<AuthenticatedOwner>(null_status_standalone).is_err());
+        assert!(serde_json::from_str::<OwnerMetadata>(null_status_standalone).is_err());
+        let err_ident_null = serde_json::from_str::<OwnerIdentity>(null_status_standalone).unwrap_err();
+        assert!(
+            err_ident_null.to_string().contains("explicit null 'status' is malformed"),
+            "OwnerIdentity should reject standalone explicit null status: {err_ident_null}"
+        );
+
+        // 5. Explicit null on auth field in complete payload is rejected across all three types
+        let null_id_json = r#"{
+            "id": null,
+            "issuer": "https://accounts.google.com",
+            "subject": "104928190283019283019",
+            "email_at_write": "tester@example.com"
+        }"#;
+        assert!(serde_json::from_str::<AuthenticatedOwner>(null_id_json).is_err());
+        assert!(serde_json::from_str::<OwnerMetadata>(null_id_json).is_err());
+        assert!(serde_json::from_str::<OwnerIdentity>(null_id_json).is_err());
+
+        // 6. Top-level JSON "null" is rejected by AuthenticatedOwner/OwnerMetadata but accepted by OwnerIdentity as Unknown
+        assert!(serde_json::from_str::<AuthenticatedOwner>("null").is_err());
+        assert!(serde_json::from_str::<OwnerMetadata>("null").is_err());
+        assert_eq!(
+            serde_json::from_str::<OwnerIdentity>("null").unwrap(),
+            OwnerIdentity::Unknown
+        );
     }
 
     #[test]
