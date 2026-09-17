@@ -6141,6 +6141,19 @@ mod tests {
             );
             assert_eq!(extracted.auth_identity().name(), auth.name());
             assert_eq!(extracted.name(), auth.name());
+            // The middleware must insert one coherent ownership snapshot: every
+            // owner/provenance accessor and every derived scoped key must agree
+            // with the AuthIdentity extension from the same authenticated token.
+            assert_eq!(extracted.owner_identity(), &auth.owner_identity());
+            assert_eq!(extracted.owner(), auth.owner());
+            assert_eq!(extracted.owner_id(), auth.owner_id());
+            assert_eq!(extracted.issuer(), auth.issuer());
+            assert_eq!(extracted.subject(), auth.subject());
+            assert_eq!(extracted.email_at_write(), auth.email_at_write());
+            assert_eq!(
+                extracted.owner_scoped_key("middleware_coherence").unwrap(),
+                auth.owner_scoped_key("middleware_coherence").unwrap()
+            );
 
             // Handler assertions for token-specific expectations and focused accessors
             if extracted.name() == "alice_with_owner" {
