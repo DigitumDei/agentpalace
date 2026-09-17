@@ -324,7 +324,8 @@ Always emit explicit scopes: omitted scopes currently mean unrestricted access.
 The gateway also checks the current role and operation before forwarding.
 POST search is a read; HTTP method alone does not determine permission.
 Unknown routes/operations fail closed. Every accepted remote REST mutation,
-including batch ingest and invalidation, must follow the same operation inventory.
+including batch ingest and invalidation, must follow the same operation inventory
+(see [canonical REST inventory](Demo-Hub-REST-Inventory.md)).
 Do not forward /mcp or add generic tool-execution routes.
 
 Proposed persistent /data/hub/access.json (illustrative addresses):
@@ -421,7 +422,8 @@ Required storage coverage:
 - Any other record accepted through the existing remote REST surface: the same
   invariant. Local-only diaries and MCP-only operations stay outside the hub.
 
-Inventory every existing remote REST mutation before implementation. Each must
+Inventory every existing remote REST mutation before implementation (published
+in [Demo-Hub-REST-Inventory.md](Demo-Hub-REST-Inventory.md)). Each must
 support authenticated provenance before it is made available through the hub.
 All accepted memory types need attribution, not just ordinary drawer writes.
 This project does not add remote versions of currently local-only/MCP-only
