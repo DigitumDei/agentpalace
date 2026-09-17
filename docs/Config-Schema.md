@@ -338,8 +338,9 @@ federation HTTP server started by `agentpalace serve`.
 ```
 
 The file at `server.token_file` is a separate JSON document — a plain array of
-token entries, not a field of `config.json`. Its shape (`token`/`name`/
-`enabled`/`scopes`):
+token entries, not a field of `config.json`. Its shape is
+`token`/`name`/`enabled`/`scopes` plus the optional `owner` object described
+below:
 
 ```jsonc
 [
@@ -348,6 +349,77 @@ token entries, not a field of `config.json`. Its shape (`token`/`name`/
     "scopes": [ { "wings": ["wing_myproject"], "operations": ["read", "coordination_read"] } ] }
 ]
 ```
+
+An owner-bearing entry uses the validated private-server token configuration as
+its authentication context; it is not a writable REST request field:
+
+```json
+[
+  {
+    "token": "alice-secret-token",
+    "name": "alice",
+    "enabled": true,
+    "owner": {
+      "id": "usr_01J8Y9K2E4",
+      "issuer": "https://accounts.google.com",
+      "subject": "104928190283019283019",
+      "email_at_write": "alice@example.com"
+    }
+  }
+]
+```
+
+The optional `owner` value is either absent, JSON `null`, or an authenticated
+owner object. The object requires exactly these fields (unknown or misspelled
+fields are rejected):
+
+- `id` — immutable, provider-neutral internal owner ID. It is 1–128 bytes of
+  ASCII letters, digits, `_`, `-`, or `.`, and is case-sensitive. The reserved
+  sentinel values `legacy`, `unknown`, `none`, and `null` (case-insensitive)
+  are rejected; `:` is also rejected because it is reserved by scoped keys.
+- `issuer` — provider-neutral credential issuer, 1–256 bytes of printable
+  ASCII.
+- `subject` — immutable provider subject, 1–256 bytes of printable ASCII.
+- `email_at_write` — the email captured at configuration/write time. It is
+  trimmed, must be 3–254 bytes, and must have one non-empty local part and
+  domain separated by exactly one `@`, with no whitespace/control characters
+  or leading/trailing dot in the domain.
+
+The object may also include `"status": "authenticated"` for an explicit,
+backward-compatible wire form. Any other status, an explicit `null` status, a
+partial object, non-string field, or extra field is invalid. An owner-less
+entry (absent or `null`) deliberately means **unknown/legacy ownership** and
+keeps ordinary static-token installations compatible; it does not create an
+authenticated owner and does not make the token's display `name` a human owner
+ID. Credential rotation can retain the same internal `id` while issuer,
+subject, or captured email changes only through a newly validated token-file
+entry.
+
+Invalid owner metadata fails the entire initial token-file load. On a hot
+reload, any parse, validation, permission, or other file-read failure clears
+the in-memory token entries (so no old token remains usable) and logs the
+failure; a later successful reload replaces the empty registry. This is also
+the behavior when the file is removed or unreadable. An unchanged malformed
+file is not silently accepted. The last valid registry is replaced only after
+the complete replacement file has parsed and validated successfully.
+
+Rejected examples include:
+
+```jsonc
+{ "token": "t", "name": "alice", "enabled": true,
+  "owner": { "id": "unknown", "issuer": "issuer", "subject": "s", "email_at_write": "a@b.com" } }
+{ "token": "t", "name": "alice", "enabled": true,
+  "owner": { "id": "usr_1", "issuer": "issuer", "subject": "s" } }
+{ "token": "t", "name": "alice", "enabled": true,
+  "owner": { "id": "usr_1", "issuer": "issuer", "subject": "s",
+              "email_at_write": "a@b.com", "emali_at_write": "typo" } }
+```
+
+The shared owner/provenance wire contract, including explicit unknown owner
+forms and owner-scoped operation keys, is documented in
+[Demo-Hub-REST-Inventory.md](Demo-Hub-REST-Inventory.md). This configuration
+slice authenticates owner metadata in memory; durable resource attribution and
+owner retrieval remain deferred to issues #161–167.
 
 ### Field Definitions
 
