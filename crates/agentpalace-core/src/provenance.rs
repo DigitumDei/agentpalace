@@ -1465,13 +1465,7 @@ impl FederatedOrigin {
         let id = origin_id.into();
         validate_origin_id(&id)?;
         if let Some(ref rec_id) = original_record_id {
-            if rec_id.len() > MAX_RECORD_ID_CHARS {
-                return Err(ProvenanceError::ValueTooLong {
-                    field: "original_record_id",
-                    len: rec_id.len(),
-                    max: MAX_RECORD_ID_CHARS,
-                });
-            }
+            validate_record_id(rec_id)?;
         }
         Ok(Self {
             origin_id: id,
@@ -1493,16 +1487,34 @@ impl FederatedOrigin {
     pub fn validate(&self) -> Result<(), ProvenanceError> {
         validate_origin_id(&self.origin_id)?;
         if let Some(ref rec_id) = self.original_record_id {
-            if rec_id.len() > MAX_RECORD_ID_CHARS {
-                return Err(ProvenanceError::ValueTooLong {
-                    field: "original_record_id",
-                    len: rec_id.len(),
-                    max: MAX_RECORD_ID_CHARS,
-                });
-            }
+            validate_record_id(rec_id)?;
         }
         Ok(())
     }
+}
+
+fn validate_record_id(s: &str) -> Result<(), ProvenanceError> {
+    if s.is_empty() {
+        return Err(ProvenanceError::EmptyField {
+            field: "original_record_id",
+        });
+    }
+    if s.len() > MAX_RECORD_ID_CHARS {
+        return Err(ProvenanceError::ValueTooLong {
+            field: "original_record_id",
+            len: s.len(),
+            max: MAX_RECORD_ID_CHARS,
+        });
+    }
+    for ch in s.chars() {
+        if ch.is_ascii_control() {
+            return Err(ProvenanceError::InvalidCharacter {
+                field: "original_record_id",
+                ch,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -1694,9 +1706,13 @@ impl RecordingTime {
         Ok(utc)
     }
 
-    /// Create a new recording time with current server UTC time.
-    pub fn now_utc() -> Self {
-        Self(OffsetDateTime::now_utc())
+    /// Create a new recording time with the current server UTC time.
+    ///
+    /// The clock value still passes through the same representability check as
+    /// parsed and caller-supplied timestamps; a clock value that cannot be
+    /// serialized as RFC 3339 is reported instead of being silently replaced.
+    pub fn now_utc() -> Result<Self, ProvenanceError> {
+        Self::from_offset_date_time(OffsetDateTime::now_utc())
     }
 
     /// Construct from an existing [`OffsetDateTime`], normalized to UTC.
@@ -1845,6 +1861,7 @@ impl OwnerScopedKey {
                 max: MAX_OPERATION_ID_CHARS,
             });
         }
+        validate_operation_key(trimmed)?;
         if let Some(ref owner) = owner_id {
             validate_owner_id(owner.as_str())?;
         }
@@ -1878,6 +1895,7 @@ impl OwnerScopedKey {
                 ch: ' ',
             });
         }
+        validate_operation_key(trimmed)?;
         if let Some(ref owner) = self.owner_id {
             validate_owner_id(owner.as_str())?;
         }
@@ -1918,6 +1936,18 @@ impl OwnerScopedKey {
             None => format!("legacy:{}", self.raw_key),
         }
     }
+}
+
+fn validate_operation_key(s: &str) -> Result<(), ProvenanceError> {
+    for ch in s.chars() {
+        if ch.is_ascii_control() {
+            return Err(ProvenanceError::InvalidCharacter {
+                field: "raw_key",
+                ch,
+            });
+        }
+    }
+    Ok(())
 }
 
 impl Display for OwnerScopedKey {
@@ -2532,7 +2562,7 @@ mod tests {
         assert!(serde_json::from_str::<RecordingTime>(r#""9999-12-31T23:30:00-01:00""#).is_err());
 
         // now_utc produces a valid RFC 3339 timestamp that formats without fallback
-        let now = RecordingTime::now_utc();
+        let now = RecordingTime::now_utc().unwrap();
         let formatted = now.to_rfc3339().unwrap();
         assert!(formatted.ends_with('Z'));
         assert_ne!(formatted, "1970-01-01T00:00:00Z");
@@ -2729,6 +2759,8 @@ mod tests {
         // String with oversized value
         let str_json = format!(r#""{long_key}""#);
         assert!(serde_json::from_str::<OwnerScopedKey>(&str_json).is_err());
+        // Control characters are not valid operation / receipt keys.
+        assert!(serde_json::from_str::<OwnerScopedKey>(r#""op\u0000id""#).is_err());
     }
 
     #[test]
@@ -3063,6 +3095,8 @@ mod tests {
         assert!(FederatedOrigin::new("https://remote palace", None).is_err());
         assert!(FederatedOrigin::new("a".repeat(MAX_ORIGIN_ID_CHARS + 1), None).is_err());
         assert!(FederatedOrigin::new("https://remote.palace", Some("r".repeat(MAX_RECORD_ID_CHARS + 1))).is_err());
+        assert!(FederatedOrigin::new("https://remote.palace", Some(String::new())).is_err());
+        assert!(FederatedOrigin::new("https://remote.palace", Some("record\n42".to_string())).is_err());
 
         // Deserialization of LocalOrigin and FederatedOrigin directly
         let loc_de: LocalOrigin = serde_json::from_str(r#"{"origin_id":"node-primary"}"#).unwrap();
