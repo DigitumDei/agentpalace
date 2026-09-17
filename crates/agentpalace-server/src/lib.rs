@@ -36,11 +36,15 @@ use axum::{Json, Router};
 use blake3::Hasher;
 use agentpalace_config::AgentPalaceConfig;
 use agentpalace_core::{
-    BUILD_VERSION, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, OwnerId, RoomId,
+    BUILD_VERSION, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, RoomId,
     SHARED_AGENT_DIARY_WING, SearchQuery, SourceLocator, WING_PREFIX, WingId, hash_bytes,
     mined_drawer_id, resolve_records,
 };
-pub use agentpalace_core::{OwnerIdentity, OwnerMetadata};
+pub use agentpalace_core::{
+    reject_payload_owner_claim, AuthenticatedOwner, EmailAtWrite, Issuer, LegacyUnknownOwner,
+    OwnerId, OwnerIdentity, OwnerMetadata, OwnerScopedKey, ProvenanceEnvelope, ProvenanceError,
+    Subject, SubjectBinding,
+};
 use agentpalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 use agentpalace_federation::{
     AckMessageRequest, AddDrawerRequest, AddDrawerResponse, ChangeEventDto, ChangesQuery,
@@ -195,6 +199,9 @@ pub enum ServerError {
     /// Malformed identifier (wing id, room id, drawer id).
     #[error(transparent)]
     Id(#[from] agentpalace_core::IdError),
+    /// Propagated provenance error.
+    #[error(transparent)]
+    Provenance(#[from] agentpalace_core::ProvenanceError),
     /// JSON serialisation error.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -235,6 +242,11 @@ impl IntoResponse for ServerError {
                 (StatusCode::BAD_REQUEST, "invalid_params", msg.as_str().to_owned())
             }
             Self::Id(err) => (StatusCode::BAD_REQUEST, "invalid_params", err.to_string()),
+            Self::Provenance(err) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_provenance",
+                err.to_string(),
+            ),
             Self::Unauthorized => {
                 (StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid token".to_owned())
             }
@@ -764,6 +776,25 @@ pub struct AuthIdentity(
 );
 
 impl AuthIdentity {
+    /// Create a new `AuthIdentity` with optional scopes and optional owner metadata.
+    pub fn new(
+        name: impl Into<String>,
+        scopes: Option<Vec<TokenScopeEntry>>,
+        owner: Option<OwnerMetadata>,
+    ) -> Self {
+        Self(name.into(), scopes, owner)
+    }
+
+    /// Create an unrestricted `AuthIdentity` with no scopes and no owner metadata (legacy static token).
+    pub fn unrestricted(name: impl Into<String>) -> Self {
+        Self(name.into(), None, None)
+    }
+
+    /// Create an unrestricted `AuthIdentity` with authenticated owner metadata.
+    pub fn with_owner(name: impl Into<String>, owner: impl Into<OwnerMetadata>) -> Self {
+        Self(name.into(), None, Some(owner.into()))
+    }
+
     /// Whether this token grants the full local MCP surface.
     pub fn is_unrestricted(&self) -> bool {
         self.1.is_none()
@@ -772,6 +803,11 @@ impl AuthIdentity {
     /// The authenticated identity name.
     pub fn name(&self) -> &str {
         &self.0
+    }
+
+    /// View resolved token scope entries, or `None` if unrestricted.
+    pub fn scopes(&self) -> Option<&[TokenScopeEntry]> {
+        self.1.as_deref()
     }
 
     /// Optional validated owner metadata for authenticated tokens.
@@ -797,6 +833,38 @@ impl AuthIdentity {
     /// True when this token carries authenticated owner metadata.
     pub fn has_owner(&self) -> bool {
         self.2.is_some()
+    }
+
+    /// View provider issuer, if authenticated.
+    pub fn issuer(&self) -> Option<&Issuer> {
+        self.2.as_ref().map(|o| &o.issuer)
+    }
+
+    /// View provider subject, if authenticated.
+    pub fn subject(&self) -> Option<&Subject> {
+        self.2.as_ref().map(|o| &o.subject)
+    }
+
+    /// View human-readable email captured at write time, if authenticated.
+    pub fn email_at_write(&self) -> Option<&EmailAtWrite> {
+        self.2.as_ref().map(|o| &o.email_at_write)
+    }
+
+    /// View provider subject binding (`(issuer, subject)`), if authenticated.
+    pub fn subject_binding(&self) -> Option<SubjectBinding> {
+        self.2.as_ref().map(|o| o.subject_binding())
+    }
+
+    /// Construct an owner-scoped key using the server-established owner identity.
+    ///
+    /// If the identity is authenticated, the resulting key is scoped to the owner ID.
+    /// If the identity is unauthenticated/legacy, the resulting key is scoped to the
+    /// reserved legacy sentinel.
+    pub fn owner_scoped_key(
+        &self,
+        raw_key: impl Into<String>,
+    ) -> std::result::Result<OwnerScopedKey, ProvenanceError> {
+        OwnerScopedKey::new(self.owner_id().cloned(), raw_key)
     }
 
     /// True when this identity may perform `op` at all, independent of wing.
@@ -844,6 +912,158 @@ impl AuthIdentity {
                 WingVisibility::Only(wings)
             }
         }
+    }
+}
+
+impl<S> axum::extract::FromRequestParts<S> for AuthIdentity
+where
+    S: Send + Sync,
+{
+    type Rejection = ServerError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<AuthIdentity>()
+            .cloned()
+            .ok_or(ServerError::Unauthorized)
+    }
+}
+
+/// Axum extractor for server-established authenticated ownership context.
+///
+/// Handlers can extract this parameter directly:
+/// ```ignore
+/// async fn route_handler(
+///     owner_ctx: AuthenticatedOwnerContext,
+///     // ...
+/// )
+/// ```
+///
+/// Provides convenient, direct access to the authenticated owner identity,
+/// provider-neutral metadata, and underlying [`AuthIdentity`] without relying
+/// on untrusted request body fields.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedOwnerContext {
+    identity: AuthIdentity,
+    owner_identity: OwnerIdentity,
+    owner_metadata: Option<OwnerMetadata>,
+}
+
+impl AuthenticatedOwnerContext {
+    /// Create a new `AuthenticatedOwnerContext` from an [`AuthIdentity`].
+    pub fn from_identity(identity: AuthIdentity) -> Self {
+        let owner_identity = identity.owner_identity();
+        let owner_metadata = identity.owner().cloned();
+        Self {
+            identity,
+            owner_identity,
+            owner_metadata,
+        }
+    }
+
+    /// The authenticated identity name (display name / token identity).
+    pub fn name(&self) -> &str {
+        self.identity.name()
+    }
+
+    /// Resolved [`OwnerIdentity`] (server-established).
+    pub fn owner_identity(&self) -> &OwnerIdentity {
+        &self.owner_identity
+    }
+
+    /// Validated [`OwnerMetadata`], if authenticated.
+    pub fn owner(&self) -> Option<&OwnerMetadata> {
+        self.owner_metadata.as_ref()
+    }
+
+    /// Immutable owner ID, if authenticated.
+    pub fn owner_id(&self) -> Option<&OwnerId> {
+        self.identity.owner_id()
+    }
+
+    /// True when this request carries authenticated owner metadata.
+    pub fn has_owner(&self) -> bool {
+        self.identity.has_owner()
+    }
+
+    /// Provider issuer, if authenticated.
+    pub fn issuer(&self) -> Option<&Issuer> {
+        self.identity.issuer()
+    }
+
+    /// Provider subject, if authenticated.
+    pub fn subject(&self) -> Option<&Subject> {
+        self.identity.subject()
+    }
+
+    /// Email-at-write, if authenticated.
+    pub fn email_at_write(&self) -> Option<&EmailAtWrite> {
+        self.identity.email_at_write()
+    }
+
+    /// Subject binding, if authenticated.
+    pub fn subject_binding(&self) -> Option<SubjectBinding> {
+        self.identity.subject_binding()
+    }
+
+    /// Construct an owner-scoped key using the server-established owner identity.
+    pub fn owner_scoped_key(
+        &self,
+        raw_key: impl Into<String>,
+    ) -> std::result::Result<OwnerScopedKey, ProvenanceError> {
+        self.identity.owner_scoped_key(raw_key)
+    }
+
+    /// Access the underlying [`AuthIdentity`].
+    pub fn auth_identity(&self) -> &AuthIdentity {
+        &self.identity
+    }
+
+    /// Consume into the underlying [`AuthIdentity`].
+    pub fn into_auth_identity(self) -> AuthIdentity {
+        self.identity
+    }
+}
+
+impl std::ops::Deref for AuthenticatedOwnerContext {
+    type Target = AuthIdentity;
+
+    fn deref(&self) -> &Self::Target {
+        &self.identity
+    }
+}
+
+impl<S> axum::extract::FromRequestParts<S> for AuthenticatedOwnerContext
+where
+    S: Send + Sync,
+{
+    type Rejection = ServerError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let identity = parts
+            .extensions
+            .get::<AuthIdentity>()
+            .cloned()
+            .ok_or(ServerError::Unauthorized)?;
+        let owner_identity = parts
+            .extensions
+            .get::<OwnerIdentity>()
+            .cloned()
+            .ok_or(ServerError::Unauthorized)?;
+        let owner_metadata = parts.extensions.get::<OwnerMetadata>().cloned();
+
+        Ok(Self {
+            identity,
+            owner_identity,
+            owner_metadata,
+        })
     }
 }
 
@@ -1189,6 +1409,9 @@ where
             if let Some(owner) = identity.owner() {
                 request.extensions_mut().insert(owner.clone());
             }
+            request
+                .extensions_mut()
+                .insert(AuthenticatedOwnerContext::from_identity(identity.clone()));
             request.extensions_mut().insert(identity);
             next.run(request).await
         }
@@ -5866,59 +6089,49 @@ mod tests {
         let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
         let (router, state) = build_router(config, provider, tokens).await.unwrap();
 
-        // Custom extractor asserting and extracting request extensions populated by auth_middleware
-        struct ExtractedOwnerContext {
-            identity: AuthIdentity,
-            owner_identity: OwnerIdentity,
-            owner_metadata: Option<OwnerMetadata>,
-        }
-
-        impl<S> axum::extract::FromRequestParts<S> for ExtractedOwnerContext
-        where
-            S: Send + Sync,
-        {
-            type Rejection = (StatusCode, &'static str);
-
-            async fn from_request_parts(
-                parts: &mut axum::http::request::Parts,
-                _state: &S,
-            ) -> Result<Self, Self::Rejection> {
-                let identity = parts
-                    .extensions
-                    .get::<AuthIdentity>()
-                    .cloned()
-                    .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "missing AuthIdentity extension"))?;
-                let owner_identity = parts
-                    .extensions
-                    .get::<OwnerIdentity>()
-                    .cloned()
-                    .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "missing OwnerIdentity extension"))?;
-                let owner_metadata = parts.extensions.get::<OwnerMetadata>().cloned();
-
-                Ok(Self {
-                    identity,
-                    owner_identity,
-                    owner_metadata,
-                })
-            }
-        }
-
         async fn test_inspect_extensions_handler(
             axum::extract::Extension(direct_owner_identity): axum::extract::Extension<OwnerIdentity>,
             direct_owner_metadata: Option<axum::extract::Extension<OwnerMetadata>>,
-            extracted: ExtractedOwnerContext,
+            extracted: AuthenticatedOwnerContext,
+            auth: AuthIdentity,
         ) -> Json<serde_json::Value> {
-            // Assert that axum's built-in Extension extractor matches the custom extractor
-            assert_eq!(direct_owner_identity, extracted.owner_identity);
+            // Assert that axum's built-in Extension extractor matches the first-class extractors
+            assert_eq!(direct_owner_identity, *extracted.owner_identity());
             assert_eq!(
                 direct_owner_metadata.as_ref().map(|m| &m.0),
-                extracted.owner_metadata.as_ref()
+                extracted.owner()
             );
+            assert_eq!(extracted.auth_identity().name(), auth.name());
+            assert_eq!(extracted.name(), auth.name());
 
-            // Handler assertions for token-specific expectations
-            if extracted.identity.name() == "alice_with_owner" {
-                assert!(extracted.owner_metadata.is_some());
-                match &extracted.owner_identity {
+            // Handler assertions for token-specific expectations and focused accessors
+            if extracted.name() == "alice_with_owner" {
+                assert!(extracted.has_owner());
+                assert!(extracted.owner().is_some());
+                assert_eq!(
+                    extracted.issuer().map(|i| i.as_str()),
+                    Some("https://accounts.google.com")
+                );
+                assert_eq!(
+                    extracted.subject().map(|s| s.as_str()),
+                    Some("sub_middleware")
+                );
+                assert_eq!(
+                    extracted.email_at_write().map(|e| e.as_str()),
+                    Some("alice@example.com")
+                );
+                assert_eq!(
+                    extracted.owner_id().map(|id| id.as_str()),
+                    Some("usr_01J8Y000000000000000000000")
+                );
+                let key = extracted.owner_scoped_key("inspect_op").unwrap();
+                assert_eq!(
+                    key.composite_key(),
+                    "usr_01J8Y000000000000000000000:inspect_op"
+                );
+                assert!(key.is_authenticated());
+
+                match extracted.owner_identity() {
                     OwnerIdentity::Authenticated(owner) => {
                         assert_eq!(owner.email_at_write.as_str(), "alice@example.com");
                         assert_eq!(owner.issuer.as_str(), "https://accounts.google.com");
@@ -5927,15 +6140,22 @@ mod tests {
                     }
                     _ => panic!("expected OwnerIdentity::Authenticated"),
                 }
-            } else if extracted.identity.name() == "static_user" {
-                assert_eq!(extracted.owner_identity, OwnerIdentity::Unknown);
-                assert!(extracted.owner_metadata.is_none());
+            } else if extracted.name() == "static_user" {
+                assert_eq!(*extracted.owner_identity(), OwnerIdentity::Unknown);
+                assert!(!extracted.has_owner());
+                assert!(extracted.owner().is_none());
+                assert!(extracted.issuer().is_none());
+                assert!(extracted.subject().is_none());
+                assert!(extracted.email_at_write().is_none());
+                let key = extracted.owner_scoped_key("inspect_op").unwrap();
+                assert_eq!(key.composite_key(), "legacy:inspect_op");
+                assert!(key.is_legacy());
             }
 
             Json(serde_json::json!({
-                "principal": extracted.identity.name(),
-                "owner_identity": serde_json::to_value(&extracted.owner_identity).unwrap(),
-                "owner_metadata": serde_json::to_value(&extracted.owner_metadata).unwrap(),
+                "principal": extracted.name(),
+                "owner_identity": serde_json::to_value(extracted.owner_identity()).unwrap(),
+                "owner_metadata": serde_json::to_value(extracted.owner()).unwrap(),
             }))
         }
 
@@ -6024,6 +6244,295 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(info_resp2.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authenticated_ownership_context_propagation_and_tamper_resistance() {
+        // 1. AuthIdentity focused accessors and constructors
+        let owner_meta = OwnerMetadata::parse(
+            "usr_01J8Y000000000000000000001",
+            "https://accounts.google.com",
+            "subject_alice_42",
+            "alice@domain.org",
+        )
+        .unwrap();
+
+        let auth_owned = AuthIdentity::with_owner("alice_display", owner_meta.clone());
+        assert_eq!(auth_owned.name(), "alice_display");
+        assert!(auth_owned.is_unrestricted());
+        assert!(auth_owned.scopes().is_none());
+        assert!(auth_owned.has_owner());
+        assert_eq!(
+            auth_owned.owner_id().map(|id| id.as_str()),
+            Some("usr_01J8Y000000000000000000001")
+        );
+        assert_eq!(
+            auth_owned.issuer().map(|i| i.as_str()),
+            Some("https://accounts.google.com")
+        );
+        assert_eq!(
+            auth_owned.subject().map(|s| s.as_str()),
+            Some("subject_alice_42")
+        );
+        assert_eq!(
+            auth_owned.email_at_write().map(|e| e.as_str()),
+            Some("alice@domain.org")
+        );
+        assert_eq!(
+            auth_owned.subject_binding().map(|sb| sb.issuer.into_string()),
+            Some("https://accounts.google.com".to_string())
+        );
+
+        let owned_key = auth_owned.owner_scoped_key("op_add_drawer").unwrap();
+        assert_eq!(
+            owned_key.composite_key(),
+            "usr_01J8Y000000000000000000001:op_add_drawer"
+        );
+        assert!(owned_key.is_authenticated());
+        assert!(!owned_key.is_legacy());
+
+        // Legacy / unrestricted static token
+        let auth_static = AuthIdentity::unrestricted("legacy_service");
+        assert_eq!(auth_static.name(), "legacy_service");
+        assert!(auth_static.is_unrestricted());
+        assert!(auth_static.scopes().is_none());
+        assert!(!auth_static.has_owner());
+        assert!(auth_static.owner().is_none());
+        assert!(auth_static.owner_id().is_none());
+        assert!(auth_static.issuer().is_none());
+        assert!(auth_static.subject().is_none());
+        assert!(auth_static.email_at_write().is_none());
+        assert_eq!(auth_static.owner_identity(), OwnerIdentity::Unknown);
+
+        let legacy_key = auth_static.owner_scoped_key("op_add_drawer").unwrap();
+        assert_eq!(legacy_key.composite_key(), "legacy:op_add_drawer");
+        assert!(!legacy_key.is_authenticated());
+        assert!(legacy_key.is_legacy());
+
+        // 2. AuthenticatedOwnerContext methods and Deref to AuthIdentity
+        let ctx = AuthenticatedOwnerContext::from_identity(auth_owned.clone());
+        assert_eq!(ctx.name(), "alice_display");
+        assert!(ctx.has_owner());
+        assert_eq!(
+            ctx.owner_id().map(|id| id.as_str()),
+            Some("usr_01J8Y000000000000000000001")
+        );
+        assert_eq!(
+            ctx.owner_scoped_key("op_ctx").unwrap().composite_key(),
+            "usr_01J8Y000000000000000000001:op_ctx"
+        );
+        // Deref to AuthIdentity methods
+        assert!(ctx.is_unrestricted());
+        assert_eq!(ctx.auth_identity().name(), "alice_display");
+
+        // 3. Server-side tamper resistance: reject_payload_owner_claim and error mapping
+        assert!(reject_payload_owner_claim::<String>(None).is_ok());
+        let claim_err = reject_payload_owner_claim(Some("spoofed_owner_id")).unwrap_err();
+        assert!(matches!(claim_err, ProvenanceError::UnauthenticatedOwnerClaim(_)));
+
+        // Verify ServerError mapping: converts ProvenanceError into HTTP 400 Bad Request
+        let server_err = ServerError::from(claim_err);
+        let resp = server_err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // 4. Token identity collision-resistance: two tokens with the same display name
+        // but different owners produce distinct OwnerScopedKey composite keys.
+        let owner_a = OwnerMetadata::parse(
+            "usr_01J8Y_ALICE_ID",
+            "https://accounts.google.com",
+            "sub_alice",
+            "alice@example.com",
+        )
+        .unwrap();
+        let owner_b = OwnerMetadata::parse(
+            "usr_01J8Y_BOB_ID",
+            "https://accounts.google.com",
+            "sub_bob",
+            "bob@example.com",
+        )
+        .unwrap();
+
+        let token_entry_a = AuthIdentity::with_owner("shared_agent_name", owner_a);
+        let token_entry_b = AuthIdentity::with_owner("shared_agent_name", owner_b);
+        assert_eq!(token_entry_a.name(), token_entry_b.name());
+
+        let key_a = token_entry_a.owner_scoped_key("tx_100").unwrap();
+        let key_b = token_entry_b.owner_scoped_key("tx_100").unwrap();
+        assert_ne!(key_a.composite_key(), key_b.composite_key());
+        assert_eq!(key_a.composite_key(), "usr_01J8Y_ALICE_ID:tx_100");
+        assert_eq!(key_b.composite_key(), "usr_01J8Y_BOB_ID:tx_100");
+
+        // 5. Integration: router with auth_middleware verifying that caller-asserted
+        // agent fields cannot override owner, demonstrating the reject_payload_owner_claim
+        // helper contract on untyped payloads, and confirming production request boundaries
+        // never accept or derive owner identity from payload fields.
+        let tempdir = TempDir::new().unwrap();
+        let palace_path = tempdir.path().join("palace");
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "tok-alice-owner",
+                    "name": "alice_identity",
+                    "enabled": true,
+                    "owner": {
+                        "id": "usr_01J8Y_ALICE_TEST",
+                        "issuer": "https://accounts.google.com",
+                        "subject": "sub_alice_test",
+                        "email_at_write": "alice@test.org"
+                    }
+                },
+                {
+                    "token": "tok-static-admin",
+                    "name": "admin_identity",
+                    "enabled": true
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let config = AgentPalaceConfig {
+            schema_version: 1,
+            collection_name: "agentpalace_drawers".to_owned(),
+            palace_path,
+            embedding_profile: EmbeddingProfile::Balanced,
+            low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+            server: ServerRuntimeConfig {
+                bind: "127.0.0.1:8765".parse().unwrap(),
+                token_file: token_file.clone(),
+                checkouts: std::collections::BTreeMap::new(),
+            },
+            federation: FederationRuntimeConfig::default(),
+            maintenance: MaintenanceRuntimeConfig::defaults(),
+        };
+
+        let tokens = TokenRegistry::load(token_file).unwrap();
+        let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
+        let (router, state) = build_router(config, provider, tokens).await.unwrap();
+
+        // Handler demonstrating the helper contract: verifying caller-asserted agent cannot override
+        // server-established owner, and using reject_payload_owner_claim to reject payload-supplied owner claims.
+        async fn test_write_tamper_handler(
+            ctx: AuthenticatedOwnerContext,
+            Json(body): Json<serde_json::Value>,
+        ) -> Result<Json<serde_json::Value>, ServerError> {
+            // Helper contract: check if caller attempted to supply an unauthenticated owner field
+            if let Some(claimed_owner) = body.get("owner") {
+                reject_payload_owner_claim(Some(claimed_owner))?;
+            }
+
+            let caller_claimed_agent = body.get("added_by").and_then(|v| v.as_str());
+            let effective_actor = match caller_claimed_agent {
+                Some(claimed) if claimed != ctx.name() => format!("{}:{claimed}", ctx.name()),
+                _ => ctx.name().to_string(),
+            };
+
+            let op_key = ctx.owner_scoped_key(
+                body.get("operation_id").and_then(|v| v.as_str()).unwrap_or("op_default")
+            )?;
+
+            Ok(Json(serde_json::json!({
+                "effective_actor": effective_actor,
+                "owner_identity": ctx.owner_identity(),
+                "owner_id": ctx.owner_id().map(|id| id.as_str()),
+                "composite_op_key": op_key.composite_key(),
+                "is_authenticated": op_key.is_authenticated(),
+            })))
+        }
+
+        let write_test_router = Router::<Arc<ServerState<DeterministicStubProvider>>>::new()
+            .route("/test/write_tamper", post(test_write_tamper_handler))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                auth_middleware::<DeterministicStubProvider>,
+            ))
+            .with_state(Arc::clone(&state));
+
+        let app = router.merge(write_test_router);
+
+        // A. Owned token write with caller-asserted agent:
+        // Caller claims added_by: "rogue_bot", operation_id: "op_42"
+        let req_a = authed_json_request(
+            Method::POST,
+            "/test/write_tamper",
+            "tok-alice-owner",
+            serde_json::json!({
+                "added_by": "rogue_bot",
+                "operation_id": "op_42"
+            }),
+        );
+        let resp_a = app.clone().oneshot(req_a).await.unwrap();
+        assert_eq!(resp_a.status(), StatusCode::OK);
+        let data_a = body_json(resp_a).await;
+        // The actor was namespaced with the authenticated display name
+        assert_eq!(data_a["effective_actor"], "alice_identity:rogue_bot");
+        // BUT the server-established owner ID and scoped key remain completely uncompromised
+        assert_eq!(data_a["owner_id"], "usr_01J8Y_ALICE_TEST");
+        assert_eq!(data_a["composite_op_key"], "usr_01J8Y_ALICE_TEST:op_42");
+        assert_eq!(data_a["is_authenticated"], true);
+
+        // B. Helper contract demonstration: caller attempts to supply an unauthenticated owner field in payload -> rejected 400 invalid_provenance
+        let req_b = authed_json_request(
+            Method::POST,
+            "/test/write_tamper",
+            "tok-alice-owner",
+            serde_json::json!({
+                "owner": "usr_hacker_forged",
+                "operation_id": "op_43"
+            }),
+        );
+        let resp_b = app.clone().oneshot(req_b).await.unwrap();
+        assert_eq!(resp_b.status(), StatusCode::BAD_REQUEST);
+        let data_b = body_json(resp_b).await;
+        assert_eq!(data_b["error"]["code"], "invalid_provenance");
+
+        // C. Static token write: owner is Unknown, operation key is legacy-scoped
+        let req_c = authed_json_request(
+            Method::POST,
+            "/test/write_tamper",
+            "tok-static-admin",
+            serde_json::json!({
+                "added_by": "daemon",
+                "operation_id": "op_static_99"
+            }),
+        );
+        let resp_c = app.clone().oneshot(req_c).await.unwrap();
+        assert_eq!(resp_c.status(), StatusCode::OK);
+        let data_c = body_json(resp_c).await;
+        assert_eq!(data_c["effective_actor"], "admin_identity:daemon");
+        assert_eq!(data_c["owner_id"], serde_json::Value::Null);
+        assert_eq!(data_c["composite_op_key"], "legacy:op_static_99");
+        assert_eq!(data_c["is_authenticated"], false);
+
+        // D. Production route verification: POST /v1/drawers ignores caller-supplied owner field in payload,
+        // namespacing added_by as {identity}:{claimed} and preserving server-established identity.
+        let req_d = authed_json_request(
+            Method::POST,
+            "/v1/drawers",
+            "tok-alice-owner",
+            serde_json::json!({
+                "wing": "wing_provenance",
+                "room": "room_test",
+                "content": "drawer content proving unforgeable provenance",
+                "added_by": "rogue_bot",
+                "owner": "usr_hacker_forged"
+            }),
+        );
+        let resp_d = app.clone().oneshot(req_d).await.unwrap();
+        assert_eq!(resp_d.status(), StatusCode::OK);
+        let data_d = body_json(resp_d).await;
+        assert_eq!(data_d["success"], true);
+        let drawer_id = data_d["drawer_id"].as_str().unwrap();
+
+        // Fetch back drawer and verify effective added_by is namespaced against server-established identity
+        let req_fetch = authed_get(&format!("/v1/drawers/{drawer_id}"), "tok-alice-owner");
+        let resp_fetch = app.clone().oneshot(req_fetch).await.unwrap();
+        assert_eq!(resp_fetch.status(), StatusCode::OK);
+        let data_fetch = body_json(resp_fetch).await;
+        assert_eq!(data_fetch["added_by"], "alice_identity:rogue_bot");
     }
 
     #[test]
