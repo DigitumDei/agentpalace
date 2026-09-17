@@ -2569,6 +2569,50 @@ mod tests {
     }
 
     #[test]
+    fn recording_time_wire_and_persistence_paths_preserve_boundaries() {
+        let lower = RecordingTime::from_rfc3339("0000-01-01T00:00:00Z").unwrap();
+        let upper = RecordingTime::from_rfc3339("9999-12-31T23:59:59Z").unwrap();
+
+        for recording_time in [lower, upper] {
+            let wire = serde_json::to_string(&recording_time).unwrap();
+            let decoded: RecordingTime = serde_json::from_str(&wire).unwrap();
+            assert_eq!(decoded, recording_time);
+
+            let envelope = ProvenanceEnvelope::new(
+                OwnerIdentity::unknown(),
+                recording_time,
+                StorageOrigin::local_default(),
+            );
+            let persisted = serde_json::to_string(&envelope).unwrap();
+            let restored: ProvenanceEnvelope = serde_json::from_str(&persisted).unwrap();
+            assert_eq!(restored.recorded_at, recording_time);
+        }
+    }
+
+    #[test]
+    fn recording_time_propagates_serializer_errors_without_epoch_fallback() {
+        struct FailingWriter;
+
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test writer failure",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let recording_time = RecordingTime::from_rfc3339("0000-01-01T00:00:00Z").unwrap();
+        let error = serde_json::to_writer(FailingWriter, &recording_time).unwrap_err();
+        assert!(error.is_io());
+        assert!(error.to_string().contains("test writer failure"));
+    }
+
+    #[test]
     fn owner_scoped_key_generation_and_serde() {
         let owner_id = OwnerId::new("usr_01J8Y").unwrap();
         let key = OwnerScopedKey::new(Some(owner_id.clone()), "op_add_drawer_1").unwrap();
