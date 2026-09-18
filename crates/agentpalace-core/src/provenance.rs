@@ -113,6 +113,10 @@ pub enum ProvenanceError {
     #[error("invalid storage origin: {0}")]
     InvalidStorageOrigin(String),
 
+    /// Persisted provenance fields contradict one another.
+    #[error("invalid provenance: {0}")]
+    InvalidProvenance(String),
+
     /// Too many source references in envelope.
     #[error("source references count ({count}) exceeds maximum allowed ({max})")]
     TooManySourceRefs {
@@ -2126,6 +2130,20 @@ impl ProvenanceHistoryEntry {
     }
 }
 
+fn require_provenance_action(
+    entry: &ProvenanceHistoryEntry,
+    field: &'static str,
+    expected: ProvenanceAction,
+) -> Result<(), ProvenanceError> {
+    if entry.action != expected {
+        return Err(ProvenanceError::InvalidProvenance(format!(
+            "{field} must use action {expected:?}, got {:?}",
+            entry.action
+        )));
+    }
+    Ok(())
+}
+
 /// Full provenance retained by a persistent store.
 ///
 /// This is the storage model: issuer and provider subject remain available for
@@ -2207,6 +2225,7 @@ impl PersistedProvenance {
     /// Validate nested values and the bounded history/reference collections.
     pub fn validate(&self) -> Result<(), ProvenanceError> {
         self.creator.validate()?;
+        require_provenance_action(&self.creator, "creator", ProvenanceAction::Created)?;
         self.authenticated_submitter.validate()?;
         if let Some(author) = &self.source_author {
             author.validate()?;
@@ -2226,12 +2245,23 @@ impl PersistedProvenance {
         }
         for entry in &self.history {
             entry.validate()?;
+            if !matches!(
+                entry.action,
+                ProvenanceAction::Modified | ProvenanceAction::AdditionalSubmission
+            ) {
+                return Err(ProvenanceError::InvalidProvenance(format!(
+                    "history entries must use action Modified or AdditionalSubmission, got {:?}",
+                    entry.action
+                )));
+            }
         }
         if let Some(entry) = &self.deleted_by {
             entry.validate()?;
+            require_provenance_action(entry, "deleted_by", ProvenanceAction::Deleted)?;
         }
         if let Some(entry) = &self.invalidated_by {
             entry.validate()?;
+            require_provenance_action(entry, "invalidated_by", ProvenanceAction::Invalidated)?;
         }
         Ok(())
     }
@@ -2308,8 +2338,18 @@ impl FederatedOriginalProvenance {
     /// Validate the federated provenance boundary.
     pub fn validate(&self) -> Result<(), ProvenanceError> {
         self.origin.validate()?;
+        if !self.origin.is_federated() {
+            return Err(ProvenanceError::InvalidProvenance(
+                "federated_original.origin must be federated".to_string(),
+            ));
+        }
         if let Some(record_id) = &self.record_id {
             validate_record_id(record_id)?;
+        }
+        if self.record_id.as_deref() != self.origin.original_record_id() {
+            return Err(ProvenanceError::InvalidProvenance(
+                "federated_original.record_id must match origin.original_record_id".to_string(),
+            ));
         }
         self.creator.validate()?;
         if let Some(author) = &self.source_author {
@@ -3971,5 +4011,91 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("\"status\":\"unknown"));
         assert!(json.contains("drawer-7"));
+    }
+
+    #[test]
+    fn persisted_provenance_deserialization_rejects_action_role_mismatches() {
+        let owner = AuthenticatedOwner::parse(
+            "usr_creator",
+            "https://accounts.google.com",
+            "google-subject",
+            "creator@example.com",
+        )
+        .unwrap();
+        let identity = OwnerIdentity::Authenticated(owner);
+        let recorded_at = RecordingTime::from_rfc3339("2026-09-18T12:00:00Z").unwrap();
+        let valid = PersistedProvenance {
+            creator: ProvenanceHistoryEntry::new(
+                ProvenanceAction::Created,
+                identity.clone(),
+                recorded_at,
+            ),
+            authenticated_submitter: identity.clone(),
+            source_author: None,
+            source_refs: Vec::new(),
+            storage_origin: StorageOrigin::local_default(),
+            federated_original: None,
+            history: Vec::new(),
+            deleted_by: None,
+            invalidated_by: None,
+        };
+
+        let mut creator = serde_json::to_value(&valid).unwrap();
+        creator["creator"]["action"] = serde_json::json!("modified");
+        assert!(serde_json::from_value::<PersistedProvenance>(creator).is_err());
+
+        let history_entry = serde_json::json!({
+            "action": "created",
+            "owner": serde_json::to_value(&identity).unwrap(),
+            "recorded_at": "2026-09-18T12:00:00Z"
+        });
+        let mut history = serde_json::to_value(&valid).unwrap();
+        history["history"] = serde_json::json!([history_entry]);
+        assert!(serde_json::from_value::<PersistedProvenance>(history).is_err());
+
+        let mut deleted = serde_json::to_value(&valid).unwrap();
+        deleted["deleted_by"] = serde_json::json!({
+            "action": "modified",
+            "owner": serde_json::to_value(&identity).unwrap(),
+            "recorded_at": "2026-09-18T12:00:00Z"
+        });
+        assert!(serde_json::from_value::<PersistedProvenance>(deleted).is_err());
+
+        let mut invalidated = serde_json::to_value(&valid).unwrap();
+        invalidated["invalidated_by"] = serde_json::json!({
+            "action": "deleted",
+            "owner": serde_json::to_value(&identity).unwrap(),
+            "recorded_at": "2026-09-18T12:00:00Z"
+        });
+        assert!(serde_json::from_value::<PersistedProvenance>(invalidated).is_err());
+    }
+
+    #[test]
+    fn federated_original_deserialization_rejects_local_and_contradictory_origins() {
+        let valid = FederatedOriginalProvenance {
+            origin: StorageOrigin::federated("https://source.example", Some("drawer-7".into()))
+                .unwrap(),
+            record_id: Some("drawer-7".into()),
+            creator: OwnerIdentity::Unknown,
+            source_author: None,
+            source_refs: Vec::new(),
+        };
+
+        let mut local_origin = serde_json::to_value(&valid).unwrap();
+        local_origin["origin"] = serde_json::json!({
+            "kind": "local",
+            "origin_id": "local"
+        });
+        assert!(serde_json::from_value::<FederatedOriginalProvenance>(local_origin).is_err());
+
+        let mut mismatched_record_id = serde_json::to_value(&valid).unwrap();
+        mismatched_record_id["record_id"] = serde_json::json!("drawer-8");
+        assert!(
+            serde_json::from_value::<FederatedOriginalProvenance>(mismatched_record_id).is_err()
+        );
+
+        let mut missing_record_id = serde_json::to_value(&valid).unwrap();
+        missing_record_id["record_id"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<FederatedOriginalProvenance>(missing_record_id).is_err());
     }
 }
