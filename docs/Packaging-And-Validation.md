@@ -157,3 +157,28 @@ the upstream ONNX Runtime license and third-party notices, installed as `ONNXRun
 
 `release/ONNXRuntime-NOTICES.txt` contains the upstream ONNX Runtime 1.23.2 license
 and third-party notices. Refresh it when upgrading the bundled runtime.
+
+## Claude PR Review Completion
+
+The Claude review workflow reviews the current PR commit, including draft
+checkpoints and commits with earlier Claude comments. It uses an explicit prompt
+rather than the upstream code-review plugin, whose draft and existing-comment
+skip rules do not fit checkpoint delivery.
+
+The agent obtains the diff through `gh pr diff` and inspects source using
+Read, Grep, and Glob. Its existing comment tools publish findings and a final
+tracking-comment summary; it is not granted unrestricted shell or `gh api` access.
+
+After uploading sanitized diagnostics, a trusted workflow step reads PR comments
+and runs `scripts/validate-claude-review.py`. Success requires a successful
+captured SDK result and a Claude-authored final summary carrying the completion
+marker for this workflow run, attempt, and PR head SHA. A progress checklist,
+an earlier review, or another author's comment cannot satisfy the check.
+A successful SDK exit without that summary now fails the job. Recovered tool
+denials remain diagnostic warnings when a final review was completed.
+
+Only the sanitized diagnostic summary is uploaded, with seven-day retention.
+The comment response used by validation stays in runner temporary storage.
+Workflow changes must reach the default branch before the Claude action's OIDC
+workflow-identity validation permits a live retry; local validation alone does
+not prove the hosted review completed.
