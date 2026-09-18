@@ -299,7 +299,7 @@ in the crate is not by itself a remote contract.
   - `ReceiptOutcome::Recover`: A prior attempt crashed. If the drawer exists and matches content, the server recovers missing `drawer_added` change events via atomic append-if-absent, marks receipt complete, and returns success. If content differs, returns `409 Conflict`. If absent, proceeds with write using the pinned target ID.
 - **Provenance Status:**
   - *Available now:* `effective_added_by` resolves to `{token_id}:{claimed_agent}` when claimed differs from token, or `{token_id}`. Stored on drawer and change event.
-  - *Deferred to storage slice:* Validated `owner` metadata on token entry; durable persistence of human `owner_id`, `issuer`, `subject`, and `email_at_write`; scoping `operation_id` to `(owner_id, operation_id)`.
+  - *Available now:* Validated `owner` metadata on private server token entries is loaded into the authenticated request context; durable persistence of human `owner_id`, `issuer`, `subject`, and `email_at_write`, and scoping `operation_id` to `(owner_id, operation_id)`, remain deferred to the storage slice.
 
 #### 6. `GET /v1/drawers`
 - **Operation Gate:** `read`.
