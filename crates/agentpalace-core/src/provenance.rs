@@ -3969,7 +3969,7 @@ mod tests {
         };
         original.validate().unwrap();
         let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("\\\"status\\\":\\\"unknown"));
+        assert!(json.contains("\"status\":\"unknown"));
         assert!(json.contains("drawer-7"));
     }
 }
