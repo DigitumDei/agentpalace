@@ -1,10 +1,10 @@
 # Demo Hub: Canonical Remote REST Inventory and Implementation Contract
 
-**Document Version:** 1.1.12<br>
+**Document Version:** 1.1.13<br>
 **Release Series:** 0.2.0 (`release/version.toml`)<br>
 **Federation API Version:** 1 (`agentpalace_federation::FEDERATION_API_VERSION`)<br>
 **Status:** Approved Implementation Contract for AgentPalace #160 (parent issue #159)<br>
-**Date:** 2026-09-17
+**Date:** 2026-09-18
 **Authoritative Sources:** `crates/agentpalace-server/src/lib.rs`, `crates/agentpalace-federation/src/lib.rs`, `docs/Demo-Hub-Design.md`
 
 ---
@@ -85,60 +85,62 @@ Every remote route follows one of four authorization models:
 
 ---
 
-## 3. Master Inventory Summary Table (34 Routes)
+## 3. Master Inventory Summary Table (34 Registrations, 51 Method/Path Pairs)
 
-The table below catalogs every current method/path pair registered in `build_router` (`crates/agentpalace-server/src/lib.rs`):
+The table below catalogs all 34 explicit production registrations in `build_router` (`crates/agentpalace-server/src/lib.rs`):
 
 | # | Method | Path | Token Operation | Auth Category | Demo Roles | Durable Store(s) | Idempotency / Receipt Key | Provenance Status |
 |---|---|---|---|---|---|---|---|---|
-| 1 | `GET` | `/v1/health` | None | Public | All (public) | In-memory | Naturally idempotent | N/A (unauthenticated) |
-| 2 | `GET` | `/v1/info` | None (auth only) | D (Server-wide) | `readonly`, `write`, `admin` | In-memory / Config | Naturally idempotent | Available now |
+| 1 | `GET`, `HEAD` | `/v1/health` | None | Public | All (public) | In-memory | Naturally idempotent | N/A (unauthenticated) |
+| 2 | `GET`, `HEAD` | `/v1/info` | None (auth only) | D (Server-wide) | `readonly`, `write`, `admin` | In-memory / Config | Naturally idempotent | Available now |
 | 3 | `POST` | `/v1/drawers/search` | `read` | A/C (Hybrid) | `readonly`, `write`, `admin` | LanceDB + Storage | Naturally idempotent | Gap: `added_by` omitted |
 | 4 | `POST` | `/v1/drawers/check_duplicate` | `read` | C (Aggregate) | `readonly`, `write`, `admin` | LanceDB | Naturally idempotent | Available now |
 | 5 | `POST` | `/v1/drawers` | `write` | A (Body wing) | `write`, `admin` | LanceDB + SQLite | `operation_id` (receipt) | Available now / storage deferred |
-| 6 | `GET` | `/v1/drawers` | `read` | A/C (Hybrid) | `readonly`, `write`, `admin` | LanceDB / Storage | Naturally idempotent | Available now (`added_by`) |
-| 7 | `GET` | `/v1/drawers/{id}` | `read` | B (Lookup 404) | `readonly`, `write`, `admin` | LanceDB / Storage | Naturally idempotent | Available now (`added_by`) |
+| 6 | `GET`, `HEAD` | `/v1/drawers` | `read` | A/C (Hybrid) | `readonly`, `write`, `admin` | LanceDB / Storage | Naturally idempotent | Available now (`added_by`) |
+| 7 | `GET`, `HEAD` | `/v1/drawers/{id}` | `read` | B (Lookup 404) | `readonly`, `write`, `admin` | LanceDB / Storage | Naturally idempotent | Available now (`added_by`) |
 | 8 | `DELETE` | `/v1/drawers/{id}` | `delete` | B (Lookup 404) | `admin` | LanceDB + SQLite | `operation_id` (receipt) | Tombstone deferred |
 | 9 | `POST` | `/v1/kg/query` | `read` | D (Server-wide) | `readonly`, `write`, `admin` | SQLite (`kg_facts`) | Naturally idempotent | No owner envelope |
 | 10 | `POST` | `/v1/kg/facts` | `write` | D (Server-wide) | `write`, `admin` | SQLite (`kg_facts`, receipts) | `operation_id` / triple dedupe | Actor in change log only |
 | 11 | `POST` | `/v1/kg/facts/invalidate` | `write` | D (Server-wide) | `write`, `admin` | SQLite (`kg_facts`, receipts) | `operation_id` / serial lock | Actor in change log only |
-| 12 | `GET` | `/v1/kg/timeline` | `read` | D (Server-wide) | `readonly`, `write`, `admin` | SQLite (`kg_facts`) | Naturally idempotent | No owner envelope |
-| 13 | `GET` | `/v1/kg/stats` | `read` | D (Server-wide) | `readonly`, `write`, `admin` | SQLite (`kg_facts`) | Naturally idempotent | N/A (aggregate stats) |
-| 14 | `GET` | `/v1/taxonomy` | `read` | C (Aggregate) | `readonly`, `write`, `admin` | Storage count stream | Naturally idempotent | N/A (structural counts) |
-| 15 | `GET` | `/v1/wings` | `read` | C (Aggregate) | `readonly`, `write`, `admin` | Storage count stream | Naturally idempotent | N/A (structural counts) |
-| 16 | `GET` | `/v1/rooms` | `read` | C (Aggregate) | `readonly`, `write`, `admin` | Storage count stream | Naturally idempotent | N/A (structural counts) |
-| 17 | `GET` | `/v1/changes` | `read` | C (Aggregate) | `readonly`, `write`, `admin` | SQLite (`changes`) | Naturally idempotent | `actor` in event DTO |
+| 12 | `GET`, `HEAD` | `/v1/kg/timeline` | `read` | D (Server-wide) | `readonly`, `write`, `admin` | SQLite (`kg_facts`) | Naturally idempotent | No owner envelope |
+| 13 | `GET`, `HEAD` | `/v1/kg/stats` | `read` | D (Server-wide) | `readonly`, `write`, `admin` | SQLite (`kg_facts`) | Naturally idempotent | N/A (aggregate stats) |
+| 14 | `GET`, `HEAD` | `/v1/taxonomy` | `read` | C (Aggregate) | `readonly`, `write`, `admin` | Storage count stream | Naturally idempotent | N/A (structural counts) |
+| 15 | `GET`, `HEAD` | `/v1/wings` | `read` | C (Aggregate) | `readonly`, `write`, `admin` | Storage count stream | Naturally idempotent | N/A (structural counts) |
+| 16 | `GET`, `HEAD` | `/v1/rooms` | `read` | C (Aggregate) | `readonly`, `write`, `admin` | Storage count stream | Naturally idempotent | N/A (structural counts) |
+| 17 | `GET`, `HEAD` | `/v1/changes` | `read` | C (Aggregate) | `readonly`, `write`, `admin` | SQLite (`changes`) | Naturally idempotent | `actor` in event DTO |
 | 18 | `POST` | `/v1/ingest/preflight` | `ingest` | A (Body wing) | `write`, `admin` | Filesystem checkouts | Naturally idempotent | Content-free hash check |
 | 19 | `POST` | `/v1/ingest/batch` | `ingest` | A (Body wing) | `write`, `admin` | LanceDB + SQLite + Filesystem | `record_id` (source lock) | Available now / storage deferred |
 | 20 | `POST` | `/v1/coordination/tasks` | `coordination_write` | A (Body wing) | `write`, `admin` | SQLite (`coordination_tasks`) | `(created_by, idempotency_key)` | Available now / storage deferred |
-| 21 | `GET` | `/v1/coordination/tasks` | `coordination_read` | C (Aggregate) | `readonly`, `write`, `admin` | SQLite (`coordination_tasks`) | Naturally idempotent | `created_by`, `owner` |
-| 22 | `GET` | `/v1/coordination/tasks/{id}` | `coordination_read` | B (Lookup 404) | `readonly`, `write`, `admin` | SQLite (`coordination_tasks`) | Naturally idempotent | `created_by`, `owner` |
+| 21 | `GET`, `HEAD` | `/v1/coordination/tasks` | `coordination_read` | C (Aggregate) | `readonly`, `write`, `admin` | SQLite (`coordination_tasks`) | Naturally idempotent | `created_by`, `owner` |
+| 22 | `GET`, `HEAD` | `/v1/coordination/tasks/{id}` | `coordination_read` | B (Lookup 404) | `readonly`, `write`, `admin` | SQLite (`coordination_tasks`) | Naturally idempotent | `created_by`, `owner` |
 | 23 | `POST` | `/v1/coordination/tasks/{id}/claim` | `coordination_claim` | B (Lookup 404) | `write`, `admin` | SQLite (`coordination_tasks`) | `expected_revision` CAS | Worker namespaced |
 | 24 | `POST` | `/v1/coordination/tasks/{id}/renew` | `coordination_claim` | B (Lookup 404) | `write`, `admin` | SQLite (`coordination_tasks`) | `expected_revision` CAS | Worker namespaced |
 | 25 | `POST` | `/v1/coordination/tasks/{id}/transition` | `coordination_claim` | B (Lookup 404) | `write`, `admin` | SQLite (`coordination_tasks`) | `expected_revision` CAS | Actor namespaced |
 | 26 | `POST` | `/v1/coordination/messages` | `coordination_write` | B (Task wing) | `write`, `admin` | SQLite (`coordination_messages`) | `(sender, idempotency_key)` | Sender namespaced |
-| 27 | `GET` | `/v1/coordination/messages/{id}` | `coordination_read` | B (Task wing) | `readonly`, `write`, `admin` | SQLite (`coordination_messages`) | Naturally idempotent | Sender / recipient |
+| 27 | `GET`, `HEAD` | `/v1/coordination/messages/{id}` | `coordination_read` | B (Task wing) | `readonly`, `write`, `admin` | SQLite (`coordination_messages`) | Naturally idempotent | Sender / recipient |
 | 28 | `POST` | `/v1/coordination/messages/{id}/ack` | `coordination_write` | B (Task wing) | `write`, `admin` | SQLite (`coordination_messages`) | Recipient match check | Actor namespaced |
-| 29 | `GET` | `/v1/coordination/inbox` | `coordination_read` | C (Aggregate) | `readonly`, `write`, `admin` | SQLite (`coordination_messages`) | Naturally idempotent | Sender / recipient |
+| 29 | `GET`, `HEAD` | `/v1/coordination/inbox` | `coordination_read` | C (Aggregate) | `readonly`, `write`, `admin` | SQLite (`coordination_messages`) | Naturally idempotent | Sender / recipient |
 | 30 | `POST` | `/v1/coordination/artifacts` | `coordination_write` | B (Task wing) | `write`, `admin` | SQLite (`coordination_artifacts`) | `(created_by, idempotency_key)` | Creator namespaced |
-| 31 | `GET` | `/v1/coordination/artifacts/{id}` | `coordination_read` | B (Task wing) | `readonly`, `write`, `admin` | SQLite (`coordination_artifacts`) | Naturally idempotent | Content hash + creator |
+| 31 | `GET`, `HEAD` | `/v1/coordination/artifacts/{id}` | `coordination_read` | B (Task wing) | `readonly`, `write`, `admin` | SQLite (`coordination_artifacts`) | Naturally idempotent | Content hash + creator |
 | 32 | `POST` | `/v1/coordination/results` | `coordination_write` | B (Task wing) | `write`, `admin` | SQLite (`coordination_task_results`) | `(created_by, idempotency_key)` | Creator namespaced |
-| 33 | `GET` | `/v1/coordination/results/{id}` | `coordination_read` | B (Task wing) | `readonly`, `write`, `admin` | SQLite (`coordination_task_results`) | Naturally idempotent | Creator namespaced |
-| 34 | `GET` | `/v1/coordination/events` | `coordination_read` | C (Aggregate) | `readonly`, `write`, `admin` | SQLite (`coordination_events`) | Naturally idempotent | `actor` in event DTO |
+| 33 | `GET`, `HEAD` | `/v1/coordination/results/{id}` | `coordination_read` | B (Task wing) | `readonly`, `write`, `admin` | SQLite (`coordination_task_results`) | Naturally idempotent | Creator namespaced |
+| 34 | `GET`, `HEAD` | `/v1/coordination/events` | `coordination_read` | C (Aggregate) | `readonly`, `write`, `admin` | SQLite (`coordination_events`) | Naturally idempotent | `actor` in event DTO |
 
 ### 3.1 Route-registration audit
 
 This inventory was checked against the production `build_router` registration in
-`crates/agentpalace-server/src/lib.rs` on 2026-09-17. The audit found exactly 34
-production method/path pairs: 2 infrastructure/discovery, 6 drawer/search, 5
+`crates/agentpalace-server/src/lib.rs` on 2026-09-18. The audit found 34 explicit
+production method/path registrations: 2 infrastructure/discovery, 6 drawer/search, 5
 knowledge-graph, 4 taxonomy/change-feed, 2 ingest, 6 coordination-task/lease,
 4 messaging/inbox, and 5 artifact/result/event routes. The two ingest routes are
 included even though they are assembled in their own body-limited sub-router.
+Axum also serves HEAD for every GET registration, yielding 51 accepted method/path
+pairs. The 17 HEAD operations are explicitly listed alongside GET in the table.
 
 The `/test/*` routes registered only by test helpers are not production routes and
 are not part of this demo inventory. `/mcp` and all MCP-only operations are also
 outside the remote REST router. Consequently, a method/path pair absent from the
-34-row table is not demo-enabled, even if an internal handler or test helper exists
+table (including each listed HEAD operation) is not demo-enabled, even if an internal handler or test helper exists
 for it; the gateway and server must fail closed rather than forward it (normally
 `404 Not Found`; unsupported methods may surface as `405 Method Not Allowed`).
 
@@ -150,11 +152,25 @@ summary table an allowlist and the detailed sections the implementation contract
 including POST search, writes, batches, invalidation, deletion, ingest, and all
 coordination reads and mutations.
 
+### HEAD behavior and authorization
+
+Every GET path in the table also accepts HEAD through Axum's GET registration.
+HEAD executes the matching GET handler and applies the same authentication,
+operation gate, wing filtering, lookup masking, and demo-role policy. The response
+retains the GET status and headers but has no body, including on errors; it does
+not return the GET provenance payload. This includes public HEAD /v1/health,
+authenticated HEAD /v1/info, and the read/coordination-read routes listed above.
+HEAD never permits a write or bypasses authentication. The gateway must explicitly
+allow these listed HEAD operations under the matching GET policy, and reject
+unlisted methods/paths. No implicit HEAD operation exists for POST-only routes.
+
 ### 3.2 Reconfirmation audit ledger
 
 The 2026-09-17 reconfirmation read the complete production registration in
 `build_router` (including the separately assembled, body-limited ingest router)
-and matched every method/path pair to one and only one numbered row above:
+and matched the 34 explicit registrations to the numbered rows above. The
+2026-09-18 correction adds the 17 implicit HEAD operations omitted from that
+earlier count; each is listed in the same row as its GET registration:
 
 | Registration set | Count | Required privilege | Contract check |
 |---|---:|---|---|
@@ -166,7 +182,8 @@ and matched every method/path pair to one and only one numbered row above:
 | Ingest | 2 | `ingest` | Checkout/read validation or resumable `record_id` batch recovery |
 | Coordination claims | 3 | `coordination_claim` | Revision CAS and lease/transition recovery rules |
 | Coordination writes | 5 | `coordination_write` | Task/message/artifact/result transaction and replay rules |
-| **Total** | **34** |  | **No unlisted production method/path pair is demo-enabled** |
+| Implicit HEAD operations | 17 | Same gate and authorization as the matching GET | Same handler/status/headers; no response body |
+| **Total accepted method/path pairs** | **51** |  | **No unlisted production method/path pair is demo-enabled** |
 
 For each row, the audit checked the gate attached at registration, the handler's
 wing or lookup authorization, the durable store actually called by the handler,
@@ -243,7 +260,7 @@ in the crate is not by itself a remote contract.
   - If `wing` is absent: cross-wing search; candidate matches are filtered post-ranking using `auth.visible_wings(Operation::Read)` and excluding diary rooms (`is_diary_wing_or_room`).
 - **Demo Role Eligibility:** `readonly`, `write`, `admin`.
 - **Request Surface:** `POST /v1/drawers/search`, JSON `DrawerSearchRequest`:
-  - `query`: string (mandatory, max 8,192 bytes)
+  - `query`: string (mandatory, max 16,384 bytes; `MAX_SEARCH_QUERY_BYTES`)
   - `wing`: Option<string>
   - `room`: Option<string>
   - `view`: Option<string> (e.g., `"canonical"` or branch view name)
@@ -262,8 +279,8 @@ in the crate is not by itself a remote contract.
 - **Wing Authorization:** Category C (Aggregate). No wing in request. Vector matches are filtered against `auth.visible_wings(Operation::Read)` and non-diary rooms before computing `is_duplicate = !matches.is_empty()` to prevent existence oracles.
 - **Demo Role Eligibility:** `readonly`, `write`, `admin`.
 - **Request Surface:** `POST /v1/drawers/check_duplicate`, JSON `CheckDuplicateRequest`:
-  - `content`: string (mandatory, max 128 KiB)
-  - `threshold`: Option<f32> (default `0.87`)
+  - `content`: string (mandatory, max 256 KiB; `MAX_DRAWER_CONTENT_BYTES`)
+  - `threshold`: Option<f32> (default `0.9`; `DEFAULT_DUPLICATE_THRESHOLD`)
 - **Retrieval Surface:** `200 OK`, JSON `CheckDuplicateResponse`:
   - `is_duplicate`: bool
   - `matches`: Value (array of matching candidate records)
@@ -282,7 +299,7 @@ in the crate is not by itself a remote contract.
 - **Request Surface:** `POST /v1/drawers`, JSON `AddDrawerRequest`:
   - `wing`: string
   - `room`: string
-  - `content`: string (max 128 KiB)
+  - `content`: string (max 256 KiB; `MAX_DRAWER_CONTENT_BYTES`)
   - `source_file`: Option<string>
   - `added_by`: Option<string> (caller-asserted agent name)
   - `drawer_id`: Option<string> (optional client-pinned drawer ID for replication)
@@ -363,7 +380,7 @@ in the crate is not by itself a remote contract.
 - **Wing Authorization:** Category D (Server-wide; KG has no wing concept).
 - **Demo Role Eligibility:** `readonly`, `write`, `admin`.
 - **Request Surface:** `POST /v1/kg/query`, JSON `KgQueryRequest`:
-  - `entity`: string (mandatory, max 512 bytes)
+  - `entity`: string (mandatory, max 4,096 bytes; `MAX_KG_FIELD_BYTES`)
   - `as_of`: Option<string> (RFC 3339 or `YYYY-MM-DD` date)
   - `direction`: Option<string> (`"outgoing"`, `"incoming"`, `"both"`, defaults to `"both"`)
 - **Retrieval Surface:** `200 OK`, JSON:
@@ -371,9 +388,9 @@ in the crate is not by itself a remote contract.
   - `as_of`: Option<string> (effective query date, if specified)
   - `facts`: array of `KnowledgeQueryRow` objects:
     - `direction`: string (`"outgoing"` or `"incoming"`)
-    - `subject`: string
-    - `predicate`: string
-    - `object`: string
+    - `subject`: string (non-empty, max 4,096 bytes; `MAX_KG_FIELD_BYTES`)
+    - `predicate`: string (non-empty, max 4,096 bytes; `MAX_KG_FIELD_BYTES`)
+    - `object`: string (non-empty, max 4,096 bytes; `MAX_KG_FIELD_BYTES`)
     - `valid_from`: Option<string> (start validity date, e.g., `"YYYY-MM-DD"`)
     - `valid_to`: Option<string> (end validity date if ended/invalidated, e.g., `"YYYY-MM-DD"`)
     - `confidence`: f32 (e.g., `1.0`)
@@ -391,9 +408,9 @@ in the crate is not by itself a remote contract.
 - **Wing Authorization:** Category D (Server-wide).
 - **Demo Role Eligibility:** `write`, `admin` (denied to `readonly`).
 - **Request Surface:** `POST /v1/kg/facts`, JSON `KgAddFactRequest`:
-  - `subject`: string
-  - `predicate`: string
-  - `object`: string
+  - `subject`: string (non-empty, max 4,096 bytes; `MAX_KG_FIELD_BYTES`)
+  - `predicate`: string (non-empty, max 4,096 bytes; `MAX_KG_FIELD_BYTES`)
+  - `object`: string (non-empty, max 4,096 bytes; `MAX_KG_FIELD_BYTES`)
   - `valid_from`: Option<string> (`YYYY-MM-DD` date)
   - `operation_id`: Option<string>
 - **Retrieval Surface:** `200 OK`, JSON:
@@ -416,9 +433,9 @@ in the crate is not by itself a remote contract.
 - **Wing Authorization:** Category D (Server-wide).
 - **Demo Role Eligibility:** `write`, `admin` (denied to `readonly`).
 - **Request Surface:** `POST /v1/kg/facts/invalidate`, JSON `KgInvalidateRequest`:
-  - `subject`: string
-  - `predicate`: string
-  - `object`: string
+  - `subject`: string (non-empty, max 4,096 bytes; `MAX_KG_FIELD_BYTES`)
+  - `predicate`: string (non-empty, max 4,096 bytes; `MAX_KG_FIELD_BYTES`)
+  - `object`: string (non-empty, max 4,096 bytes; `MAX_KG_FIELD_BYTES`)
   - `ended`: Option<string> (`YYYY-MM-DD` date)
   - `operation_id`: Option<string>
 - **Retrieval Surface:** `200 OK`, JSON:
@@ -440,14 +457,14 @@ in the crate is not by itself a remote contract.
 - **Wing Authorization:** Category D (Server-wide).
 - **Demo Role Eligibility:** `readonly`, `write`, `admin`.
 - **Request Surface:** `GET /v1/kg/timeline`, query parameters `KgTimelineQuery`:
-  - `entity`: Option<string>
-  - `limit`: Option<usize> (default 50, clamped to `[1, 200]`)
+  - `entity`: Option<string> (when present, non-empty and max 4,096 bytes; `MAX_KG_FIELD_BYTES`)
+  - `limit`: Option<usize> (default 100, clamped to `[1, 200]`; `DEFAULT_KG_TIMELINE_LIMIT` / `MAX_KG_TIMELINE_LIMIT`)
 - **Retrieval Surface:** `200 OK`, JSON:
   - `entity`: string (the queried entity name, or `"all"` if omitted)
   - `timeline`: array of `KnowledgeTimelineRow` objects:
-    - `subject`: string
-    - `predicate`: string
-    - `object`: string
+    - `subject`: string (non-empty, max 4,096 bytes; `MAX_KG_FIELD_BYTES`)
+    - `predicate`: string (non-empty, max 4,096 bytes; `MAX_KG_FIELD_BYTES`)
+    - `object`: string (non-empty, max 4,096 bytes; `MAX_KG_FIELD_BYTES`)
     - `valid_from`: Option<string>
     - `valid_to`: Option<string>
     - `current`: bool
@@ -837,7 +854,7 @@ Under the Demo Hub design:
    ```
 2. **Never Trust Owner from Request Body:** The client LLM or harness is never permitted to establish, override, or suggest authenticated ownership through `owner` fields. Existing production federation REST DTOs omit client-writable `owner` fields entirely; under their current serde compatibility behavior, an extra `owner` field is ignored rather than used to establish ownership. Where a mutation handler or ingest path explicitly opts into checking an untyped or extended payload, the `reject_payload_owner_claim` helper rejects a supplied owner claim with `invalid_provenance`. In both cases, ownership comes only from server-validated authentication context.
 3. **Legacy Preservation:** Standard static tokens without owner metadata continue to function identically to legacy installations. Ownership is marked explicitly as unknown (`None`), never fabricated.
-4. **Stable Owner Identity Across Rotation:** `owner.id` is the immutable internal human-owner identifier. Rotating a token, changing its secret or display name, or refreshing `email_at_write` does not create a new owner. The `(issuer, subject)` binding identifies the provider account; `email_at_write` is an audit snapshot and is never the stable identity key.
+4. **Stable Owner Identity Across Rotation:** `owner.id` is the immutable internal human-owner identifier. Rotating a token, changing its secret or display name, or refreshing `email_at_write` does not create a new owner. Loading a token file rejects different owner IDs for the same (issuer, subject) across entries, including disabled entries; malformed hot reloads disable all tokens until corrected. The `(issuer, subject)` binding identifies the provider account; `email_at_write` is an audit snapshot and is never the stable identity key.
 5. **Explicit Legacy and Unknown Ownership:** A token without owner metadata remains ownerless and resolves to the explicit `Unknown`/legacy representation. The server never infers an owner from a caller label, source author, token name, or email. Unknown values remain distinguishable from authenticated owners on the wire and in storage.
 6. **Owner-Scoped Idempotency and Receipts:** The downstream storage slice must update receipt and idempotency indices so deduplication keys are scoped to `(owner_id, operation_id)` or `(owner_id, created_by, idempotency_key)`. Unknown/legacy operations use the legacy scope and must not collide with authenticated-owner keys. A replay or recovery may return only the receipt and resource associated with that same owner scope; it must not adopt a later submitter as the creator.
 
@@ -882,6 +899,7 @@ Implemented in `crates/agentpalace-core/src/provenance.rs`, the engine provides 
 
 ## 6. Document Revision and Verification History
 
+- **2026-09-18:** Version 1.1.13 corrects the earlier explicit-registration-only count to include 17 implicit HEAD operations (51 method/path pairs), aligns search/content/KG limits and defaults with server constants, and validates consistent owner IDs for subject bindings across token entries. Earlier dated audit counts remain historical evidence.
 - **2026-09-17:** Version 1.1.12 reconfirmed all 34 production method/path registrations against the route table, including POST search, writes, KG invalidation, deletion, both ingest routes, and every coordination read/write/claim operation. Added the privilege/store/receipt-recovery count ledger and an explicit provenance retrieval crosswalk. Reconfirmed that local diaries, MCP-only operations, and test routes are excluded, unlisted routes remain fail-closed, and durable human-owner attribution remains deferred to the storage slice.
 - **2026-09-17:** Version 1.1.11 pre-publication static verification for Issue #160. Reviewed the complete retained diff against `origin/main` for production-path coverage, test coverage, documentation consistency, dependency changes, provenance claims, formatting artifacts, and merge-conflict markers. Confirmed the router inventory still covers all 34 production method/path registrations and that no Cargo manifest or lockfile changes were introduced. `git diff --check` and targeted source/document searches passed. Compilation, Rust tests, `rustfmt`, and Clippy were not run because Rust commands are disabled by VM policy; GitHub CI remains the required authority for those checks. This evidence does not claim durable attribution is complete; that remains deferred to the storage slice, and issue #157 remains open.
 - **2026-09-17:** Version 1.1.10 updated for Issue #160. Reconciled provenance terminology and visibility with the implementation: the `TokenScopeEntry` type is module-private, while `AuthIdentity::new` and `AuthIdentity::scopes` are crate-private. Clarified immutable creator versus later submitters/modifiers, source attribution versus authenticated ownership, explicit legacy/unknown ownership, stable owner identity across credential rotation, and owner-scoped receipt/recovery behavior. Preserved implementation-accurate wire representations, validation limits, the complete 34-route inventory, and the statement that durable attribution remains deferred to the storage slice.

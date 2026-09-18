@@ -602,6 +602,7 @@ impl TokenRegistry {
         let file_entries: Vec<TokenEntry> =
             serde_json::from_str(&raw).map_err(|err| ServerError::TokenFile(err.to_string()))?;
         let mut entries = Vec::with_capacity(file_entries.len());
+        let mut owner_ids = std::collections::BTreeMap::new();
         for entry in file_entries {
             if entry.name.trim().is_empty() {
                 return Err(ServerError::TokenFile(
@@ -638,6 +639,17 @@ impl TokenRegistry {
                         entry.name
                     ))
                 })?;
+                // Keep the provider account's namespace stable across credentials,
+                // including disabled entries that may be enabled during rotation.
+                let binding = (owner.issuer.clone(), owner.subject.clone());
+                if let Some(previous_id) = owner_ids.insert(binding, owner.id.clone()) {
+                    if previous_id != owner.id {
+                        return Err(ServerError::TokenFile(format!(
+                            "conflicting owner IDs for the subject binding on token {}",
+                            entry.name
+                        )));
+                    }
+                }
             }
             let scopes = entry
                 .scopes
@@ -5424,6 +5436,38 @@ mod tests {
     // ─── 2. Info auth ─────────────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn head_routes_preserve_get_auth_and_strip_response_bodies() {
+        let harness = make_harness().await;
+        for (path, token, expected) in [
+            ("/v1/health", None, StatusCode::OK),
+            ("/v1/info", None, StatusCode::UNAUTHORIZED),
+            ("/v1/info", Some(ALICE_TOKEN), StatusCode::OK),
+            ("/v1/kg/stats", Some(ALICE_TOKEN), StatusCode::OK),
+            ("/v1/kg/stats", Some(LOCKED_TOKEN), StatusCode::FORBIDDEN),
+        ] {
+            for method in [Method::GET, Method::HEAD] {
+                let mut request = Request::builder().method(method.clone()).uri(path);
+                if let Some(token) = token {
+                    request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+                }
+                let response = harness
+                    .router
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "{method} {path}");
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                if method == Method::HEAD {
+                    assert!(bytes.is_empty(), "HEAD {path} must have no response body");
+                } else {
+                    assert!(!bytes.is_empty(), "GET {path} must retain its response body");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn info_without_token_returns_401() {
         let harness = make_harness().await;
         let request =
@@ -5539,6 +5583,99 @@ mod tests {
     }
 
     // ─── Owner metadata on token entries (Issue #160) ─────────────────────────
+
+    fn owner_rotation_entries() -> Value {
+        json!([
+            {
+                "token": "old-secret", "name": "old_name", "enabled": true,
+                "owner": {"id": "usr_alice", "issuer": "issuer_a", "subject": "subject_a",
+                          "email_at_write": "old@example.com"}
+            },
+            {
+                "token": "new-secret", "name": "new_name", "enabled": true,
+                "owner": {"id": "usr_alice", "issuer": "issuer_a", "subject": "subject_a",
+                          "email_at_write": "new@example.com"}
+            }
+        ])
+    }
+
+    #[test]
+    fn owner_rotation_preserves_scoped_keys_and_allows_distinct_bindings() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        let mut entries = owner_rotation_entries();
+        // Subjects are namespaced by issuer; different subjects are independent.
+        for (issuer, subject, id) in [
+            ("issuer_b", "subject_a", "usr_bob"),
+            ("issuer_a", "subject_b", "usr_carol"),
+        ] {
+            let mut other = entries[0].clone();
+            other["token"] = json!(id);
+            other["owner"]["issuer"] = json!(issuer);
+            other["owner"]["subject"] = json!(subject);
+            other["owner"]["id"] = json!(id);
+            entries.as_array_mut().unwrap().push(other);
+        }
+        std::fs::write(&token_file, serde_json::to_vec(&entries).unwrap()).unwrap();
+        restrict_token_file(&token_file);
+        let registry = TokenRegistry::load(token_file).unwrap();
+        let old = registry.authenticate("old-secret").unwrap();
+        let new = registry.authenticate("new-secret").unwrap();
+        assert_eq!(old.owner_id(), new.owner_id());
+        assert_eq!(old.owner_scoped_key("retry").unwrap(), new.owner_scoped_key("retry").unwrap());
+        assert_ne!(old.email_at_write(), new.email_at_write());
+        assert_eq!(
+            registry.authenticate("usr_bob").unwrap().owner_id().unwrap().as_str(),
+            "usr_bob"
+        );
+        assert_eq!(
+            registry.authenticate("usr_carol").unwrap().owner_id().unwrap().as_str(),
+            "usr_carol"
+        );
+    }
+
+    #[test]
+    fn owner_rotation_rejects_conflicting_ids_in_either_order() {
+        for enabled in [true, false] {
+            for reversed in [true, false] {
+                let tempdir = TempDir::new().unwrap();
+                let token_file = tempdir.path().join("tokens.json");
+                let mut entries = owner_rotation_entries();
+                entries[1]["owner"]["id"] = json!("usr_other");
+                entries[1]["enabled"] = json!(enabled);
+                if reversed {
+                    entries.as_array_mut().unwrap().reverse();
+                }
+                std::fs::write(&token_file, serde_json::to_vec(&entries).unwrap()).unwrap();
+                restrict_token_file(&token_file);
+                let err = TokenRegistry::load(token_file).unwrap_err();
+                assert!(err.to_string().contains("conflicting owner IDs"), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn owner_rotation_conflicting_reload_fails_closed_and_recovers() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        let mut entries = owner_rotation_entries();
+        std::fs::write(&token_file, serde_json::to_vec(&entries).unwrap()).unwrap();
+        restrict_token_file(&token_file);
+        let registry = TokenRegistry::load(token_file.clone()).unwrap();
+        assert!(registry.authenticate("old-secret").is_some());
+        assert!(registry.authenticate("new-secret").is_some());
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        entries[1]["owner"]["id"] = json!("usr_other");
+        std::fs::write(&token_file, serde_json::to_vec(&entries).unwrap()).unwrap();
+        assert!(registry.authenticate("old-secret").is_none());
+        assert!(registry.authenticate("new-secret").is_none());
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        entries[1]["owner"]["id"] = json!("usr_alice");
+        std::fs::write(&token_file, serde_json::to_vec(&entries).unwrap()).unwrap();
+        let old = registry.authenticate("old-secret").unwrap();
+        let new = registry.authenticate("new-secret").unwrap();
+        assert_eq!(old.owner_scoped_key("retry").unwrap(), new.owner_scoped_key("retry").unwrap());
+    }
 
     #[test]
     fn token_file_accepts_valid_owner_metadata() {

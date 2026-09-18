@@ -393,7 +393,13 @@ keeps ordinary static-token installations compatible; it does not create an
 authenticated owner and does not make the token's display `name` a human owner
 ID. Credential rotation can retain the same internal `id` while issuer,
 subject, or captured email changes only through a newly validated token-file
-entry.
+entry. Within a token file, every entry with the same (issuer, subject) must
+use the same internal owner ID, including disabled entries. A conflicting ID rejects
+the entire file on initial load or hot reload. Secret, display-name and captured
+email changes are allowed while retaining that ID. Different issuers namespace
+their subjects independently. This checks the current complete file; it is not a
+persistent identity-history registry, so operators must preserve IDs when
+replacing credentials without overlap.
 
 Invalid owner metadata fails the entire initial token-file load. On a hot
 reload, any parse, validation, permission, or other file-read failure clears
