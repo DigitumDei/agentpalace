@@ -39,8 +39,8 @@ use blake3::Hasher;
 use agentpalace_config::AgentPalaceConfig;
 use agentpalace_core::{
     BUILD_VERSION, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, RoomId,
-    SHARED_AGENT_DIARY_WING, SearchQuery, SourceLocator, WING_PREFIX, WingId, hash_bytes,
-    mined_drawer_id, resolve_records,
+    RecordingTime, SHARED_AGENT_DIARY_WING, SearchQuery, SourceLocator, StorageOrigin,
+    WING_PREFIX, WingId, hash_bytes, mined_drawer_id, resolve_records,
 };
 pub use agentpalace_core::{
     reject_payload_owner_claim, AuthenticatedOwner, EmailAtWrite, Issuer, LegacyUnknownOwner,
@@ -1796,7 +1796,10 @@ where
             operation_kind: RECEIPT_KIND_DRAWER_ADD.to_owned(),
             request_hash,
             target_id: resolved_target_id.as_str().to_owned(),
-            provenance: None,
+            provenance: Some(receipt_provenance(
+                &auth.0,
+                operation_key.as_ref().expect("operation key"),
+            )?),
         })?;
 
         match outcome {
@@ -2058,7 +2061,10 @@ where
             operation_kind: RECEIPT_KIND_DRAWER_DELETE.to_owned(),
             request_hash,
             target_id: id.clone(),
-            provenance: None,
+            provenance: Some(receipt_provenance(
+                &auth.0,
+                operation_key.as_ref().expect("operation key"),
+            )?),
         })?;
         match outcome {
             ReceiptOutcome::Conflict { .. } => {
@@ -2280,6 +2286,24 @@ fn authorize_delete_receipt_scope(
     Ok(())
 }
 
+/// Build the immutable provenance captured with a mutation receipt.
+///
+/// The owner and operation scope come only from authentication and the validated
+/// server-derived key. Legacy static-token requests remain explicitly unknown,
+/// while authenticated requests retain the stable owner identity across retries
+/// and credential rotation.
+fn receipt_provenance(
+    auth: &AuthIdentity,
+    operation_key: &OwnerScopedKey,
+) -> Result<ProvenanceEnvelope, ServerError> {
+    Ok(ProvenanceEnvelope::new(
+        auth.owner_identity(),
+        RecordingTime::now_utc()?,
+        StorageOrigin::local_default(),
+    )
+    .with_operation_key(operation_key.clone())?)
+}
+
 /// Compare the durable incarnation marker captured before a keyed delete with the
 /// currently visible row. Receipts written before incarnation markers existed only
 /// contain wing/room and remain compatible; new receipts carry both fields below.
@@ -2496,7 +2520,10 @@ where
             operation_kind: RECEIPT_KIND_KG_ADD.to_owned(),
             request_hash,
             target_id: canonical_kg_triple(&body.subject, &body.predicate, &body.object),
-            provenance: None,
+            provenance: Some(receipt_provenance(
+                &auth.0,
+                operation_key.as_ref().expect("operation key"),
+            )?),
         })?;
         match outcome {
             ReceiptOutcome::Conflict { .. } => {
@@ -2654,7 +2681,10 @@ where
             operation_kind: RECEIPT_KIND_KG_INVALIDATE.to_owned(),
             request_hash,
             target_id: canonical_kg_triple(&body.subject, &body.predicate, &body.object),
-            provenance: None,
+            provenance: Some(receipt_provenance(
+                &auth.0,
+                operation_key.as_ref().expect("operation key"),
+            )?),
         })?;
         match outcome {
             ReceiptOutcome::Conflict { .. } => {
@@ -3162,7 +3192,12 @@ where
                 "{}:{}:{}",
                 wing, body.repo_id, body.files[0].relative_path
             )),
-            provenance: None,
+            provenance: Some(receipt_provenance(
+                &auth.0,
+                replication_operation_key
+                    .as_ref()
+                    .expect("replication operation key"),
+            )?),
         })? {
             ReceiptOutcome::Replay(receipt) => {
                 let response = serde_json::from_value(receipt.response.unwrap_or(Value::Null))
