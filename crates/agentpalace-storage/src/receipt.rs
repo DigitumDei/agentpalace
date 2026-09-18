@@ -150,10 +150,13 @@ pub trait ReceiptKey {
 }
 
 impl ReceiptKey for OwnerScopedKey {
-    fn into_receipt_key(self) -> Result<OwnerScopedKey> { Ok(self) }
+    fn into_receipt_key(self) -> Result<OwnerScopedKey> {
+        self.validate().map_err(|error| StorageError::Invariant(error.to_string()))?;
+        Ok(self)
+    }
 }
 impl ReceiptKey for &OwnerScopedKey {
-    fn into_receipt_key(self) -> Result<OwnerScopedKey> { Ok(self.clone()) }
+    fn into_receipt_key(self) -> Result<OwnerScopedKey> { self.clone().into_receipt_key() }
 }
 impl ReceiptKey for &str {
     fn into_receipt_key(self) -> Result<OwnerScopedKey> {
@@ -238,6 +241,7 @@ CREATE TABLE IF NOT EXISTS mutation_receipts (
     /// only a byte-identical request is allowed to reuse a completed receipt.
     pub fn begin_receipt(&self, input: &NewReceipt) -> Result<ReceiptOutcome> {
         input.operation_key.validate().map_err(|error| StorageError::Invariant(error.to_string()))?;
+        validate_provenance_scope(input.provenance.as_ref(), &input.operation_key)?;
         bounded_identifier(&input.operation_kind, "operation_kind")?;
         bounded_identifier(&input.request_hash, "request_hash")?;
         // Target ids are validated by the owning domain (e.g. `DrawerId`), which
@@ -425,6 +429,22 @@ fn receipt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MutationReceipt> {
     })
 }
 
+fn validate_provenance_scope(
+    provenance: Option<&ProvenanceEnvelope>,
+    operation_key: &OwnerScopedKey,
+) -> Result<()> {
+    let Some(provenance) = provenance else {
+        return Ok(());
+    };
+    provenance.validate().map_err(|error| StorageError::Invariant(error.to_string()))?;
+    if provenance.operation_id() != Some(operation_key) {
+        return Err(StorageError::Invariant(
+            "receipt provenance operation key does not match receipt key".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
     let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     Ok(statement.query_map([], |row| row.get(1))?.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -478,6 +498,7 @@ impl ReceiptState {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use rusqlite::Connection;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -686,5 +707,44 @@ mod tests {
         let reopened = MutationReceiptStore::new(dir.path().join("storage.sqlite3"));
         reopened.ensure_schema().unwrap();
         assert_eq!(reopened.get_receipt(&key).unwrap().unwrap().provenance, Some(provenance));
+    }
+
+    #[test]
+    fn legacy_receipts_migrate_without_fabricating_owner_scope() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE mutation_receipts (
+                    operation_id TEXT PRIMARY KEY,
+                    operation_kind TEXT NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    response_json TEXT,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+                INSERT INTO mutation_receipts(
+                    operation_id, operation_kind, request_hash, target_id, status,
+                    response_json, created_at, completed_at
+                ) VALUES('old-op', 'drawer_add', 'old-hash', 'drawer_old', 'completed',
+                         '{\"success\":true}', '2026-09-18T00:00:00Z',
+                         '2026-09-18T00:00:01Z');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = MutationReceiptStore::new(&path);
+        store.ensure_schema().unwrap();
+        let migrated = store.get_receipt("old-op").unwrap().unwrap();
+        assert!(migrated.operation_key.is_legacy());
+        assert_eq!(migrated.operation_key.raw_key(), "old-op");
+        assert_eq!(migrated.provenance, None);
+        assert_eq!(migrated.response, Some(json!({"success": true})));
+
+        let owner = OwnerScopedKey::new(Some("alice".parse().unwrap()), "old-op").unwrap();
+        assert!(store.get_receipt(&owner).unwrap().is_none());
     }
 }

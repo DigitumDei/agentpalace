@@ -2189,13 +2189,25 @@ fn append_event_if_absent_inner(
     connection.busy_timeout(std::time::Duration::from_millis(5_000))?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let exists: bool = match operation_id {
-        Some(operation_id) => transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM change_log WHERE operation_id=?1 AND event_type=?2)",
-                params![operation_id, event.event_type],
-                |row| row.get(0),
-            )
-            .map_err(StorageError::from)?,
+        Some(operation_id) => {
+            // Before owner-scoped receipts, recovery stored the raw operation ID. Keep
+            // recognizing that legacy spelling when the new composite spelling is retried;
+            // otherwise an upgrade between the effect and its change-log append duplicates the
+            // visible event. The fallback is deliberately limited to the suffix of a composite
+            // key and does not alter newly-written owner-scoped rows.
+            let legacy_operation_id = operation_id.split_once(':').map(|(_, raw)| raw);
+            transaction
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM change_log
+                        WHERE event_type=?1
+                          AND (operation_id=?2 OR (?3 IS NOT NULL AND operation_id=?3))
+                    )",
+                    params![event.event_type, operation_id, legacy_operation_id],
+                    |row| row.get(0),
+                )
+                .map_err(StorageError::from)?
+        }
         None => transaction
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM change_log WHERE entity_id=?1 AND event_type=?2)",
@@ -2833,6 +2845,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(operation_count, 2);
+    }
+
+    #[test]
+    fn owner_scoped_event_recovery_recognizes_pre_migration_raw_operation_id() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+        let event = ChangeEvent {
+            event_type: "drawer_added".to_owned(),
+            occurred_at: datetime!(2026-06-01 12:00:00 UTC),
+            entity_id: "legacy-drawer".to_owned(),
+            actor: Some("legacy".to_owned()),
+            details_json: None,
+        };
+
+        assert!(store.append_event_if_absent_with_operation(&event, "old-op").unwrap());
+        assert!(!store
+            .append_event_if_absent_with_operation(&event, "alice:old-op")
+            .unwrap());
+
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM change_log WHERE entity_id='legacy-drawer' AND event_type='drawer_added'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
