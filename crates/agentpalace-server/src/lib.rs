@@ -6741,7 +6741,7 @@ mod tests {
         let resp_b = app.clone().oneshot(req_b).await.unwrap();
         assert_eq!(resp_b.status(), StatusCode::BAD_REQUEST);
         let data_b = body_json(resp_b).await;
-        assert_eq!(data_b["error"]["code"], "invalid_provenance");
+        assert_eq!(data_b["code"], "invalid_provenance");
 
         // C. Static token write: owner is Unknown, operation key is legacy-scoped
         let req_c = authed_json_request(
