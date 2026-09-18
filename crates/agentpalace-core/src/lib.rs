@@ -20,10 +20,13 @@ pub use ids::{DrawerId, IdError, RoomId, WING_PREFIX, WingId};
 pub use locator::{ResolvedSnippet, SourceLocator, resolve_locator, resolve_records};
 pub use profiles::{BALANCED_PROFILE, EmbeddingProfile, EmbeddingProfileMetadata, LOW_CPU_PROFILE};
 pub use provenance::{
-    AgentAssurance, AgentAttribution, AgentName, AuthenticatedOwner, EmailAtWrite, FederatedOrigin,
-    Issuer, LegacyUnknownOwner, LocalOrigin, OwnerId, OwnerIdentity, OwnerMetadata, OwnerScopedKey,
-    ProvenanceEnvelope, ProvenanceError, RecordingTime, SourceAuthor, SourceReference,
-    StorageOrigin, Subject, SubjectBinding, reject_payload_owner_claim,
+    AgentAssurance, AgentAttribution, AgentName, AuthenticatedOwner, EmailAtWrite,
+    FederatedOriginalProvenance, FederatedOriginalSummary, FederatedOrigin, Issuer,
+    LegacyUnknownOwner, LocalOrigin, OwnerId, OwnerIdentity, OwnerMetadata, OwnerScopedKey,
+    OwnerSummary, OwnerSummaryStatus, PersistedProvenance, ProvenanceAction, ProvenanceEnvelope,
+    ProvenanceError, ProvenanceHistoryEntry, ProvenanceResponse, ProvenanceResponseEvent,
+    RecordingTime, SourceAuthor, SourceReference, StorageOrigin, Subject, SubjectBinding,
+    reject_payload_owner_claim,
 };
 pub use search::{
     DrawerRecord, RepositoryViewMetadata, SearchQuery, SearchResult, compare_layer_drawers,
