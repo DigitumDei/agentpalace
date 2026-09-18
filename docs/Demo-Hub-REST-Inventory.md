@@ -1,6 +1,6 @@
 # Demo Hub: Canonical Remote REST Inventory and Implementation Contract
 
-**Document Version:** 1.1.13<br>
+**Document Version:** 1.1.14<br>
 **Release Series:** 0.2.0 (`release/version.toml`)<br>
 **Federation API Version:** 1 (`agentpalace_federation::FEDERATION_API_VERSION`)<br>
 **Status:** Approved Implementation Contract for AgentPalace #160 (parent issue #159)<br>
@@ -209,6 +209,40 @@ This audit deliberately does not count local-only diaries, the local HTTP MCP
 transport, MCP-only operations, or test-helper routes. A method/path absent from
 the table remains outside the allowlist and must fail closed; a handler existing
 in the crate is not by itself a remote contract.
+
+### 3.3 Issue #161 reconciliation matrix
+
+The following matrix is the implementation hand-off for the next provenance
+slice. It is deliberately a cross-route view of the approved inventory: every
+remote mutation is paired with the reads that must expose its committed result.
+“Legacy” means a token without validated `owner` metadata; it remains usable,
+but its authenticated owner is explicitly unknown and must never be inferred
+from a token name, caller label, source author, email, or record ID.
+
+| Mutation route(s) | Matching read/search route(s) | Store of record | Owner scope and history | Receipt / recovery requirement | Legacy behavior |
+|---|---|---|---|---|---|
+| `POST /v1/drawers` | `POST /v1/drawers/search`; `GET /v1/drawers`; `GET /v1/drawers/{id}`; `GET /v1/changes` | LanceDB drawer row plus SQLite receipt/change metadata | Preserve authenticated creator; append later modifiers/deleters; keep `added_by` as caller-asserted agent and source fields separate | Owner-scoped `operation_id`; commit receipt with drawer row and change event; recover an ownerless-visible partial write as pending/failed, never success | Accept existing static tokens with `owner: null`/omitted; return explicit unknown owner and preserve legacy receipt namespace |
+| `DELETE /v1/drawers/{id}` | `GET /v1/changes`; lookup returns `404` after deletion | LanceDB tombstone/delete state plus SQLite receipt/change metadata | Retain original creator and append deleting owner; source references remain distinct from deletion actor | Owner-scoped delete receipt captures target incarnation before deletion; recover missing tombstone/change event before success | Legacy delete remains attributable only to unknown authenticated owner; never transfer creator to deleter |
+| `POST /v1/kg/facts` | `POST /v1/kg/query`; `GET /v1/kg/timeline`; `GET /v1/kg/stats`; `GET /v1/changes` | SQLite `kg_facts`, `kg_entities`, receipts, changes | Preserve original fact submitter; append later authenticated modifiers; source closet/reference is not owner provenance | Owner-scoped receipt and triple dedupe; replay/recovery must restore the fact event before completing the receipt | Existing facts without owner metadata read as explicitly unknown; canonical triple dedupe must not bind them to a later owner |
+| `POST /v1/kg/facts/invalidate` | `POST /v1/kg/query`; `GET /v1/kg/timeline`; `GET /v1/changes` | SQLite `kg_facts`, receipts, changes | Preserve original creator; append invalidating owner and evidence/date separately | Owner-scoped serialized receipt; recover the invalidation event and exact effective date before success | Legacy invalidation remains valid but owner is unknown; it must not rewrite original creator metadata |
+| `POST /v1/ingest/preflight` | No content mutation; subsequent `POST /v1/ingest/batch` result is read through drawer/search routes | Checkout/filesystem inspection only | No durable creator is established by a content-free preflight | Naturally retryable; no mutation receipt and no visible provenance claim | Works unchanged for legacy tokens; no owner is fabricated from checkout/source metadata |
+| `POST /v1/ingest/batch` | `POST /v1/drawers/search`; `GET /v1/drawers`; `GET /v1/drawers/{id}`; `GET /v1/changes` | Filesystem checkout, LanceDB drawer rows, SQLite receipt/change metadata | Record authenticated submitting owner separately from source author, commit, path, and federated original provenance; preserve per-chunk creator history | Owner-scoped `record_id` receipt/source lock; resumable recovery must reconcile committed chunks and events before success | Existing unowned mined rows remain unknown; retries cannot adopt them or change their original source provenance |
+| `POST /v1/coordination/tasks` | `GET /v1/coordination/tasks`; `GET /v1/coordination/tasks/{id}`; `GET /v1/coordination/events` | SQLite `coordination_tasks`, receipts/events | Preserve authenticated creator; keep `created_by` as agent attribution and source/federation origin separate | Owner-scoped `(idempotency_key, record identity)`; task and creation event must be recoverable as one visible commit | Legacy `created_by`/owner strings remain readable, with human owner explicitly unknown |
+| `POST /v1/coordination/tasks/{id}/claim`; `/renew`; `/transition` | `GET /v1/coordination/tasks/{id}`; task list; `GET /v1/coordination/events` | SQLite task row, revision/lease fields, coordination events | Preserve creator; append authenticated claimant/actor history and keep worker/actor labels distinct | Revision CAS plus owner-scoped mutation receipt where supplied; no successful response until the state and event agree | Existing agent-owned leases continue to work; unknown human owner never becomes the authenticated owner of a legacy task |
+| `POST /v1/coordination/messages` | `GET /v1/coordination/messages/{id}`; `GET /v1/coordination/inbox`; `GET /v1/coordination/events` | SQLite `coordination_messages`, receipts/events | Preserve authenticated sender owner; retain sender/recipient agent identities and federated source separately; append acknowledger history | Owner-scoped `(idempotency_key, sender)`; recover message and event together before success | Legacy sender/recipient values remain visible; owner field is explicitly unknown |
+| `POST /v1/coordination/messages/{id}/ack` | `GET /v1/coordination/messages/{id}`; inbox; events | SQLite message row and coordination event | Preserve original sender and append authenticated recipient/ack actor; do not replace creator | Recipient authorization plus durable ack event; retry must replay only within the same owner scope | Legacy recipient matching remains unchanged and does not establish human ownership |
+| `POST /v1/coordination/artifacts` | `GET /v1/coordination/artifacts/{id}`; `GET /v1/coordination/events` | SQLite `coordination_artifacts`, receipts/events | Preserve authenticated creator; retain content hash, source reference, and federated original provenance independently | Owner-scoped `(idempotency_key, created_by)`; artifact and event must recover together | Existing artifacts expose creator agent but unknown human owner |
+| `POST /v1/coordination/results` | `GET /v1/coordination/results/{id}`; `GET /v1/coordination/events` | SQLite `coordination_task_results`, receipts/events | Preserve authenticated submitter and original task/artifact provenance; append later modifiers if supported | Owner-scoped `(idempotency_key, created_by)`; result/event recovery precedes successful receipt completion | Existing results remain readable with explicit unknown human owner |
+
+The following approved reads have no corresponding remote mutation and therefore
+must never be treated as provenance-bearing writes: `GET /v1/health`,
+`GET /v1/info`, `GET /v1/taxonomy`, `GET /v1/wings`, `GET /v1/rooms`,
+`POST /v1/drawers/check_duplicate`, and the aggregate portions of
+`GET /v1/kg/stats`. They retain their existing filtered/shared semantics. In
+particular, shared responses may expose owner ID and `email_at_write` only after
+the authenticated provenance storage slice; raw provider subjects are not an
+ordinary response field. Diaries, MCP-only operations, and coordination
+delegation/telemetry surfaces remain excluded.
 
 ---
 
@@ -899,6 +933,7 @@ Implemented in `crates/agentpalace-core/src/provenance.rs`, the engine provides 
 
 ## 6. Document Revision and Verification History
 
+- **2026-09-18:** Version 1.1.14 adds the Issue #161 reconciliation matrix, pairing every approved remote mutation with its retrieval/search surfaces, actual store, owner/history boundary, receipt/recovery invariant, and explicit legacy behavior. It preserves the exclusions for diaries, MCP-only operations, and coordination delegation/telemetry, and does not claim the deferred durable storage slice is implemented.
 - **2026-09-18:** Version 1.1.13 corrects the earlier explicit-registration-only count to include 17 implicit HEAD operations (51 method/path pairs), aligns search/content/KG limits and defaults with server constants, and validates consistent owner IDs for subject bindings across token entries. Earlier dated audit counts remain historical evidence.
 - **2026-09-17:** Version 1.1.12 reconfirmed all 34 production method/path registrations against the route table, including POST search, writes, KG invalidation, deletion, both ingest routes, and every coordination read/write/claim operation. Added the privilege/store/receipt-recovery count ledger and an explicit provenance retrieval crosswalk. Reconfirmed that local diaries, MCP-only operations, and test routes are excluded, unlisted routes remain fail-closed, and durable human-owner attribution remains deferred to the storage slice.
 - **2026-09-17:** Version 1.1.11 pre-publication static verification for Issue #160. Reviewed the complete retained diff against `origin/main` for production-path coverage, test coverage, documentation consistency, dependency changes, provenance claims, formatting artifacts, and merge-conflict markers. Confirmed the router inventory still covers all 34 production method/path registrations and that no Cargo manifest or lockfile changes were introduced. `git diff --check` and targeted source/document searches passed. Compilation, Rust tests, `rustfmt`, and Clippy were not run because Rust commands are disabled by VM policy; GitHub CI remains the required authority for those checks. This evidence does not claim durable attribution is complete; that remains deferred to the storage slice, and issue #157 remains open.
