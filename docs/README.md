@@ -40,6 +40,7 @@ see [Migration](Migration.md) before upgrading a MemPalace installation.
 
 - [Demo Hub Design](Demo-Hub-Design.md) — proposed local Docker learning demo with Google login, email roles, and owner provenance; not implemented
 - [Demo Hub Google Setup](Demo-Hub-Google-Setup.md) — tester-owned OAuth preparation for the proposed localhost example
+- [Demo Hub REST Inventory](Demo-Hub-REST-Inventory.md) — canonical inventory of remote REST operations, role mappings, and owner provenance contract
 
 ### Historical
 

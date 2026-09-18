@@ -150,7 +150,8 @@ On start it prints the palace path, bind address, and token file, then logs
 ### 1.4 REST surface
 
 All routes are under `/v1`. `GET /v1/health` is unauthenticated; everything else
-requires `Authorization: Bearer <token>`.
+requires `Authorization: Bearer <token>`. See [Demo-Hub-REST-Inventory.md](Demo-Hub-REST-Inventory.md)
+for the canonical operation inventory, demo role mappings, durable stores, and owner-provenance contract.
 
 | Method & path | Purpose |
 |---|---|

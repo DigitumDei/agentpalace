@@ -324,7 +324,8 @@ Always emit explicit scopes: omitted scopes currently mean unrestricted access.
 The gateway also checks the current role and operation before forwarding.
 POST search is a read; HTTP method alone does not determine permission.
 Unknown routes/operations fail closed. Every accepted remote REST mutation,
-including batch ingest and invalidation, must follow the same operation inventory.
+including batch ingest and invalidation, must follow the same operation inventory
+(see [canonical REST inventory](Demo-Hub-REST-Inventory.md)).
 Do not forward /mcp or add generic tool-execution routes.
 
 Proposed persistent /data/hub/access.json (illustrative addresses):
@@ -405,9 +406,14 @@ Extend authenticated server token entries with optional, validated,
 provider-neutral owner metadata. Generate private upstream credentials per
 owner/effective privilege ceiling, retaining a stable identity across rotation
 for coordination ownership. Only the gateway provisions that private token file.
-Never take owner fields from writable request payloads. Older installations
-without metadata continue to return explicitly unknown ownership; the demo
-rejects ownerless writes.
+Never trust owner fields from writable request payloads. The current
+foundation ignores extra `owner` fields on legacy-compatible REST DTOs and
+provides `reject_payload_owner_claim` for handlers that explicitly validate
+untyped or extended payloads; neither path allows a payload to establish
+authenticated ownership. Older installations without metadata continue to
+return explicitly unknown ownership. Durable owner-scoped persistence and
+receipt integration are deferred to issue #161, while OAuth/device/gateway
+work is deferred to issues #162–#164.
 
 Required storage coverage:
 
@@ -421,7 +427,8 @@ Required storage coverage:
 - Any other record accepted through the existing remote REST surface: the same
   invariant. Local-only diaries and MCP-only operations stay outside the hub.
 
-Inventory every existing remote REST mutation before implementation. Each must
+Inventory every existing remote REST mutation before implementation (published
+in [Demo-Hub-REST-Inventory.md](Demo-Hub-REST-Inventory.md)). Each must
 support authenticated provenance before it is made available through the hub.
 All accepted memory types need attribution, not just ordinary drawer writes.
 This project does not add remote versions of currently local-only/MCP-only

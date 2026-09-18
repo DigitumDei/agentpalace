@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::IdError;
+use crate::provenance::ProvenanceError;
 
 /// Shared result type for workspace crates.
 pub type Result<T> = std::result::Result<T, AgentPalaceError>;
@@ -12,6 +13,8 @@ pub type Result<T> = std::result::Result<T, AgentPalaceError>;
 pub enum AgentPalaceError {
     #[error("invalid id: {0}")]
     InvalidId(#[from] IdError),
+    #[error("invalid provenance: {0}")]
+    InvalidProvenance(#[from] ProvenanceError),
     #[error("unsupported config schema version: {0}")]
     UnsupportedConfigVersion(u32),
     #[error("unknown embedding profile: {0}")]

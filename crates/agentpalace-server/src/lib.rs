@@ -22,6 +22,8 @@
 //! # }
 //! ```
 
+#![deny(private_interfaces)]
+
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::SystemTime;
@@ -39,6 +41,11 @@ use agentpalace_core::{
     BUILD_VERSION, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, RoomId,
     SHARED_AGENT_DIARY_WING, SearchQuery, SourceLocator, WING_PREFIX, WingId, hash_bytes,
     mined_drawer_id, resolve_records,
+};
+pub use agentpalace_core::{
+    reject_payload_owner_claim, AuthenticatedOwner, EmailAtWrite, Issuer, LegacyUnknownOwner,
+    OwnerId, OwnerIdentity, OwnerMetadata, OwnerScopedKey, ProvenanceEnvelope, ProvenanceError,
+    Subject, SubjectBinding,
 };
 use agentpalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 use agentpalace_federation::{
@@ -194,6 +201,9 @@ pub enum ServerError {
     /// Malformed identifier (wing id, room id, drawer id).
     #[error(transparent)]
     Id(#[from] agentpalace_core::IdError),
+    /// Propagated provenance error.
+    #[error(transparent)]
+    Provenance(#[from] agentpalace_core::ProvenanceError),
     /// JSON serialisation error.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -234,6 +244,11 @@ impl IntoResponse for ServerError {
                 (StatusCode::BAD_REQUEST, "invalid_params", msg.as_str().to_owned())
             }
             Self::Id(err) => (StatusCode::BAD_REQUEST, "invalid_params", err.to_string()),
+            Self::Provenance(err) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_provenance",
+                err.to_string(),
+            ),
             Self::Unauthorized => {
                 (StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid token".to_owned())
             }
@@ -504,6 +519,12 @@ impl CoordinationReadScope {
 /// unrestricted token instead of the operator's intended scoped one. That
 /// fails open on exactly the kind of mistake this format needs to fail
 /// closed on, so an unrecognised key is a load error instead.
+///
+/// For issue #160, `owner` carries optional provider-neutral [`OwnerMetadata`]
+/// (containing immutable internal owner ID, issuer, subject, and email-at-write).
+/// Misspelled or unrecognized ownership keys fail closed via `deny_unknown_fields`
+/// both on `TokenEntry` and inside `OwnerMetadata`. Omitting `owner` or setting it
+/// to explicit `null` retains unchanged behavior for ordinary static-token entries.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TokenEntry {
@@ -521,6 +542,11 @@ struct TokenEntry {
     /// and is NOT a synonym for absent.
     #[serde(default)]
     scopes: Option<Vec<RawTokenScope>>,
+    /// Optional provider-neutral owner metadata. `None` (the field absent or
+    /// explicit JSON `null`) retains unchanged behavior for ordinary static-token
+    /// entries that omit owner metadata.
+    #[serde(default)]
+    owner: Option<OwnerMetadata>,
 }
 
 /// An in-memory token entry with its bearer token pre-hashed.
@@ -538,6 +564,8 @@ struct TokenRegistryEntry {
     /// Resolved scopes; see [`TokenEntry::scopes`] for the `None` vs
     /// `Some(vec![])` distinction.
     scopes: Option<Vec<TokenScopeEntry>>,
+    /// Optional validated owner metadata for authenticated tokens.
+    owner: Option<OwnerMetadata>,
 }
 
 /// In-memory registry of bearer tokens loaded from a JSON file.
@@ -558,8 +586,10 @@ struct TokenRegistryInner {
 impl TokenRegistry {
     /// Loads the token registry from `path`.
     ///
-    /// The file must be a JSON array of `{"token","name","enabled"}` objects.
-    /// Returns `Err` if the file exists but cannot be parsed.
+    /// The file must be a JSON array of token objects. Each object may include
+    /// optional `scopes` and validated `owner` metadata; absent or null owner
+    /// metadata preserves legacy static-token behavior. Returns `Err` if the
+    /// file exists but cannot be parsed or validated.
     pub fn load(path: PathBuf) -> Result<Self, ServerError> {
         let inner = Self::read_file(&path)?;
         Ok(Self { path, inner: RwLock::new(inner) })
@@ -572,6 +602,7 @@ impl TokenRegistry {
         let file_entries: Vec<TokenEntry> =
             serde_json::from_str(&raw).map_err(|err| ServerError::TokenFile(err.to_string()))?;
         let mut entries = Vec::with_capacity(file_entries.len());
+        let mut owner_ids = std::collections::BTreeMap::new();
         for entry in file_entries {
             if entry.name.trim().is_empty() {
                 return Err(ServerError::TokenFile(
@@ -601,6 +632,25 @@ impl TokenRegistry {
                     entry.name
                 )));
             }
+            if let Some(ref owner) = entry.owner {
+                owner.validate().map_err(|err| {
+                    ServerError::TokenFile(format!(
+                        "invalid owner metadata for token `{}`: {err}",
+                        entry.name
+                    ))
+                })?;
+                // Keep the provider account's namespace stable across credentials,
+                // including disabled entries that may be enabled during rotation.
+                let binding = (owner.issuer.clone(), owner.subject.clone());
+                if let Some(previous_id) = owner_ids.insert(binding, owner.id.clone()) {
+                    if previous_id != owner.id {
+                        return Err(ServerError::TokenFile(format!(
+                            "conflicting owner IDs for the subject binding on token {}",
+                            entry.name
+                        )));
+                    }
+                }
+            }
             let scopes = entry
                 .scopes
                 .map(|raw_scopes| {
@@ -625,6 +675,7 @@ impl TokenRegistry {
                 enabled: entry.enabled,
                 token_hash: blake3::hash(entry.token.as_bytes()),
                 scopes,
+                owner: entry.owner,
             });
         }
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
@@ -695,8 +746,8 @@ impl TokenRegistry {
     }
 
     /// Authenticates `presented` token using constant-time comparison on BLAKE3
-    /// hashes. Returns the resolved [`AuthIdentity`] (name plus scopes) for an
-    /// enabled, matching token; `None` otherwise.
+    /// hashes. Returns the resolved [`AuthIdentity`] (name plus scopes and optional owner metadata)
+    /// for an enabled, matching token; `None` otherwise.
     pub fn authenticate(&self, presented: &str) -> Option<AuthIdentity> {
         if presented.trim().is_empty() {
             return None;
@@ -710,7 +761,11 @@ impl TokenRegistry {
             }
             let eq: bool = presented_hash.as_bytes().ct_eq(entry.token_hash.as_bytes()).into();
             if eq {
-                return Some(AuthIdentity(entry.name.clone(), entry.scopes.clone()));
+                return Some(AuthIdentity(
+                    entry.name.clone(),
+                    entry.scopes.clone(),
+                    entry.owner.clone(),
+                ));
             }
         }
         None
@@ -720,9 +775,11 @@ impl TokenRegistry {
 /// Extension type inserted into axum request extensions by the auth middleware.
 ///
 /// Widened for scoped tokens (issue #102 Stage 2) to carry the token's
-/// resolved scopes alongside its identity name. The identity string stays the
-/// first tuple field so existing call sites (`auth.0.0`, used for `added_by`
-/// and `ChangeEvent.actor` provenance) keep compiling unchanged.
+/// resolved scopes alongside its identity name, and extended for owner
+/// provenance (issue #160) to carry optional validated [`OwnerMetadata`].
+/// The identity string stays the first tuple field so existing call sites
+/// (`auth.0.0`, used for `added_by` and `ChangeEvent.actor` provenance)
+/// keep compiling unchanged.
 #[derive(Debug, Clone)]
 pub struct AuthIdentity(
     /// The authenticated identity name.
@@ -730,9 +787,30 @@ pub struct AuthIdentity(
     /// Resolved scopes. `None` means unrestricted (grandfathered); see
     /// [`TokenEntry::scopes`] for the full `None` vs `Some(vec![])` rule.
     Option<Vec<TokenScopeEntry>>,
+    /// Optional validated owner metadata for authenticated tokens.
+    Option<OwnerMetadata>,
 );
 
 impl AuthIdentity {
+    /// Create a new `AuthIdentity` with optional scopes and optional owner metadata.
+    pub(crate) fn new(
+        name: impl Into<String>,
+        scopes: Option<Vec<TokenScopeEntry>>,
+        owner: Option<OwnerMetadata>,
+    ) -> Self {
+        Self(name.into(), scopes, owner)
+    }
+
+    /// Create an unrestricted `AuthIdentity` with no scopes and no owner metadata (legacy static token).
+    pub fn unrestricted(name: impl Into<String>) -> Self {
+        Self(name.into(), None, None)
+    }
+
+    /// Create an unrestricted `AuthIdentity` with authenticated owner metadata.
+    pub fn with_owner(name: impl Into<String>, owner: impl Into<OwnerMetadata>) -> Self {
+        Self(name.into(), None, Some(owner.into()))
+    }
+
     /// Whether this token grants the full local MCP surface.
     pub fn is_unrestricted(&self) -> bool {
         self.1.is_none()
@@ -741,6 +819,68 @@ impl AuthIdentity {
     /// The authenticated identity name.
     pub fn name(&self) -> &str {
         &self.0
+    }
+
+    /// View resolved token scope entries, or `None` if unrestricted.
+    pub(crate) fn scopes(&self) -> Option<&[TokenScopeEntry]> {
+        self.1.as_deref()
+    }
+
+    /// Optional validated owner metadata for authenticated tokens.
+    pub fn owner(&self) -> Option<&OwnerMetadata> {
+        self.2.as_ref()
+    }
+
+    /// Resolved owner identity, returning `OwnerIdentity::Authenticated` if
+    /// owner metadata is configured on the token entry, or `OwnerIdentity::Unknown`
+    /// if owner metadata is omitted (e.g. legacy static tokens).
+    pub fn owner_identity(&self) -> OwnerIdentity {
+        match &self.2 {
+            Some(owner) => OwnerIdentity::Authenticated(owner.clone()),
+            None => OwnerIdentity::Unknown,
+        }
+    }
+
+    /// View the immutable owner ID, if authenticated.
+    pub fn owner_id(&self) -> Option<&OwnerId> {
+        self.2.as_ref().map(|o| &o.id)
+    }
+
+    /// True when this token carries authenticated owner metadata.
+    pub fn has_owner(&self) -> bool {
+        self.2.is_some()
+    }
+
+    /// View provider issuer, if authenticated.
+    pub fn issuer(&self) -> Option<&Issuer> {
+        self.2.as_ref().map(|o| &o.issuer)
+    }
+
+    /// View provider subject, if authenticated.
+    pub fn subject(&self) -> Option<&Subject> {
+        self.2.as_ref().map(|o| &o.subject)
+    }
+
+    /// View human-readable email captured at write time, if authenticated.
+    pub fn email_at_write(&self) -> Option<&EmailAtWrite> {
+        self.2.as_ref().map(|o| &o.email_at_write)
+    }
+
+    /// View provider subject binding (`(issuer, subject)`), if authenticated.
+    pub fn subject_binding(&self) -> Option<SubjectBinding> {
+        self.2.as_ref().map(|o| o.subject_binding())
+    }
+
+    /// Construct an owner-scoped key using the server-established owner identity.
+    ///
+    /// If the identity is authenticated, the resulting key is scoped to the owner ID.
+    /// If the identity is unauthenticated/legacy, the resulting key is scoped to the
+    /// reserved legacy sentinel.
+    pub fn owner_scoped_key(
+        &self,
+        raw_key: impl Into<String>,
+    ) -> std::result::Result<OwnerScopedKey, ProvenanceError> {
+        OwnerScopedKey::new(self.owner_id().cloned(), raw_key)
     }
 
     /// True when this identity may perform `op` at all, independent of wing.
@@ -788,6 +928,152 @@ impl AuthIdentity {
                 WingVisibility::Only(wings)
             }
         }
+    }
+}
+
+impl<S> axum::extract::FromRequestParts<S> for AuthIdentity
+where
+    S: Send + Sync,
+{
+    type Rejection = ServerError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<AuthIdentity>()
+            .cloned()
+            .ok_or(ServerError::Unauthorized)
+    }
+}
+
+/// Axum extractor for server-established authenticated ownership context.
+///
+/// Handlers can extract this parameter directly:
+/// ```ignore
+/// async fn route_handler(
+///     owner_ctx: AuthenticatedOwnerContext,
+///     // ...
+/// )
+/// ```
+///
+/// Provides convenient, direct access to the authenticated owner identity,
+/// provider-neutral metadata, and underlying [`AuthIdentity`] without relying
+/// on untrusted request body fields.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedOwnerContext {
+    identity: AuthIdentity,
+    owner_identity: OwnerIdentity,
+    owner_metadata: Option<OwnerMetadata>,
+}
+
+impl AuthenticatedOwnerContext {
+    /// Create a new `AuthenticatedOwnerContext` from an [`AuthIdentity`].
+    pub fn from_identity(identity: AuthIdentity) -> Self {
+        let owner_identity = identity.owner_identity();
+        let owner_metadata = identity.owner().cloned();
+        Self {
+            identity,
+            owner_identity,
+            owner_metadata,
+        }
+    }
+
+    /// The authenticated identity name (display name / token identity).
+    pub fn name(&self) -> &str {
+        self.identity.name()
+    }
+
+    /// Resolved [`OwnerIdentity`] (server-established).
+    pub fn owner_identity(&self) -> &OwnerIdentity {
+        &self.owner_identity
+    }
+
+    /// Validated [`OwnerMetadata`], if authenticated.
+    pub fn owner(&self) -> Option<&OwnerMetadata> {
+        self.owner_metadata.as_ref()
+    }
+
+    /// Immutable owner ID, if authenticated.
+    pub fn owner_id(&self) -> Option<&OwnerId> {
+        self.identity.owner_id()
+    }
+
+    /// True when this request carries authenticated owner metadata.
+    pub fn has_owner(&self) -> bool {
+        self.identity.has_owner()
+    }
+
+    /// Provider issuer, if authenticated.
+    pub fn issuer(&self) -> Option<&Issuer> {
+        self.identity.issuer()
+    }
+
+    /// Provider subject, if authenticated.
+    pub fn subject(&self) -> Option<&Subject> {
+        self.identity.subject()
+    }
+
+    /// Email-at-write, if authenticated.
+    pub fn email_at_write(&self) -> Option<&EmailAtWrite> {
+        self.identity.email_at_write()
+    }
+
+    /// Subject binding, if authenticated.
+    pub fn subject_binding(&self) -> Option<SubjectBinding> {
+        self.identity.subject_binding()
+    }
+
+    /// Construct an owner-scoped key using the server-established owner identity.
+    pub fn owner_scoped_key(
+        &self,
+        raw_key: impl Into<String>,
+    ) -> std::result::Result<OwnerScopedKey, ProvenanceError> {
+        self.identity.owner_scoped_key(raw_key)
+    }
+
+    /// Access the underlying [`AuthIdentity`].
+    pub fn auth_identity(&self) -> &AuthIdentity {
+        &self.identity
+    }
+
+    /// Consume into the underlying [`AuthIdentity`].
+    pub fn into_auth_identity(self) -> AuthIdentity {
+        self.identity
+    }
+}
+
+impl std::ops::Deref for AuthenticatedOwnerContext {
+    type Target = AuthIdentity;
+
+    fn deref(&self) -> &Self::Target {
+        &self.identity
+    }
+}
+
+impl<S> axum::extract::FromRequestParts<S> for AuthenticatedOwnerContext
+where
+    S: Send + Sync,
+{
+    type Rejection = ServerError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        if let Some(ctx) = parts.extensions.get::<AuthenticatedOwnerContext>() {
+            return Ok(ctx.clone());
+        }
+
+        let identity = parts
+            .extensions
+            .get::<AuthIdentity>()
+            .cloned()
+            .ok_or(ServerError::Unauthorized)?;
+
+        Ok(Self::from_identity(identity))
     }
 }
 
@@ -979,6 +1265,11 @@ where
     // operation that route requires. `/v1/info` carries no gate: any
     // authenticated token may call it.
     //
+    // This is the closed remote REST allowlist. Keep new remote operations
+    // explicit here and add them to docs/Demo-Hub-REST-Inventory.md; paths
+    // handled elsewhere (including `/mcp` and test-only routes) are not
+    // implicitly demo-enabled and therefore fail closed at the router.
+    //
     // Ingest batch/preflight get a 16 MiB body limit (vs axum's 2 MiB default)
     // through this separate sub-router; other routes keep the default.
     let ingest_route = Router::new()
@@ -1129,6 +1420,13 @@ where
 
     match token.and_then(|t| state.tokens.authenticate(t)) {
         Some(identity) => {
+            request.extensions_mut().insert(identity.owner_identity());
+            if let Some(owner) = identity.owner() {
+                request.extensions_mut().insert(owner.clone());
+            }
+            request
+                .extensions_mut()
+                .insert(AuthenticatedOwnerContext::from_identity(identity.clone()));
             request.extensions_mut().insert(identity);
             next.run(request).await
         }
@@ -5138,6 +5436,38 @@ mod tests {
     // ─── 2. Info auth ─────────────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn head_routes_preserve_get_auth_and_strip_response_bodies() {
+        let harness = make_harness().await;
+        for (path, token, expected) in [
+            ("/v1/health", None, StatusCode::OK),
+            ("/v1/info", None, StatusCode::UNAUTHORIZED),
+            ("/v1/info", Some(ALICE_TOKEN), StatusCode::OK),
+            ("/v1/kg/stats", Some(ALICE_TOKEN), StatusCode::OK),
+            ("/v1/kg/stats", Some(LOCKED_TOKEN), StatusCode::FORBIDDEN),
+        ] {
+            for method in [Method::GET, Method::HEAD] {
+                let mut request = Request::builder().method(method.clone()).uri(path);
+                if let Some(token) = token {
+                    request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+                }
+                let response = harness
+                    .router
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "{method} {path}");
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                if method == Method::HEAD {
+                    assert!(bytes.is_empty(), "HEAD {path} must have no response body");
+                } else {
+                    assert!(!bytes.is_empty(), "GET {path} must retain its response body");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn info_without_token_returns_401() {
         let harness = make_harness().await;
         let request =
@@ -5250,6 +5580,1350 @@ mod tests {
         assert_eq!(identity.name(), "spelled_right");
         assert!(identity.allows_wing(Operation::Read, "wing_alpha"));
         assert!(!identity.allows_wing(Operation::Read, "wing_beta"), "scope must stay restrictive");
+    }
+
+    // ─── Owner metadata on token entries (Issue #160) ─────────────────────────
+
+    fn owner_rotation_entries() -> Value {
+        json!([
+            {
+                "token": "old-secret", "name": "old_name", "enabled": true,
+                "owner": {"id": "usr_alice", "issuer": "issuer_a", "subject": "subject_a",
+                          "email_at_write": "old@example.com"}
+            },
+            {
+                "token": "new-secret", "name": "new_name", "enabled": true,
+                "owner": {"id": "usr_alice", "issuer": "issuer_a", "subject": "subject_a",
+                          "email_at_write": "new@example.com"}
+            }
+        ])
+    }
+
+    #[test]
+    fn owner_rotation_preserves_scoped_keys_and_allows_distinct_bindings() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        let mut entries = owner_rotation_entries();
+        // Subjects are namespaced by issuer; different subjects are independent.
+        for (issuer, subject, id) in [
+            ("issuer_b", "subject_a", "usr_bob"),
+            ("issuer_a", "subject_b", "usr_carol"),
+        ] {
+            let mut other = entries[0].clone();
+            other["token"] = json!(id);
+            other["owner"]["issuer"] = json!(issuer);
+            other["owner"]["subject"] = json!(subject);
+            other["owner"]["id"] = json!(id);
+            entries.as_array_mut().unwrap().push(other);
+        }
+        std::fs::write(&token_file, serde_json::to_vec(&entries).unwrap()).unwrap();
+        restrict_token_file(&token_file);
+        let registry = TokenRegistry::load(token_file).unwrap();
+        let old = registry.authenticate("old-secret").unwrap();
+        let new = registry.authenticate("new-secret").unwrap();
+        assert_eq!(old.owner_id(), new.owner_id());
+        assert_eq!(old.owner_scoped_key("retry").unwrap(), new.owner_scoped_key("retry").unwrap());
+        assert_ne!(old.email_at_write(), new.email_at_write());
+        assert_eq!(
+            registry.authenticate("usr_bob").unwrap().owner_id().unwrap().as_str(),
+            "usr_bob"
+        );
+        assert_eq!(
+            registry.authenticate("usr_carol").unwrap().owner_id().unwrap().as_str(),
+            "usr_carol"
+        );
+    }
+
+    #[test]
+    fn owner_rotation_rejects_conflicting_ids_in_either_order() {
+        for enabled in [true, false] {
+            for reversed in [true, false] {
+                let tempdir = TempDir::new().unwrap();
+                let token_file = tempdir.path().join("tokens.json");
+                let mut entries = owner_rotation_entries();
+                entries[1]["owner"]["id"] = json!("usr_other");
+                entries[1]["enabled"] = json!(enabled);
+                if reversed {
+                    entries.as_array_mut().unwrap().reverse();
+                }
+                std::fs::write(&token_file, serde_json::to_vec(&entries).unwrap()).unwrap();
+                restrict_token_file(&token_file);
+                let err = TokenRegistry::load(token_file).unwrap_err();
+                assert!(err.to_string().contains("conflicting owner IDs"), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn owner_rotation_conflicting_reload_fails_closed_and_recovers() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        let mut entries = owner_rotation_entries();
+        std::fs::write(&token_file, serde_json::to_vec(&entries).unwrap()).unwrap();
+        restrict_token_file(&token_file);
+        let registry = TokenRegistry::load(token_file.clone()).unwrap();
+        assert!(registry.authenticate("old-secret").is_some());
+        assert!(registry.authenticate("new-secret").is_some());
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        entries[1]["owner"]["id"] = json!("usr_other");
+        std::fs::write(&token_file, serde_json::to_vec(&entries).unwrap()).unwrap();
+        assert!(registry.authenticate("old-secret").is_none());
+        assert!(registry.authenticate("new-secret").is_none());
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        entries[1]["owner"]["id"] = json!("usr_alice");
+        std::fs::write(&token_file, serde_json::to_vec(&entries).unwrap()).unwrap();
+        let old = registry.authenticate("old-secret").unwrap();
+        let new = registry.authenticate("new-secret").unwrap();
+        assert_eq!(old.owner_scoped_key("retry").unwrap(), new.owner_scoped_key("retry").unwrap());
+    }
+
+    #[test]
+    fn token_file_accepts_valid_owner_metadata() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "owner-secret-token",
+                    "name": "tester",
+                    "enabled": true,
+                    "owner": {
+                        "id": "usr_01J8Y000000000000000000000",
+                        "issuer": "https://accounts.google.com",
+                        "subject": "104928190283019283019",
+                        "email_at_write": "tester@example.com"
+                    }
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let registry = TokenRegistry::load(token_file).expect("valid owner metadata must load");
+        let identity = registry
+            .authenticate("owner-secret-token")
+            .expect("token with owner metadata must authenticate");
+
+        assert_eq!(identity.name(), "tester");
+        assert!(identity.has_owner());
+        assert!(identity.owner().is_some());
+        let owner = identity.owner().unwrap();
+        assert_eq!(owner.id.as_str(), "usr_01J8Y000000000000000000000");
+        assert_eq!(owner.issuer.as_str(), "https://accounts.google.com");
+        assert_eq!(owner.subject.as_str(), "104928190283019283019");
+        assert_eq!(owner.email_at_write.as_str(), "tester@example.com");
+
+        assert_eq!(
+            identity.owner_id().map(|id| id.as_str()),
+            Some("usr_01J8Y000000000000000000000")
+        );
+
+        let owner_identity = identity.owner_identity();
+        assert!(owner_identity.is_authenticated());
+        assert!(!owner_identity.is_unknown());
+        assert_eq!(
+            owner_identity.owner_id().map(|id| id.as_str()),
+            Some("usr_01J8Y000000000000000000000")
+        );
+    }
+
+    #[test]
+    fn token_file_accepts_valid_owner_metadata_with_explicit_status() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "owner-status-token",
+                    "name": "tester_status",
+                    "enabled": true,
+                    "owner": {
+                        "status": "authenticated",
+                        "id": "usr_01J8Y000000000000000000001",
+                        "issuer": "https://accounts.google.com",
+                        "subject": "sub-12345",
+                        "email_at_write": "status@example.com"
+                    }
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let registry = TokenRegistry::load(token_file).expect("valid explicit-status owner must load");
+        let identity = registry
+            .authenticate("owner-status-token")
+            .expect("token with explicit status must authenticate");
+        assert_eq!(identity.name(), "tester_status");
+        assert!(identity.has_owner());
+        assert_eq!(
+            identity.owner_id().map(|id| id.as_str()),
+            Some("usr_01J8Y000000000000000000001")
+        );
+    }
+
+    #[test]
+    fn token_file_omitted_or_null_owner_retains_legacy_behavior() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "omitted-owner-token",
+                    "name": "omitted_user",
+                    "enabled": true
+                },
+                {
+                    "token": "null-owner-token",
+                    "name": "null_user",
+                    "enabled": true,
+                    "owner": null
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let registry = TokenRegistry::load(token_file).expect("omitted/null owner tokens must load");
+
+        // Omitted owner
+        let omitted = registry
+            .authenticate("omitted-owner-token")
+            .expect("omitted owner token must authenticate");
+        assert_eq!(omitted.name(), "omitted_user");
+        assert!(!omitted.has_owner());
+        assert!(omitted.owner().is_none());
+        assert_eq!(omitted.owner_id(), None);
+        assert_eq!(omitted.owner_identity(), OwnerIdentity::Unknown);
+
+        // Explicit null owner
+        let nulled = registry
+            .authenticate("null-owner-token")
+            .expect("null owner token must authenticate");
+        assert_eq!(nulled.name(), "null_user");
+        assert!(!nulled.has_owner());
+        assert!(nulled.owner().is_none());
+        assert_eq!(nulled.owner_id(), None);
+        assert_eq!(nulled.owner_identity(), OwnerIdentity::Unknown);
+    }
+
+    #[test]
+    fn token_file_rejects_misspelled_owner_key_at_entry_level() {
+        let bad_keys = ["ownr", "owners", "owner_metadata", "owner_id"];
+        for bad_key in bad_keys {
+            let tempdir = TempDir::new().unwrap();
+            let token_file = tempdir.path().join("tokens.json");
+            let mut obj = serde_json::Map::new();
+            obj.insert("token".to_string(), serde_json::json!("tok"));
+            obj.insert("name".to_string(), serde_json::json!("tester"));
+            obj.insert("enabled".to_string(), serde_json::json!(true));
+            obj.insert(
+                bad_key.to_string(),
+                serde_json::json!({
+                    "id": "usr_01J8Y000000000000000000000",
+                    "issuer": "https://accounts.google.com",
+                    "subject": "104928190283019283019",
+                    "email_at_write": "tester@example.com"
+                }),
+            );
+            std::fs::write(
+                &token_file,
+                serde_json::to_string(&vec![serde_json::Value::Object(obj)]).unwrap(),
+            )
+            .unwrap();
+            restrict_token_file(&token_file);
+
+            let err = TokenRegistry::load(token_file).expect_err(&format!(
+                "misspelled key `{bad_key}` at entry level must fail to load"
+            ));
+            assert!(
+                err.to_string().contains(bad_key),
+                "error should name unknown field `{bad_key}`: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_file_rejects_unknown_fields_inside_owner_metadata() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "tok",
+                    "name": "tester",
+                    "enabled": true,
+                    "owner": {
+                        "id": "usr_01J8Y000000000000000000000",
+                        "issuer": "https://accounts.google.com",
+                        "subject": "104928190283019283019",
+                        "email_at_write": "tester@example.com",
+                        "unexpected_role": "admin"
+                    }
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let err = TokenRegistry::load(token_file)
+            .expect_err("unknown field inside owner metadata must fail load");
+        assert!(
+            err.to_string().contains("unexpected_role"),
+            "error should name unknown field `unexpected_role`: {err}"
+        );
+    }
+
+    #[test]
+    fn token_file_rejects_misspelled_fields_inside_owner_metadata() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "tok",
+                    "name": "tester",
+                    "enabled": true,
+                    "owner": {
+                        "id": "usr_01J8Y000000000000000000000",
+                        "issuer": "https://accounts.google.com",
+                        "subject": "104928190283019283019",
+                        "email": "tester@example.com"
+                    }
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let err = TokenRegistry::load(token_file)
+            .expect_err("misspelled field `email` inside owner metadata must fail load");
+        assert!(
+            err.to_string().contains("email"),
+            "error should name offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn token_file_rejects_malformed_owner_fields() {
+        let malformed_owners = [
+            // Empty ID
+            serde_json::json!({
+                "id": "",
+                "issuer": "https://accounts.google.com",
+                "subject": "sub1",
+                "email_at_write": "test@example.com"
+            }),
+            // Reserved sentinel ID 'unknown'
+            serde_json::json!({
+                "id": "unknown",
+                "issuer": "https://accounts.google.com",
+                "subject": "sub1",
+                "email_at_write": "test@example.com"
+            }),
+            // Reserved sentinel ID 'legacy'
+            serde_json::json!({
+                "id": "legacy",
+                "issuer": "https://accounts.google.com",
+                "subject": "sub1",
+                "email_at_write": "test@example.com"
+            }),
+            // Reserved sentinel ID 'none'
+            serde_json::json!({
+                "id": "none",
+                "issuer": "https://accounts.google.com",
+                "subject": "sub1",
+                "email_at_write": "test@example.com"
+            }),
+            // Reserved sentinel ID 'null'
+            serde_json::json!({
+                "id": "null",
+                "issuer": "https://accounts.google.com",
+                "subject": "sub1",
+                "email_at_write": "test@example.com"
+            }),
+            // Empty issuer
+            serde_json::json!({
+                "id": "usr_01J8Y000000000000000000000",
+                "issuer": "",
+                "subject": "sub1",
+                "email_at_write": "test@example.com"
+            }),
+            // Empty subject
+            serde_json::json!({
+                "id": "usr_01J8Y000000000000000000000",
+                "issuer": "https://accounts.google.com",
+                "subject": "",
+                "email_at_write": "test@example.com"
+            }),
+            // Invalid email
+            serde_json::json!({
+                "id": "usr_01J8Y000000000000000000000",
+                "issuer": "https://accounts.google.com",
+                "subject": "sub1",
+                "email_at_write": "notanemail"
+            }),
+            // Explicit null status
+            serde_json::json!({
+                "status": null,
+                "id": "usr_01J8Y000000000000000000000",
+                "issuer": "https://accounts.google.com",
+                "subject": "sub1",
+                "email_at_write": "test@example.com"
+            }),
+            // Invalid status
+            serde_json::json!({
+                "status": "google",
+                "id": "usr_01J8Y000000000000000000000",
+                "issuer": "https://accounts.google.com",
+                "subject": "sub1",
+                "email_at_write": "test@example.com"
+            }),
+            // Contradictory ownership status: an authenticated owner object
+            // cannot declare itself unknown while carrying authenticated
+            // fields. This must not be interpreted as legacy ownership.
+            serde_json::json!({
+                "status": "unknown",
+                "id": "usr_01J8Y000000000000000000000",
+                "issuer": "https://accounts.google.com",
+                "subject": "sub1",
+                "email_at_write": "test@example.com"
+            }),
+        ];
+
+        for (idx, malformed) in malformed_owners.iter().enumerate() {
+            let tempdir = TempDir::new().unwrap();
+            let token_file = tempdir.path().join("tokens.json");
+            std::fs::write(
+                &token_file,
+                serde_json::to_string(&serde_json::json!([
+                    {
+                        "token": "tok",
+                        "name": "tester",
+                        "enabled": true,
+                        "owner": malformed
+                    }
+                ]))
+                .unwrap(),
+            )
+            .unwrap();
+            restrict_token_file(&token_file);
+
+            let res = TokenRegistry::load(token_file);
+            assert!(
+                res.is_err(),
+                "case {idx} with malformed owner {malformed:?} must fail load, got: {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_file_rejects_non_object_owner_values() {
+        // `owner: null` is the one intentional non-object representation. Any
+        // other scalar/array value is malformed and must not downgrade a
+        // configured token to an unauthenticated legacy token.
+        for malformed in [
+            serde_json::json!("unknown"),
+            serde_json::json!(42),
+            serde_json::json!([]),
+        ] {
+            let tempdir = TempDir::new().unwrap();
+            let token_file = tempdir.path().join("tokens.json");
+            std::fs::write(
+                &token_file,
+                serde_json::to_string(&serde_json::json!([{
+                    "token": "tok",
+                    "name": "tester",
+                    "enabled": true,
+                    "owner": malformed
+                }]))
+                .unwrap(),
+            )
+            .unwrap();
+            restrict_token_file(&token_file);
+
+            assert!(
+                TokenRegistry::load(token_file).is_err(),
+                "non-null owner value {malformed:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn token_reload_with_malformed_or_unknown_owner_fails_closed() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+
+        // 1. Initial valid file with owner metadata
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "tok_reload",
+                    "name": "reloader",
+                    "enabled": true,
+                    "owner": {
+                        "id": "usr_01J8Y000000000000000000000",
+                        "issuer": "https://accounts.google.com",
+                        "subject": "sub_initial",
+                        "email_at_write": "initial@example.com"
+                    }
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let registry = TokenRegistry::load(token_file.clone()).unwrap();
+        let id1 = registry.authenticate("tok_reload").expect("initial auth must succeed");
+        assert_eq!(
+            id1.owner_id().map(|id| id.as_str()),
+            Some("usr_01J8Y000000000000000000000")
+        );
+
+        // 2. Modify file with unknown field inside owner -> must fail closed on reload
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "tok_reload",
+                    "name": "reloader",
+                    "enabled": true,
+                    "owner": {
+                        "id": "usr_01J8Y000000000000000000000",
+                        "issuer": "https://accounts.google.com",
+                        "subject": "sub_initial",
+                        "email_at_write": "initial@example.com",
+                        "unknown_attr": 42
+                    }
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            registry.authenticate("tok_reload").is_none(),
+            "hot reload with unknown owner field must disable all tokens (fail closed)"
+        );
+
+        // 3. Fix file with valid updated owner
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "tok_reload",
+                    "name": "reloader",
+                    "enabled": true,
+                    "owner": {
+                        "id": "usr_01J8Y000000000000000000000",
+                        "issuer": "https://accounts.google.com",
+                        "subject": "sub_fixed",
+                        "email_at_write": "fixed@example.com"
+                    }
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let id3 = registry.authenticate("tok_reload").expect("auth after fix must succeed");
+        assert_eq!(
+            id3.owner().unwrap().email_at_write.as_str(),
+            "fixed@example.com"
+        );
+    }
+
+    #[test]
+    fn token_reload_with_misspelled_owner_key_fails_closed() {
+        let tempdir = TempDir::new().unwrap();
+        let token_file = tempdir.path().join("tokens.json");
+
+        // 1. Initial valid file
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "tok_reload_key",
+                    "name": "reloader_key",
+                    "enabled": true
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let registry = TokenRegistry::load(token_file.clone()).unwrap();
+        assert!(registry.authenticate("tok_reload_key").is_some());
+
+        // 2. Modify with typo "ownr"
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "tok_reload_key",
+                    "name": "reloader_key",
+                    "enabled": true,
+                    "ownr": {
+                        "id": "usr_01J8Y000000000000000000000",
+                        "issuer": "https://accounts.google.com",
+                        "subject": "sub",
+                        "email_at_write": "test@example.com"
+                    }
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            registry.authenticate("tok_reload_key").is_none(),
+            "hot reload with misspelled `ownr` must disable all tokens (fail closed)"
+        );
+
+        // 3. Fix with correctly spelled "owner"
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "tok_reload_key",
+                    "name": "reloader_key",
+                    "enabled": true,
+                    "owner": {
+                        "id": "usr_01J8Y000000000000000000000",
+                        "issuer": "https://accounts.google.com",
+                        "subject": "sub",
+                        "email_at_write": "test@example.com"
+                    }
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let id = registry.authenticate("tok_reload_key").expect("auth after fix must succeed");
+        assert!(id.has_owner());
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_propagates_owner_identity_to_extensions() {
+        let tempdir = TempDir::new().unwrap();
+        let palace_path = tempdir.path().join("palace");
+        let token_file = tempdir.path().join("tokens.json");
+
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "authed-owner-token",
+                    "name": "alice_with_owner",
+                    "enabled": true,
+                    "owner": {
+                        "id": "usr_01J8Y000000000000000000000",
+                        "issuer": "https://accounts.google.com",
+                        "subject": "sub_middleware",
+                        "email_at_write": "alice@example.com"
+                    }
+                },
+                {
+                    "token": "static-no-owner-token",
+                    "name": "static_user",
+                    "enabled": true
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let config = AgentPalaceConfig {
+            schema_version: 1,
+            collection_name: "agentpalace_drawers".to_owned(),
+            palace_path,
+            embedding_profile: EmbeddingProfile::Balanced,
+            low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+            server: ServerRuntimeConfig {
+                bind: "127.0.0.1:8765".parse().unwrap(),
+                token_file: token_file.clone(),
+                checkouts: std::collections::BTreeMap::new(),
+            },
+            federation: FederationRuntimeConfig::default(),
+            maintenance: MaintenanceRuntimeConfig::defaults(),
+        };
+
+        let tokens = TokenRegistry::load(token_file).unwrap();
+        let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
+        let (router, state) = build_router(config, provider, tokens).await.unwrap();
+
+        async fn test_inspect_extensions_handler(
+            axum::extract::Extension(direct_owner_identity): axum::extract::Extension<OwnerIdentity>,
+            direct_owner_metadata: Option<axum::extract::Extension<OwnerMetadata>>,
+            extracted: AuthenticatedOwnerContext,
+            auth: AuthIdentity,
+        ) -> Json<serde_json::Value> {
+            // Assert that axum's built-in Extension extractor matches the first-class extractors
+            assert_eq!(direct_owner_identity, *extracted.owner_identity());
+            assert_eq!(
+                direct_owner_metadata.as_ref().map(|m| &m.0),
+                extracted.owner()
+            );
+            assert_eq!(extracted.auth_identity().name(), auth.name());
+            assert_eq!(extracted.name(), auth.name());
+            // The middleware must insert one coherent ownership snapshot: every
+            // owner/provenance accessor and every derived scoped key must agree
+            // with the AuthIdentity extension from the same authenticated token.
+            assert_eq!(extracted.owner_identity(), &auth.owner_identity());
+            assert_eq!(extracted.owner(), auth.owner());
+            assert_eq!(extracted.owner_id(), auth.owner_id());
+            assert_eq!(extracted.issuer(), auth.issuer());
+            assert_eq!(extracted.subject(), auth.subject());
+            assert_eq!(extracted.email_at_write(), auth.email_at_write());
+            assert_eq!(
+                extracted.owner_scoped_key("middleware_coherence").unwrap(),
+                auth.owner_scoped_key("middleware_coherence").unwrap()
+            );
+
+            // Handler assertions for token-specific expectations and focused accessors
+            if extracted.name() == "alice_with_owner" {
+                assert!(extracted.has_owner());
+                assert!(extracted.owner().is_some());
+                assert_eq!(
+                    extracted.issuer().map(|i| i.as_str()),
+                    Some("https://accounts.google.com")
+                );
+                assert_eq!(
+                    extracted.subject().map(|s| s.as_str()),
+                    Some("sub_middleware")
+                );
+                assert_eq!(
+                    extracted.email_at_write().map(|e| e.as_str()),
+                    Some("alice@example.com")
+                );
+                assert_eq!(
+                    extracted.owner_id().map(|id| id.as_str()),
+                    Some("usr_01J8Y000000000000000000000")
+                );
+                let key = extracted.owner_scoped_key("inspect_op").unwrap();
+                assert_eq!(
+                    key.composite_key(),
+                    "usr_01J8Y000000000000000000000:inspect_op"
+                );
+                assert!(key.is_authenticated());
+
+                match extracted.owner_identity() {
+                    OwnerIdentity::Authenticated(owner) => {
+                        assert_eq!(owner.email_at_write.as_str(), "alice@example.com");
+                        assert_eq!(owner.issuer.as_str(), "https://accounts.google.com");
+                        assert_eq!(owner.subject.as_str(), "sub_middleware");
+                        assert_eq!(owner.id.as_str(), "usr_01J8Y000000000000000000000");
+                    }
+                    _ => panic!("expected OwnerIdentity::Authenticated"),
+                }
+            } else if extracted.name() == "static_user" {
+                assert_eq!(*extracted.owner_identity(), OwnerIdentity::Unknown);
+                assert!(!extracted.has_owner());
+                assert!(extracted.owner().is_none());
+                assert!(extracted.issuer().is_none());
+                assert!(extracted.subject().is_none());
+                assert!(extracted.email_at_write().is_none());
+                let key = extracted.owner_scoped_key("inspect_op").unwrap();
+                assert_eq!(key.composite_key(), "legacy:inspect_op");
+                assert!(key.is_legacy());
+            }
+
+            Json(serde_json::json!({
+                "principal": extracted.name(),
+                "owner_identity": serde_json::to_value(extracted.owner_identity()).unwrap(),
+                "owner_metadata": serde_json::to_value(extracted.owner()).unwrap(),
+            }))
+        }
+
+        let test_router = Router::<Arc<ServerState<DeterministicStubProvider>>>::new()
+            .route("/test/owner_extensions", get(test_inspect_extensions_handler))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                auth_middleware::<DeterministicStubProvider>,
+            ))
+            .with_state(Arc::clone(&state));
+
+        let router = router.merge(test_router);
+
+        // 1. Authenticated owner request through inspect endpoint asserting extensions
+        let resp = router
+            .clone()
+            .oneshot(authed_get("/test/owner_extensions", "authed-owner-token"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["principal"], "alice_with_owner");
+
+        let expected_owner = OwnerMetadata::parse(
+            "usr_01J8Y000000000000000000000",
+            "https://accounts.google.com",
+            "sub_middleware",
+            "alice@example.com",
+        )
+        .unwrap();
+
+        let actual_owner_identity: OwnerIdentity =
+            serde_json::from_value(body["owner_identity"].clone()).unwrap();
+        assert_eq!(
+            actual_owner_identity,
+            OwnerIdentity::Authenticated(expected_owner.clone())
+        );
+
+        let actual_owner_metadata: Option<OwnerMetadata> =
+            serde_json::from_value(body["owner_metadata"].clone()).unwrap();
+        assert_eq!(actual_owner_metadata, Some(expected_owner));
+
+        // 2. Static token request without owner asserting OwnerIdentity::Unknown and absent OwnerMetadata
+        let resp2 = router
+            .clone()
+            .oneshot(authed_get("/test/owner_extensions", "static-no-owner-token"))
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let body2 = body_json(resp2).await;
+        assert_eq!(body2["principal"], "static_user");
+
+        let actual_static_identity: OwnerIdentity =
+            serde_json::from_value(body2["owner_identity"].clone()).unwrap();
+        assert_eq!(actual_static_identity, OwnerIdentity::Unknown);
+
+        let actual_static_metadata: Option<OwnerMetadata> =
+            serde_json::from_value(body2["owner_metadata"].clone()).unwrap();
+        assert_eq!(actual_static_metadata, None);
+
+        // 3. Unauthenticated request rejected by auth_middleware
+        let unauth_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/test/owner_extensions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 4. Standard protected route /v1/info still succeeds for both tokens
+        let info_resp1 = router
+            .clone()
+            .oneshot(authed_get("/v1/info", "authed-owner-token"))
+            .await
+            .unwrap();
+        assert_eq!(info_resp1.status(), StatusCode::OK);
+
+        let info_resp2 = router
+            .clone()
+            .oneshot(authed_get("/v1/info", "static-no-owner-token"))
+            .await
+            .unwrap();
+        assert_eq!(info_resp2.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mismatched_extensions_cannot_cross_contaminate_owner_context() {
+        use axum::extract::FromRequestParts;
+
+        // Construct two distinct owners
+        let owner_alice = OwnerMetadata::parse(
+            "usr_01J8Y_ALICE_LEGIT",
+            "https://accounts.google.com",
+            "sub_alice",
+            "alice@example.com",
+        )
+        .unwrap();
+
+        let owner_mallory = OwnerMetadata::parse(
+            "usr_01J8Y_MALLORY_ATTACKER",
+            "https://accounts.google.com",
+            "sub_mallory",
+            "mallory@example.com",
+        )
+        .unwrap();
+
+        let owner_charlie = OwnerMetadata::parse(
+            "usr_01J8Y_CHARLIE_THIRD",
+            "https://accounts.google.com",
+            "sub_charlie",
+            "charlie@example.com",
+        )
+        .unwrap();
+
+        // 1. When a coherent AuthenticatedOwnerContext is present in extensions,
+        // it cannot be subverted even if conflicting AuthIdentity, OwnerIdentity,
+        // or OwnerMetadata extensions are present.
+        let coherent_ctx =
+            AuthenticatedOwnerContext::from_identity(AuthIdentity::with_owner("alice", owner_alice.clone()));
+
+        let mut req_coherent = Request::builder()
+            .uri("/dummy")
+            .body(Body::empty())
+            .unwrap();
+        // Insert legitimate context
+        req_coherent.extensions_mut().insert(coherent_ctx);
+        // Attacker attempts to pollute extensions with Mallory's and Charlie's credentials
+        req_coherent.extensions_mut().insert(AuthIdentity::with_owner("mallory", owner_mallory.clone()));
+        req_coherent.extensions_mut().insert(OwnerIdentity::Authenticated(owner_mallory.clone()));
+        req_coherent.extensions_mut().insert(owner_charlie.clone());
+
+        let (mut parts_coherent, _) = req_coherent.into_parts();
+        let extracted_coherent = AuthenticatedOwnerContext::from_request_parts(&mut parts_coherent, &())
+            .await
+            .unwrap();
+
+        // Assert that owner_identity(), owner(), owner_id(), and owner_scoped_key() remain mutually consistent
+        assert_eq!(extracted_coherent.name(), "alice");
+        assert_eq!(
+            *extracted_coherent.owner_identity(),
+            OwnerIdentity::Authenticated(owner_alice.clone())
+        );
+        assert_eq!(extracted_coherent.owner(), Some(&owner_alice));
+        assert_eq!(
+            extracted_coherent.owner_id().map(|id| id.as_str()),
+            Some("usr_01J8Y_ALICE_LEGIT")
+        );
+        assert_eq!(
+            extracted_coherent.owner().unwrap().id.as_str(),
+            extracted_coherent.owner_id().unwrap().as_str()
+        );
+        assert_eq!(
+            extracted_coherent.owner_identity().owner_id().unwrap().as_str(),
+            extracted_coherent.owner_id().unwrap().as_str()
+        );
+        let key_coherent = extracted_coherent.owner_scoped_key("op_1").unwrap();
+        assert_eq!(key_coherent.composite_key(), "usr_01J8Y_ALICE_LEGIT:op_1");
+        assert_eq!(key_coherent.owner_id().unwrap().as_str(), extracted_coherent.owner_id().unwrap().as_str());
+        assert!(key_coherent.is_authenticated());
+        assert!(!key_coherent.is_legacy());
+
+        // 2. When AuthenticatedOwnerContext extension is absent, the extractor derives
+        // the context exclusively from the single AuthIdentity extension, completely ignoring
+        // conflicting standalone OwnerIdentity and OwnerMetadata extensions.
+        let mut req_derived = Request::builder()
+            .uri("/dummy")
+            .body(Body::empty())
+            .unwrap();
+        // Authenticated token identity is Alice
+        req_derived.extensions_mut().insert(AuthIdentity::with_owner("alice", owner_alice.clone()));
+        // Standalone extensions are maliciously set or mismatched to Mallory and Charlie
+        req_derived.extensions_mut().insert(OwnerIdentity::Authenticated(owner_mallory.clone()));
+        req_derived.extensions_mut().insert(owner_charlie.clone());
+
+        let (mut parts_derived, _) = req_derived.into_parts();
+        let extracted_derived = AuthenticatedOwnerContext::from_request_parts(&mut parts_derived, &())
+            .await
+            .unwrap();
+
+        // Extracted context remains Alice across all accessors and scoped keys
+        assert_eq!(extracted_derived.name(), "alice");
+        assert_eq!(
+            *extracted_derived.owner_identity(),
+            OwnerIdentity::Authenticated(owner_alice.clone())
+        );
+        assert_eq!(extracted_derived.owner(), Some(&owner_alice));
+        assert_eq!(
+            extracted_derived.owner_id().map(|id| id.as_str()),
+            Some("usr_01J8Y_ALICE_LEGIT")
+        );
+        assert_eq!(
+            extracted_derived.owner().unwrap().id.as_str(),
+            extracted_derived.owner_id().unwrap().as_str()
+        );
+        assert_eq!(
+            extracted_derived.owner_identity().owner_id().unwrap().as_str(),
+            extracted_derived.owner_id().unwrap().as_str()
+        );
+        assert_eq!(
+            extracted_derived.issuer().map(|i| i.as_str()),
+            Some("https://accounts.google.com")
+        );
+        assert_eq!(
+            extracted_derived.subject().map(|s| s.as_str()),
+            Some("sub_alice")
+        );
+        assert_eq!(
+            extracted_derived.email_at_write().map(|e| e.as_str()),
+            Some("alice@example.com")
+        );
+
+        let key_derived = extracted_derived.owner_scoped_key("op_2").unwrap();
+        assert_eq!(key_derived.composite_key(), "usr_01J8Y_ALICE_LEGIT:op_2");
+        assert_ne!(key_derived.composite_key(), "usr_01J8Y_MALLORY_ATTACKER:op_2");
+        assert_ne!(key_derived.composite_key(), "usr_01J8Y_CHARLIE_THIRD:op_2");
+        assert_eq!(key_derived.owner_id().unwrap().as_str(), extracted_derived.owner_id().unwrap().as_str());
+        assert!(key_derived.is_authenticated());
+
+        // 3. Static legacy token: conflicting OwnerIdentity or OwnerMetadata extensions
+        // cannot cause a static token to claim authenticated ownership.
+        let mut req_static = Request::builder()
+            .uri("/dummy")
+            .body(Body::empty())
+            .unwrap();
+        req_static.extensions_mut().insert(AuthIdentity::unrestricted("static_service"));
+        req_static.extensions_mut().insert(OwnerIdentity::Authenticated(owner_mallory.clone()));
+        req_static.extensions_mut().insert(owner_mallory.clone());
+
+        let (mut parts_static, _) = req_static.into_parts();
+        let extracted_static = AuthenticatedOwnerContext::from_request_parts(&mut parts_static, &())
+            .await
+            .unwrap();
+
+        assert_eq!(extracted_static.name(), "static_service");
+        assert_eq!(*extracted_static.owner_identity(), OwnerIdentity::Unknown);
+        assert!(!extracted_static.has_owner());
+        assert_eq!(extracted_static.owner_id(), None);
+        assert_eq!(extracted_static.owner(), None);
+        assert_eq!(extracted_static.issuer(), None);
+        assert_eq!(extracted_static.subject(), None);
+        assert_eq!(extracted_static.email_at_write(), None);
+        let key_static = extracted_static.owner_scoped_key("op_3").unwrap();
+        assert_eq!(key_static.composite_key(), "legacy:op_3");
+        assert_eq!(key_static.owner_id(), None);
+        assert!(key_static.is_legacy());
+        assert!(!key_static.is_authenticated());
+        assert_eq!(extracted_static.owner_identity().owner_id(), key_static.owner_id());
+
+        // 4. Mismatched combination: AuthIdentity with Mallory's identity, but standalone extensions
+        // carrying Alice's OwnerIdentity and Charlie's OwnerMetadata.
+        // Must derive strictly from AuthIdentity (Mallory), refusing Alice/Charlie extensions.
+        let mut req_mallory_auth = Request::builder()
+            .uri("/dummy")
+            .body(Body::empty())
+            .unwrap();
+        req_mallory_auth.extensions_mut().insert(AuthIdentity::with_owner("mallory", owner_mallory.clone()));
+        req_mallory_auth.extensions_mut().insert(OwnerIdentity::Authenticated(owner_alice.clone()));
+        req_mallory_auth.extensions_mut().insert(owner_charlie.clone());
+
+        let (mut parts_mallory, _) = req_mallory_auth.into_parts();
+        let extracted_mallory = AuthenticatedOwnerContext::from_request_parts(&mut parts_mallory, &())
+            .await
+            .unwrap();
+
+        assert_eq!(extracted_mallory.name(), "mallory");
+        assert_eq!(
+            *extracted_mallory.owner_identity(),
+            OwnerIdentity::Authenticated(owner_mallory.clone())
+        );
+        assert_eq!(extracted_mallory.owner(), Some(&owner_mallory));
+        assert_eq!(
+            extracted_mallory.owner_id().map(|id| id.as_str()),
+            Some("usr_01J8Y_MALLORY_ATTACKER")
+        );
+        let key_mallory = extracted_mallory.owner_scoped_key("op_4").unwrap();
+        assert_eq!(key_mallory.composite_key(), "usr_01J8Y_MALLORY_ATTACKER:op_4");
+        assert_ne!(key_mallory.composite_key(), "usr_01J8Y_ALICE_LEGIT:op_4");
+        assert_ne!(key_mallory.composite_key(), "usr_01J8Y_CHARLIE_THIRD:op_4");
+        assert_eq!(key_mallory.owner_id().unwrap().as_str(), extracted_mallory.owner_id().unwrap().as_str());
+    }
+
+    #[tokio::test]
+    async fn authenticated_ownership_context_propagation_and_tamper_resistance() {
+        // 1. AuthIdentity focused accessors and constructors
+        let owner_meta = OwnerMetadata::parse(
+            "usr_01J8Y000000000000000000001",
+            "https://accounts.google.com",
+            "subject_alice_42",
+            "alice@domain.org",
+        )
+        .unwrap();
+
+        let auth_owned = AuthIdentity::with_owner("alice_display", owner_meta.clone());
+        assert_eq!(auth_owned.name(), "alice_display");
+        assert!(auth_owned.is_unrestricted());
+        assert!(auth_owned.scopes().is_none());
+        assert!(auth_owned.has_owner());
+        assert_eq!(
+            auth_owned.owner_id().map(|id| id.as_str()),
+            Some("usr_01J8Y000000000000000000001")
+        );
+        assert_eq!(
+            auth_owned.issuer().map(|i| i.as_str()),
+            Some("https://accounts.google.com")
+        );
+        assert_eq!(
+            auth_owned.subject().map(|s| s.as_str()),
+            Some("subject_alice_42")
+        );
+        assert_eq!(
+            auth_owned.email_at_write().map(|e| e.as_str()),
+            Some("alice@domain.org")
+        );
+        assert_eq!(
+            auth_owned.subject_binding().map(|sb| sb.issuer.to_string()),
+            Some("https://accounts.google.com".to_string())
+        );
+
+        let owned_key = auth_owned.owner_scoped_key("op_add_drawer").unwrap();
+        assert_eq!(
+            owned_key.composite_key(),
+            "usr_01J8Y000000000000000000001:op_add_drawer"
+        );
+        assert!(owned_key.is_authenticated());
+        assert!(!owned_key.is_legacy());
+
+        // Legacy / unrestricted static token
+        let auth_static = AuthIdentity::unrestricted("legacy_service");
+        assert_eq!(auth_static.name(), "legacy_service");
+        assert!(auth_static.is_unrestricted());
+        assert!(auth_static.scopes().is_none());
+        assert!(!auth_static.has_owner());
+        assert!(auth_static.owner().is_none());
+        assert!(auth_static.owner_id().is_none());
+        assert!(auth_static.issuer().is_none());
+        assert!(auth_static.subject().is_none());
+        assert!(auth_static.email_at_write().is_none());
+        assert_eq!(auth_static.owner_identity(), OwnerIdentity::Unknown);
+
+        let legacy_key = auth_static.owner_scoped_key("op_add_drawer").unwrap();
+        assert_eq!(legacy_key.composite_key(), "legacy:op_add_drawer");
+        assert!(!legacy_key.is_authenticated());
+        assert!(legacy_key.is_legacy());
+
+        // 2. AuthenticatedOwnerContext methods and Deref to AuthIdentity
+        let ctx = AuthenticatedOwnerContext::from_identity(auth_owned.clone());
+        assert_eq!(ctx.name(), "alice_display");
+        assert!(ctx.has_owner());
+        assert_eq!(
+            ctx.owner_id().map(|id| id.as_str()),
+            Some("usr_01J8Y000000000000000000001")
+        );
+        assert_eq!(
+            ctx.owner_scoped_key("op_ctx").unwrap().composite_key(),
+            "usr_01J8Y000000000000000000001:op_ctx"
+        );
+        // Deref to AuthIdentity methods
+        assert!(ctx.is_unrestricted());
+        assert_eq!(ctx.auth_identity().name(), "alice_display");
+
+        // 3. Server-side tamper resistance: reject_payload_owner_claim and error mapping
+        assert!(reject_payload_owner_claim::<String>(None).is_ok());
+        let claim_err = reject_payload_owner_claim(Some("spoofed_owner_id")).unwrap_err();
+        assert!(matches!(claim_err, ProvenanceError::UnauthenticatedOwnerClaim(_)));
+
+        // Verify ServerError mapping: converts ProvenanceError into HTTP 400 Bad Request
+        let server_err = ServerError::from(claim_err);
+        let resp = server_err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // 4. Token identity collision-resistance: two tokens with the same display name
+        // but different owners produce distinct OwnerScopedKey composite keys.
+        let owner_a = OwnerMetadata::parse(
+            "usr_01J8Y_ALICE_ID",
+            "https://accounts.google.com",
+            "sub_alice",
+            "alice@example.com",
+        )
+        .unwrap();
+        let owner_b = OwnerMetadata::parse(
+            "usr_01J8Y_BOB_ID",
+            "https://accounts.google.com",
+            "sub_bob",
+            "bob@example.com",
+        )
+        .unwrap();
+
+        let token_entry_a = AuthIdentity::with_owner("shared_agent_name", owner_a);
+        let token_entry_b = AuthIdentity::with_owner("shared_agent_name", owner_b);
+        assert_eq!(token_entry_a.name(), token_entry_b.name());
+
+        let key_a = token_entry_a.owner_scoped_key("tx_100").unwrap();
+        let key_b = token_entry_b.owner_scoped_key("tx_100").unwrap();
+        assert_ne!(key_a.composite_key(), key_b.composite_key());
+        assert_eq!(key_a.composite_key(), "usr_01J8Y_ALICE_ID:tx_100");
+        assert_eq!(key_b.composite_key(), "usr_01J8Y_BOB_ID:tx_100");
+
+        // 5. Integration: router with auth_middleware verifying that caller-asserted
+        // agent fields cannot override owner, demonstrating the reject_payload_owner_claim
+        // helper contract on untyped payloads, and confirming production request boundaries
+        // never accept or derive owner identity from payload fields.
+        let tempdir = TempDir::new().unwrap();
+        let palace_path = tempdir.path().join("palace");
+        let token_file = tempdir.path().join("tokens.json");
+        std::fs::write(
+            &token_file,
+            serde_json::to_string(&serde_json::json!([
+                {
+                    "token": "tok-alice-owner",
+                    "name": "alice_identity",
+                    "enabled": true,
+                    "owner": {
+                        "id": "usr_01J8Y_ALICE_TEST",
+                        "issuer": "https://accounts.google.com",
+                        "subject": "sub_alice_test",
+                        "email_at_write": "alice@test.org"
+                    }
+                },
+                {
+                    "token": "tok-static-admin",
+                    "name": "admin_identity",
+                    "enabled": true
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        restrict_token_file(&token_file);
+
+        let config = AgentPalaceConfig {
+            schema_version: 1,
+            collection_name: "agentpalace_drawers".to_owned(),
+            palace_path,
+            embedding_profile: EmbeddingProfile::Balanced,
+            low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
+            server: ServerRuntimeConfig {
+                bind: "127.0.0.1:8765".parse().unwrap(),
+                token_file: token_file.clone(),
+                checkouts: std::collections::BTreeMap::new(),
+            },
+            federation: FederationRuntimeConfig::default(),
+            maintenance: MaintenanceRuntimeConfig::defaults(),
+        };
+
+        let tokens = TokenRegistry::load(token_file).unwrap();
+        let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
+        let (router, state) = build_router(config, provider, tokens).await.unwrap();
+
+        // Handler demonstrating the helper contract: verifying caller-asserted agent cannot override
+        // server-established owner, and using reject_payload_owner_claim to reject payload-supplied owner claims.
+        async fn test_write_tamper_handler(
+            ctx: AuthenticatedOwnerContext,
+            Json(body): Json<serde_json::Value>,
+        ) -> Result<Json<serde_json::Value>, ServerError> {
+            // Helper contract: check if caller attempted to supply an unauthenticated owner field
+            if let Some(claimed_owner) = body.get("owner") {
+                reject_payload_owner_claim(Some(claimed_owner))?;
+            }
+
+            let caller_claimed_agent = body.get("added_by").and_then(|v| v.as_str());
+            let effective_actor = match caller_claimed_agent {
+                Some(claimed) if claimed != ctx.name() => format!("{}:{claimed}", ctx.name()),
+                _ => ctx.name().to_string(),
+            };
+
+            let op_key = ctx.owner_scoped_key(
+                body.get("operation_id").and_then(|v| v.as_str()).unwrap_or("op_default")
+            )?;
+
+            Ok(Json(serde_json::json!({
+                "effective_actor": effective_actor,
+                "owner_identity": ctx.owner_identity(),
+                "owner_id": ctx.owner_id().map(|id| id.as_str()),
+                "composite_op_key": op_key.composite_key(),
+                "is_authenticated": op_key.is_authenticated(),
+            })))
+        }
+
+        let write_test_router = Router::<Arc<ServerState<DeterministicStubProvider>>>::new()
+            .route("/test/write_tamper", post(test_write_tamper_handler))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                auth_middleware::<DeterministicStubProvider>,
+            ))
+            .with_state(Arc::clone(&state));
+
+        let app = router.merge(write_test_router);
+
+        // A. Owned token write with caller-asserted agent:
+        // Caller claims added_by: "rogue_bot", operation_id: "op_42"
+        let req_a = authed_json_request(
+            Method::POST,
+            "/test/write_tamper",
+            "tok-alice-owner",
+            serde_json::json!({
+                "added_by": "rogue_bot",
+                "operation_id": "op_42"
+            }),
+        );
+        let resp_a = app.clone().oneshot(req_a).await.unwrap();
+        assert_eq!(resp_a.status(), StatusCode::OK);
+        let data_a = body_json(resp_a).await;
+        // The actor was namespaced with the authenticated display name
+        assert_eq!(data_a["effective_actor"], "alice_identity:rogue_bot");
+        // BUT the server-established owner ID and scoped key remain completely uncompromised
+        assert_eq!(data_a["owner_id"], "usr_01J8Y_ALICE_TEST");
+        assert_eq!(data_a["composite_op_key"], "usr_01J8Y_ALICE_TEST:op_42");
+        assert_eq!(data_a["is_authenticated"], true);
+
+        // B. Helper contract demonstration: caller attempts to supply an unauthenticated owner field in payload -> rejected 400 invalid_provenance
+        let req_b = authed_json_request(
+            Method::POST,
+            "/test/write_tamper",
+            "tok-alice-owner",
+            serde_json::json!({
+                "owner": "usr_hacker_forged",
+                "operation_id": "op_43"
+            }),
+        );
+        let resp_b = app.clone().oneshot(req_b).await.unwrap();
+        assert_eq!(resp_b.status(), StatusCode::BAD_REQUEST);
+        let data_b = body_json(resp_b).await;
+        assert_eq!(data_b["code"], "invalid_provenance");
+
+        // C. Static token write: owner is Unknown, operation key is legacy-scoped
+        let req_c = authed_json_request(
+            Method::POST,
+            "/test/write_tamper",
+            "tok-static-admin",
+            serde_json::json!({
+                "added_by": "daemon",
+                "operation_id": "op_static_99"
+            }),
+        );
+        let resp_c = app.clone().oneshot(req_c).await.unwrap();
+        assert_eq!(resp_c.status(), StatusCode::OK);
+        let data_c = body_json(resp_c).await;
+        assert_eq!(data_c["effective_actor"], "admin_identity:daemon");
+        assert_eq!(data_c["owner_id"], serde_json::Value::Null);
+        assert_eq!(data_c["composite_op_key"], "legacy:op_static_99");
+        assert_eq!(data_c["is_authenticated"], false);
+
+        // D. Production route verification: POST /v1/drawers ignores caller-supplied owner field in payload,
+        // namespacing added_by as {identity}:{claimed} and preserving server-established identity.
+        let req_d = authed_json_request(
+            Method::POST,
+            "/v1/drawers",
+            "tok-alice-owner",
+            serde_json::json!({
+                "wing": "wing_provenance",
+                "room": "room_test",
+                "content": "drawer content proving unforgeable provenance",
+                "added_by": "rogue_bot",
+                "owner": "usr_hacker_forged"
+            }),
+        );
+        let resp_d = app.clone().oneshot(req_d).await.unwrap();
+        assert_eq!(resp_d.status(), StatusCode::OK);
+        let data_d = body_json(resp_d).await;
+        assert_eq!(data_d["success"], true);
+        let drawer_id = data_d["drawer_id"].as_str().unwrap();
+
+        // Fetch back drawer and verify effective added_by is namespaced against server-established identity
+        let req_fetch = authed_get(&format!("/v1/drawers/{drawer_id}"), "tok-alice-owner");
+        let resp_fetch = app.clone().oneshot(req_fetch).await.unwrap();
+        assert_eq!(resp_fetch.status(), StatusCode::OK);
+        let data_fetch = body_json(resp_fetch).await;
+        assert_eq!(data_fetch["added_by"], "alice_identity:rogue_bot");
     }
 
     #[test]
