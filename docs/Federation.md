@@ -214,6 +214,13 @@ Federated mutation routes (`POST /v1/drawers`, `DELETE /v1/drawers/{id}`,
 `operation_id`; when present, the server pins the mutation's target identity in
 a receipt table so an idempotent replay — whether from a retried outbox worker
 or a crash-recovered re-apply — lands exactly once and never double-applies.
+Receipt identity is stored as the validated `(authenticated owner ID,
+operation_id)` pair. The same stable owner ID survives credential rotation,
+while different owners may reuse the raw operation ID without replaying one
+another's response. Rows from older installations are migrated into an
+explicit `legacy` scope and remain owner-unknown; they are never assigned to
+an authenticated owner. Pending and completed rows retain the immutable
+provenance envelope supplied with the mutation intent.
 When a crash lands between the storage commit and the change-event append, a
 recovered drawer add or delete also restores the missing `drawer_added`/
 `drawer_deleted` event exactly once — via an atomic append-if-absent — before
