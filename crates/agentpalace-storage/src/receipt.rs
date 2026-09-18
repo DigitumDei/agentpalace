@@ -502,6 +502,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
+    use agentpalace_core::{OwnerScopedKey, ProvenanceEnvelope};
     use super::{
         MutationReceiptStore, NewReceipt, RECEIPT_KIND_DRAWER_ADD, ReceiptOutcome, ReceiptState,
     };

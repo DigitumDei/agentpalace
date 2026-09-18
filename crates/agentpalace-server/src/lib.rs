@@ -2145,7 +2145,7 @@ where
     if !auth.0.allows_wing(Operation::Delete, drawer.wing.as_str()) {
         return Err(ServerError::NotFound(format!("drawer {id} not found")));
     }
-    let identity = auth.0.0;
+    let identity = auth.0.0.clone();
 
     // A pending keyed delete may be recovering after the target id was re-used. The
     // receipt's incarnation marker distinguishes the original row from its replacement;
@@ -2490,7 +2490,7 @@ async fn route_kg_add<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let identity = auth.0.0;
+    let identity = auth.0.0.clone();
     validate_kg_field("subject", &body.subject)?;
     validate_kg_field("predicate", &body.predicate)?;
     validate_kg_field("object", &body.object)?;
@@ -2638,7 +2638,7 @@ async fn route_kg_invalidate<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let identity = auth.0.0;
+    let identity = auth.0.0.clone();
     validate_kg_field("subject", &body.subject)?;
     validate_kg_field("predicate", &body.predicate)?;
     validate_kg_field("object", &body.object)?;
@@ -3110,7 +3110,7 @@ where
     if !auth.0.allows_wing(Operation::Ingest, wing.as_str()) {
         return Err(ServerError::Forbidden);
     }
-    let identity = auth.0.0;
+    let identity = auth.0.0.clone();
     let replication_operation_key = body
         .replication
         .as_ref()

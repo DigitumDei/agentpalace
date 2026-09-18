@@ -67,8 +67,10 @@ use federation::FederationRouter;
 pub use agentpalace_core as core;
 use metrics::PhaseMeter;
 use replication::{
-    OUTBOX_ACTOR, OUTBOX_MAX_ATTEMPTS, ReplicationMutation, expect_applied, run_replication_worker,
+    OUTBOX_ACTOR, OUTBOX_MAX_ATTEMPTS, ReplicationMutation, run_replication_worker,
 };
+#[cfg(test)]
+use replication::expect_applied;
 
 // ─── Federation routing semantics ─────────────────────────────────────────────
 //
