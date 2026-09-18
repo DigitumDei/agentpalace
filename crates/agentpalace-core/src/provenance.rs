@@ -32,40 +32,40 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
 
-/// Maximum length in bytes/characters for an [`OwnerId`].
+/// Maximum length in bytes for an [`OwnerId`].
 pub const MAX_OWNER_ID_CHARS: usize = 128;
 
-/// Maximum length in bytes/characters for an [`Issuer`] identifier or URL.
+/// Maximum length in bytes for an [`Issuer`] identifier or URL.
 pub const MAX_ISSUER_CHARS: usize = 256;
 
-/// Maximum length in bytes/characters for a provider-specific [`Subject`].
+/// Maximum length in bytes for a provider-specific [`Subject`].
 pub const MAX_SUBJECT_CHARS: usize = 256;
 
-/// Maximum length in bytes/characters for an [`EmailAtWrite`] address (RFC 5321).
+/// Maximum length in bytes for an [`EmailAtWrite`] address.
 pub const MAX_EMAIL_CHARS: usize = 254;
 
-/// Minimum length in bytes/characters for an [`EmailAtWrite`] address (e.g. `a@b`).
+/// Minimum length in bytes for an [`EmailAtWrite`] address (e.g. `a@b`).
 pub const MIN_EMAIL_CHARS: usize = 3;
 
-/// Maximum length in bytes/characters for a caller-asserted [`AgentName`].
+/// Maximum length in bytes for a caller-asserted [`AgentName`].
 pub const MAX_AGENT_NAME_CHARS: usize = 128;
 
-/// Maximum length in bytes/characters for an original [`SourceAuthor`].
+/// Maximum length in bytes for an original [`SourceAuthor`].
 pub const MAX_SOURCE_AUTHOR_CHARS: usize = 256;
 
-/// Maximum length in bytes/characters for an original [`SourceReference`].
+/// Maximum length in bytes for an original [`SourceReference`].
 pub const MAX_SOURCE_REF_CHARS: usize = 2048;
 
-/// Maximum length in bytes/characters for a [`StorageOrigin`] identifier.
+/// Maximum length in bytes for a [`StorageOrigin`] identifier.
 pub const MAX_ORIGIN_ID_CHARS: usize = 256;
 
-/// Maximum length in bytes/characters for an original record identifier.
+/// Maximum length in bytes for an original record identifier.
 pub const MAX_RECORD_ID_CHARS: usize = 256;
 
-/// Maximum length in bytes/characters for an operation / idempotency receipt key.
+/// Maximum length in bytes for an operation / idempotency receipt key.
 pub const MAX_OPERATION_ID_CHARS: usize = 128;
 
-/// Maximum length in bytes/characters for an RFC 3339 timestamp string.
+/// Maximum length in bytes for an RFC 3339 timestamp string.
 pub const MAX_RFC3339_CHARS: usize = 64;
 
 /// Maximum number of source references attached to a single provenance envelope.
@@ -82,7 +82,7 @@ pub enum ProvenanceError {
     },
 
     /// Value exceeded the maximum allowed length.
-    #[error("{field} exceeds maximum length of {max} characters (got {len})")]
+    #[error("{field} exceeds maximum length of {max} bytes (got {len})")]
     ValueTooLong {
         /// Name of the overflowing field.
         field: &'static str,
@@ -558,6 +558,9 @@ fn validate_email(s: &str) -> Result<(), ProvenanceError> {
 /// Used for human display, auditing, and contact in collaborative environments.
 /// Because emails can change or be recycled, the immutable [`OwnerId`] and
 /// [`Subject`] remain authoritative for identity and authorization.
+/// Validation is intentionally basic and bounded (one `@`, non-empty local and
+/// domain parts, and no ASCII whitespace/control characters); it is not full
+/// RFC 5321 validation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct EmailAtWrite(String);

@@ -406,9 +406,14 @@ Extend authenticated server token entries with optional, validated,
 provider-neutral owner metadata. Generate private upstream credentials per
 owner/effective privilege ceiling, retaining a stable identity across rotation
 for coordination ownership. Only the gateway provisions that private token file.
-Never take owner fields from writable request payloads. Older installations
-without metadata continue to return explicitly unknown ownership; the demo
-rejects ownerless writes.
+Never trust owner fields from writable request payloads. The current
+foundation ignores extra `owner` fields on legacy-compatible REST DTOs and
+provides `reject_payload_owner_claim` for handlers that explicitly validate
+untyped or extended payloads; neither path allows a payload to establish
+authenticated ownership. Older installations without metadata continue to
+return explicitly unknown ownership. Durable owner-scoped persistence and
+receipt integration are deferred to issue #161, while OAuth/device/gateway
+work is deferred to issues #162–#164.
 
 Required storage coverage:
 
