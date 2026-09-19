@@ -221,6 +221,14 @@ another's response. Rows from older installations are migrated into an
 explicit `legacy` scope and remain owner-unknown; they are never assigned to
 an authenticated owner. Pending and completed rows retain the immutable
 provenance envelope supplied with the mutation intent.
+The change log has a separate compatibility boundary: pre-owner-scope rows may
+contain only the raw operation suffix in their details. Recovery first checks
+the owner-scoped key, then falls back to that raw suffix only for rows explicitly
+marked as legacy. The fallback is deduplicated by canonical change identity
+(event type, entity, and raw suffix), so repeated recovery cannot append duplicate
+events; it never lets a legacy suffix match an authenticated owner's scoped receipt
+or cross an owner boundary. New rows always write the full owner-scoped key and do
+not participate in the raw-suffix fallback.
 When a crash lands between the storage commit and the change-event append, a
 recovered drawer add or delete also restores the missing `drawer_added`/
 `drawer_deleted` event exactly once — via an atomic append-if-absent — before

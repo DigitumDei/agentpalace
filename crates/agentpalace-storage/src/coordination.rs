@@ -460,23 +460,23 @@ CREATE TABLE IF NOT EXISTS coordination_tasks (
  revision INTEGER NOT NULL, created_by TEXT NOT NULL, owner TEXT, parent_id TEXT,
  dependencies_json TEXT NOT NULL, budget_json TEXT, lease_expires_at TEXT, expires_at TEXT,
  idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
- wing TEXT NOT NULL DEFAULT 'wing_unscoped',
+ wing TEXT NOT NULL DEFAULT 'wing_unscoped', provenance_json TEXT,
  UNIQUE(created_by, idempotency_key), FOREIGN KEY(parent_id) REFERENCES coordination_tasks(task_id));
 CREATE TABLE IF NOT EXISTS coordination_messages (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE NOT NULL, task_id TEXT NOT NULL,
  sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL, payload_json TEXT NOT NULL,
  envelope_version INTEGER NOT NULL, idempotency_key TEXT NOT NULL, acknowledged_at TEXT,
- acknowledged_by TEXT, created_at TEXT NOT NULL, UNIQUE(sender, idempotency_key),
+ acknowledged_by TEXT, created_at TEXT NOT NULL, provenance_json TEXT, UNIQUE(sender, idempotency_key),
  FOREIGN KEY(task_id) REFERENCES coordination_tasks(task_id));
 CREATE INDEX IF NOT EXISTS idx_coordination_inbox ON coordination_messages(recipient, sequence);
 CREATE TABLE IF NOT EXISTS coordination_artifacts (
  artifact_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, created_by TEXT NOT NULL, role TEXT NOT NULL,
  media_type TEXT NOT NULL, content TEXT NOT NULL, content_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL,
- created_at TEXT NOT NULL, UNIQUE(created_by, idempotency_key),
+ created_at TEXT NOT NULL, provenance_json TEXT, UNIQUE(created_by, idempotency_key),
  FOREIGN KEY(task_id) REFERENCES coordination_tasks(task_id));
 CREATE TABLE IF NOT EXISTS coordination_results (
  result_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, created_by TEXT NOT NULL,
- payload_json TEXT NOT NULL, idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL,
+ payload_json TEXT NOT NULL, idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL, provenance_json TEXT,
  UNIQUE(created_by, idempotency_key), FOREIGN KEY(task_id) REFERENCES coordination_tasks(task_id));
 CREATE TABLE IF NOT EXISTS coordination_events (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL, entity_type TEXT NOT NULL,
@@ -510,6 +510,10 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             "TEXT NOT NULL DEFAULT 'wing_unscoped'",
         )?;
         add_column_if_missing(&tx, "coordination_tasks", "executor_affinity", "TEXT")?;
+        add_column_if_missing(&tx, "coordination_tasks", "provenance_json", "TEXT")?;
+        add_column_if_missing(&tx, "coordination_messages", "provenance_json", "TEXT")?;
+        add_column_if_missing(&tx, "coordination_artifacts", "provenance_json", "TEXT")?;
+        add_column_if_missing(&tx, "coordination_results", "provenance_json", "TEXT")?;
         add_column_if_missing(&tx, "coordination_tasks", "sequence", "INTEGER")?;
         // A separate AUTOINCREMENT allocator prevents sequence reuse after deletions/VACUUM.
         // Backfill and trigger installation share the schema upgrade's write lock.
@@ -646,7 +650,7 @@ END;
         }
         let now = OffsetDateTime::now_utc();
         let id = format!("task_{}", Uuid::new_v4().simple());
-        tx.execute("INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,idempotency_key,created_at,updated_at,wing) VALUES (?1,?2,?3,?12,0,?4,NULL,?5,?6,?7,NULL,?8,?9,?10,?10,?11)", params![id,input.title,input.description,input.created_by,input.parent_id,serde_json::to_string(&input.dependencies)?,input.budget.as_ref().map(serde_json::to_string).transpose()?,format_time_opt(input.expires_at)?,input.idempotency_key,format_time(now)?,wing,initial_state.as_str()])?;
+        tx.execute("INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,idempotency_key,created_at,updated_at,wing,provenance_json) VALUES (?1,?2,?3,?12,0,?4,NULL,?5,?6,?7,NULL,?8,?9,?10,?10,?11,NULL)", params![id,input.title,input.description,input.created_by,input.parent_id,serde_json::to_string(&input.dependencies)?,input.budget.as_ref().map(serde_json::to_string).transpose()?,format_time_opt(input.expires_at)?,input.idempotency_key,format_time(now)?,wing,initial_state.as_str()])?;
         let details = is_import.then(|| serde_json::json!({"imported": true}));
         append_event(
             &tx,
@@ -1007,7 +1011,7 @@ END;
         let task = require_task(&tx, &input.task_id)?;
         let now = OffsetDateTime::now_utc();
         let id = format!("message_{}", Uuid::new_v4().simple());
-        tx.execute("INSERT INTO coordination_messages(message_id,task_id,sender,recipient,kind,payload_json,envelope_version,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![id,input.task_id,input.sender,input.recipient,input.kind,serde_json::to_string(&input.payload)?,input.envelope_version,input.idempotency_key,format_time(now)?])?;
+        tx.execute("INSERT INTO coordination_messages(message_id,task_id,sender,recipient,kind,payload_json,envelope_version,idempotency_key,created_at,provenance_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL)",params![id,input.task_id,input.sender,input.recipient,input.kind,serde_json::to_string(&input.payload)?,input.envelope_version,input.idempotency_key,format_time(now)?])?;
         append_event(
             &tx,
             "message",
@@ -1166,7 +1170,7 @@ END;
         let id = format!("artifact_{}", Uuid::new_v4().simple());
         let hash = blake3::hash(input.content.as_bytes()).to_hex().to_string();
         tx.execute(
-            "INSERT INTO coordination_artifacts(artifact_id,task_id,created_by,role,media_type,content,content_hash,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            "INSERT INTO coordination_artifacts(artifact_id,task_id,created_by,role,media_type,content,content_hash,idempotency_key,created_at,provenance_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 id,
                 input.task_id,
@@ -1176,7 +1180,8 @@ END;
                 input.content,
                 hash,
                 input.idempotency_key,
-                format_time(now)?
+                format_time(now)?,
+                Option::<String>::None
             ],
         )?;
         append_event(
@@ -1217,8 +1222,8 @@ END;
         let now = OffsetDateTime::now_utc();
         let id = format!("result_{}", Uuid::new_v4().simple());
         tx.execute(
-            "INSERT INTO coordination_results(result_id,task_id,created_by,payload_json,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![id, input.task_id, input.created_by, serde_json::to_string(&input.payload)?, input.idempotency_key, format_time(now)?],
+            "INSERT INTO coordination_results(result_id,task_id,created_by,payload_json,idempotency_key,created_at,provenance_json) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![id, input.task_id, input.created_by, serde_json::to_string(&input.payload)?, input.idempotency_key, format_time(now)?, Option::<String>::None],
         )?;
         append_event(
             &tx,
@@ -1578,7 +1583,7 @@ fn task_wing(tx: &Transaction<'_>, task_id: &str) -> Result<String> {
         .ok_or_else(|| StorageError::Invariant(format!("task `{task_id}`{NOT_FOUND_SUFFIX}")))
 }
 fn get_task_conn(conn: &Connection, id: &str) -> Result<Option<Task>> {
-    let mut s=conn.prepare("SELECT task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,created_at,updated_at,wing,executor_affinity FROM coordination_tasks WHERE task_id=?1")?;
+    let mut s=conn.prepare("SELECT task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,created_at,updated_at,wing,executor_affinity,provenance_json FROM coordination_tasks WHERE task_id=?1")?;
     s.query_row([id], task_row).optional().map_err(Into::into)
 }
 fn get_task_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<Task>> {
@@ -1641,7 +1646,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     })
 }
 fn get_message_conn(conn: &Connection, id: &str) -> Result<Option<Message>> {
-    let mut s=conn.prepare("SELECT message_id,sequence,task_id,sender,recipient,kind,payload_json,envelope_version,acknowledged_at,acknowledged_by,created_at FROM coordination_messages WHERE message_id=?1")?;
+    let mut s=conn.prepare("SELECT message_id,sequence,task_id,sender,recipient,kind,payload_json,envelope_version,acknowledged_at,acknowledged_by,created_at,provenance_json FROM coordination_messages WHERE message_id=?1")?;
     s.query_row([id], message_row).optional().map_err(Into::into)
 }
 fn get_message_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<Message>> {
@@ -1675,7 +1680,7 @@ fn artifact_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
     })
 }
 fn get_artifact_conn(conn: &Connection, id: &str) -> Result<Option<Artifact>> {
-    let mut s=conn.prepare("SELECT artifact_id,task_id,created_by,role,media_type,content,content_hash,created_at FROM coordination_artifacts WHERE artifact_id=?1")?;
+    let mut s=conn.prepare("SELECT artifact_id,task_id,created_by,role,media_type,content,content_hash,created_at,provenance_json FROM coordination_artifacts WHERE artifact_id=?1")?;
     s.query_row([id], artifact_row).optional().map_err(Into::into)
 }
 fn get_artifact_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<Artifact>> {
@@ -1702,7 +1707,7 @@ fn result_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskResult> {
 }
 fn get_result_conn(conn: &Connection, id: &str) -> Result<Option<TaskResult>> {
     let mut statement = conn.prepare(
-        "SELECT result_id,task_id,created_by,payload_json,created_at FROM coordination_results WHERE result_id=?1",
+        "SELECT result_id,task_id,created_by,payload_json,created_at,provenance_json FROM coordination_results WHERE result_id=?1",
     )?;
     statement.query_row([id], result_row).optional().map_err(Into::into)
 }
