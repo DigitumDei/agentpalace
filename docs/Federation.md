@@ -74,7 +74,7 @@ it all locally for dev testing.
 ### OAuth remote authentication
 
 Bearer-token remotes remain unchanged. Library callers may instead construct a remote with
-`RemoteEndpoint::with_oauth` and an `OAuthConfig { client_id, allow_in_memory, .. }`. The client
+`RemoteEndpoint::with_oauth` and an `OAuthConfig { client_id, account, allow_in_memory, allow_loopback_demo, .. }`. The client
 preserves a server's `401` Bearer `resource_metadata` challenge and exposes it to the caller;
 background/MCP requests return `authentication-required` guidance and never open a browser.
 Interactive login is an explicit caller action. Discovery accepts RFC 9728 protected-resource
@@ -82,8 +82,10 @@ metadata followed by RFC 8414 authorization-server metadata, requires the config
 and advertised issuer to match, and rejects endpoint changes or non-HTTPS URLs. HTTP is permitted
 only for an explicitly opted-in exact loopback demo origin; the native callback is loopback-only.
 PKCE uses S256 and callback state is mandatory. Credentials must be supplied by a secure
-`TokenStore`; the included in-memory store is an explicit volatile/test choice and no token is
-placed in ordinary config, MCP output, logs, command arguments, or URLs.
+`TokenStore` passed through the OAuth configuration; the included in-memory store is an explicit
+volatile/test choice. Store keys include resource, issuer, client ID, and optional account. If
+secure storage is unavailable, login reports it without retaining the grant. No token is placed in
+ordinary config, MCP output, logs, command arguments, or URLs.
 
 ## Part 1 — Running a server (the hub)
 

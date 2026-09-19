@@ -222,8 +222,8 @@ async fn mcp_server_with_hub_multi_default(
             ResolvedRemote {
                 name: (*name).to_owned(),
                 url: (*url).to_owned(),
-        token: Some(TEST_TOKEN.to_owned()),
-        timeout: Duration::from_secs(5),
+                token: Some(TEST_TOKEN.to_owned()),
+                timeout: Duration::from_secs(5),
             },
         );
     }

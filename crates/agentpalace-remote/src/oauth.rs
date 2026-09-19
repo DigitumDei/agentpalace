@@ -15,13 +15,23 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 /// Public client configuration for an OAuth native application.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthConfig {
     /// Registered public client identifier.
     pub client_id: String,
+    /// Optional account label used to isolate multiple grants.
+    #[serde(default)]
+    pub account: Option<String>,
     /// Explicitly permit volatile in-memory credentials instead of an OS credential store.
     #[serde(default)]
     pub allow_in_memory: bool,
+    /// Explicitly allow the exact configured loopback origin for standards-compliant test issuers.
+    #[serde(default)]
+    pub allow_loopback_demo: bool,
+    /// Optional host-provided secure credential backend. This is intentionally skipped by
+    /// serde: credential implementations and secrets never belong in config files.
+    #[serde(skip)]
+    pub token_store: Option<SharedTokenStore>,
     /// Optional absolute login timeout (defaults to five minutes).
     #[serde(default = "default_login_timeout_seconds")]
     pub login_timeout_seconds: u64,
@@ -73,34 +83,50 @@ pub struct OAuthSession {
     pub resource: String,
     pub issuer: String,
     pub client_id: String,
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 /// Storage boundary for credentials. Implementations must scope records by all session identity
 /// fields and must not use ordinary config files for secret material.
 #[async_trait::async_trait]
-pub trait TokenStore: Send + Sync {
-    async fn load(&self, resource: &str, issuer: &str, client_id: &str) -> Option<OAuthSession>;
+pub trait TokenStore: Send + Sync + std::fmt::Debug {
+    async fn load(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Option<OAuthSession>;
     async fn save(&self, session: OAuthSession) -> Result<(), String>;
-    async fn clear(&self, resource: &str, issuer: &str, client_id: &str);
+    async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>);
 }
 
 /// Explicit volatile credential storage for offline/test use.
 #[derive(Debug, Default)]
 pub struct InMemoryTokenStore(Mutex<Option<OAuthSession>>);
 
+/// A store used when the host has no configured OS credential backend. It makes the failure
+/// explicit instead of silently persisting tokens in a config file or process arguments.
+#[derive(Debug, Default)]
+pub struct UnavailableTokenStore;
+
+#[async_trait::async_trait]
+impl TokenStore for UnavailableTokenStore {
+    async fn load(&self, _resource: &str, _issuer: &str, _client_id: &str, _account: Option<&str>) -> Option<OAuthSession> { None }
+    async fn save(&self, _session: OAuthSession) -> Result<(), String> {
+        Err("secure OS credential storage is unavailable; enable explicit in-memory mode".to_owned())
+    }
+    async fn clear(&self, _resource: &str, _issuer: &str, _client_id: &str, _account: Option<&str>) {}
+}
+
 #[async_trait::async_trait]
 impl TokenStore for InMemoryTokenStore {
-    async fn load(&self, resource: &str, issuer: &str, client_id: &str) -> Option<OAuthSession> {
+    async fn load(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Option<OAuthSession> {
         let value = self.0.lock().await.clone()?;
-        (value.resource == resource && value.issuer == issuer && value.client_id == client_id).then_some(value)
+        (value.resource == resource && value.issuer == issuer && value.client_id == client_id && value.account.as_deref() == account).then_some(value)
     }
     async fn save(&self, session: OAuthSession) -> Result<(), String> {
         *self.0.lock().await = Some(session);
         Ok(())
     }
-    async fn clear(&self, resource: &str, issuer: &str, client_id: &str) {
+    async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) {
         let mut guard = self.0.lock().await;
-        if guard.as_ref().is_some_and(|s| s.resource == resource && s.issuer == issuer && s.client_id == client_id) {
+        if guard.as_ref().is_some_and(|s| s.resource == resource && s.issuer == issuer && s.client_id == client_id && s.account.as_deref() == account) {
             *guard = None;
         }
     }
@@ -141,8 +167,9 @@ pub fn validate_metadata(resource: &ProtectedResourceMetadata, server: &Authoriz
     if !resource.authorization_servers.iter().any(|candidate| candidate.trim_end_matches('/') == server.issuer.trim_end_matches('/')) {
         return Err("authorization-server issuer is not advertised by the protected resource".to_owned());
     }
-    if issuer.origin() != reqwest::Url::parse(&server.authorization_endpoint).map_err(|_| "invalid authorization endpoint".to_owned())?.origin()
-        && issuer.host_str() != reqwest::Url::parse(&server.authorization_endpoint).map_err(|_| "invalid authorization endpoint".to_owned())?.host_str() {
+    let authorization_endpoint = reqwest::Url::parse(&server.authorization_endpoint).map_err(|_| "invalid authorization endpoint".to_owned())?;
+    let token_endpoint = reqwest::Url::parse(&server.token_endpoint).map_err(|_| "invalid token endpoint".to_owned())?;
+    if issuer.origin() != authorization_endpoint.origin() || issuer.origin() != token_endpoint.origin() {
         return Err("authorization endpoint is unrelated to the discovered issuer".to_owned());
     }
     let _ = validate_oauth_url(&server.authorization_endpoint, configured_origin, allow_loopback_demo)?;
@@ -181,7 +208,7 @@ pub async fn discover_metadata(
         .json::<ProtectedResourceMetadata>().await.map_err(|_| "protected-resource metadata is malformed".to_owned())?;
     let issuer = protected.authorization_servers.first().ok_or_else(|| "protected-resource metadata advertises no authorization server".to_owned())?;
     let issuer_url = validate_oauth_url(issuer, configured_origin, allow_loopback_demo)?;
-    let server_url = issuer_url.join(".well-known/oauth-authorization-server").map_err(|_| "cannot construct authorization-server metadata URL".to_owned())?;
+    let server_url = well_known_url(&issuer_url)?;
     let server = http.get(server_url).send().await.map_err(|_| "authorization-server metadata is unreachable".to_owned())?
         .error_for_status().map_err(|_| "authorization-server metadata was rejected".to_owned())?
         .json::<AuthorizationServerMetadata>().await.map_err(|_| "authorization-server metadata is malformed".to_owned())?;
@@ -198,8 +225,10 @@ pub fn authorization_url(
     state: &str,
     challenge: &str,
     resource: &str,
+    allow_loopback_demo: bool,
 ) -> Result<reqwest::Url, String> {
-    let mut url = validate_oauth_url(&metadata.authorization_endpoint, &reqwest::Url::parse(resource).map_err(|_| "invalid resource URL".to_owned())?, false)?;
+    let resource_url = reqwest::Url::parse(resource).map_err(|_| "invalid resource URL".to_owned())?;
+    let mut url = validate_oauth_url(&metadata.authorization_endpoint, &resource_url, allow_loopback_demo)?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", &config.client_id)
@@ -224,7 +253,7 @@ pub async fn browser_login(
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
     let (verifier, challenge) = new_pkce_pair();
     let state = new_state();
-    let url = authorization_url(metadata, config, &redirect_uri, &state, &challenge, resource)?;
+    let url = authorization_url(metadata, config, &redirect_uri, &state, &challenge, resource, config.allow_loopback_demo)?;
     open_browser(url.as_str())?;
     let result = tokio::time::timeout(login_timeout(config), async {
         let (mut socket, _) = listener.accept().await.map_err(|_| "OAuth callback was not accepted".to_owned())?;
@@ -233,6 +262,7 @@ pub async fn browser_login(
         let request = std::str::from_utf8(&bytes[..count]).map_err(|_| "OAuth callback was not valid HTTP".to_owned())?;
         let target = request.lines().next().and_then(|line| line.split_whitespace().nth(1)).ok_or_else(|| "OAuth callback request was malformed".to_owned())?;
         let callback = reqwest::Url::parse(&format!("http://127.0.0.1{target}")).map_err(|_| "OAuth callback URL was malformed".to_owned())?;
+        if callback.path() != "/callback" || callback.host_str() != Some("127.0.0.1") { return Err("OAuth callback was outside the constrained loopback path".to_owned()); }
         let returned_state = callback.query_pairs().find(|(key, _)| key == "state").map(|(_, value)| value.into_owned()).unwrap_or_default();
         validate_callback_state(&state, &returned_state)?;
         let code = callback.query_pairs().find(|(key, _)| key == "code").map(|(_, value)| value.into_owned()).ok_or_else(|| "OAuth consent did not return an authorization code".to_owned())?;
@@ -245,9 +275,18 @@ pub async fn browser_login(
             .json::<TokenResponse>().await.map_err(|_| "OAuth token response was malformed".to_owned())?;
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 24\r\nContent-Type: text/plain\r\n\r\nLogin complete; you may close this window.";
         let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response).await;
-        Ok::<_, String>(OAuthSession { access_token: body.access_token, refresh_token: body.refresh_token, expires_at: body.expires_in.map(|seconds| now_seconds().saturating_add(seconds)), resource: resource.to_owned(), issuer: metadata.issuer.clone(), client_id: config.client_id.clone() })
+        Ok::<_, String>(OAuthSession { access_token: body.access_token, refresh_token: body.refresh_token, expires_at: body.expires_in.map(|seconds| now_seconds().saturating_add(seconds)), resource: resource.to_owned(), issuer: metadata.issuer.clone(), client_id: config.client_id.clone(), account: config.account.clone() })
     }).await.map_err(|_| "OAuth login timed out".to_owned())??;
     Ok(result)
+}
+
+/// RFC 8414 §3.1 discovery URL. The suffix is inserted after the authority while preserving
+/// a path-based issuer identifier (for example `/tenant/.well-known/...`).
+pub fn well_known_url(issuer: &reqwest::Url) -> Result<reqwest::Url, String> {
+    let mut url = issuer.clone();
+    let path = url.path().trim_end_matches('/');
+    url.set_path(&format!("{path}/.well-known/oauth-authorization-server"));
+    Ok(url)
 }
 
 #[derive(Debug, Deserialize)]
@@ -318,5 +357,26 @@ mod tests {
     fn non_loopback_http_is_rejected() {
         let origin = reqwest::Url::parse("https://hub.example").expect("test URL");
         assert!(validate_oauth_url("http://issuer.example/token", &origin, true).is_err());
+    }
+    #[test]
+    fn well_known_preserves_path_based_issuer() {
+        let issuer = reqwest::Url::parse("https://issuer.example/tenant-a").expect("test URL");
+        assert_eq!(well_known_url(&issuer).expect("well-known URL").as_str(), "https://issuer.example/tenant-a/.well-known/oauth-authorization-server");
+    }
+    #[test]
+    fn loopback_demo_requires_explicit_opt_in() {
+        let origin = reqwest::Url::parse("http://127.0.0.1:8765").expect("test URL");
+        assert!(validate_oauth_url("http://127.0.0.1:8765/token", &origin, true).is_ok());
+        assert!(validate_oauth_url("http://127.0.0.1:8766/token", &origin, true).is_err());
+        assert!(validate_oauth_url("http://127.0.0.1:8765/token", &origin, false).is_err());
+    }
+    #[tokio::test]
+    async fn volatile_store_is_scoped_and_unavailable_store_is_explicit() {
+        let store = InMemoryTokenStore::default();
+        let session = OAuthSession { access_token: "access".to_owned(), refresh_token: None, expires_at: None, resource: "https://resource".to_owned(), issuer: "https://issuer".to_owned(), client_id: "client".to_owned(), account: None };
+        store.save(session.clone()).await.expect("volatile store");
+        assert!(store.load("https://resource", "https://issuer", "client", None).await.is_some());
+        assert!(store.load("https://other", "https://issuer", "client", None).await.is_none());
+        assert!(UnavailableTokenStore.save(session).await.is_err());
     }
 }

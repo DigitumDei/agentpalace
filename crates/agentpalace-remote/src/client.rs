@@ -60,6 +60,7 @@ pub struct RemoteClient {
     token: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
     oauth: Option<crate::OAuthConfig>,
     oauth_session: std::sync::Arc<tokio::sync::Mutex<Option<crate::OAuthSession>>>,
+    token_store: crate::SharedTokenStore,
     login_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// Shared reqwest HTTP client (connection-pool aware).
     http: reqwest::Client,
@@ -106,12 +107,20 @@ impl RemoteClient {
                 message: format!("failed to build HTTP client: {e}"),
             })?;
 
+        let token_store: crate::SharedTokenStore = endpoint.oauth.as_ref().and_then(|config| config.token_store.clone()).unwrap_or_else(|| {
+            if endpoint.oauth.as_ref().is_some_and(|config| config.allow_in_memory) {
+                std::sync::Arc::new(crate::InMemoryTokenStore::default())
+            } else {
+                std::sync::Arc::new(crate::UnavailableTokenStore)
+            }
+        });
         Ok(Self {
             name: endpoint.name,
             base_url,
             token: std::sync::Arc::new(tokio::sync::Mutex::new(endpoint.token)),
             oauth: endpoint.oauth,
             oauth_session: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            token_store,
             login_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             http,
             info: tokio::sync::OnceCell::new(),
@@ -431,16 +440,45 @@ impl RemoteClient {
         let config = self.oauth.as_ref().ok_or_else(|| RemoteError::InvalidConfig { remote: self.name.clone(), message: "OAuth login requested for a bearer-token remote".to_owned() })?;
         let _guard = self.login_lock.lock().await;
         let session = crate::browser_login(&self.http, metadata, config, resource).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
+        self.token_store.save(session.clone()).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
         *self.token.lock().await = Some(session.access_token.clone());
         *self.oauth_session.lock().await = Some(session);
         Ok(())
+    }
+
+    /// Discover metadata from a preserved RFC 9728 challenge and perform one explicit browser
+    /// login. This is the intended foreground entry point; background calls only return the
+    /// challenge in [`RemoteError::AuthenticationRequired`].
+    pub async fn login_from_challenge(&self, resource_metadata: &str) -> Result<()> {
+        let config = self.oauth.as_ref().ok_or_else(|| RemoteError::InvalidConfig { remote: self.name.clone(), message: "OAuth login requested for a bearer-token remote".to_owned() })?;
+        let resource = self.base_url.clone();
+        let (protected, metadata) = crate::discover_metadata(&self.http, resource_metadata, &resource, &resource, config.allow_loopback_demo)
+            .await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: Some(resource_metadata.to_owned()) })?;
+        self.login(&metadata, &protected.resource).await
+    }
+
+    /// Load a previously authorized grant for the exact resource/issuer/client/account tuple.
+    /// Returns `false` when the secure store is unavailable or has no matching grant.
+    pub async fn load_stored_session(&self, resource: &str, issuer: &str) -> bool {
+        let Some(config) = self.oauth.as_ref() else { return false };
+        let Some(session) = self.token_store.load(resource, issuer, &config.client_id, config.account.as_deref()).await else { return false };
+        *self.token.lock().await = Some(session.access_token.clone());
+        *self.oauth_session.lock().await = Some(session);
+        true
     }
 
     /// Refresh the current grant once, replacing the access and rotating refresh token together.
     pub async fn refresh(&self, metadata: &crate::AuthorizationServerMetadata) -> Result<()> {
         let _guard = self.login_lock.lock().await;
         let current = self.oauth_session.lock().await.clone().ok_or_else(|| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: "run the explicit remote OAuth login command".to_owned(), resource_metadata: None })?;
-        let session = crate::refresh(&self.http, metadata, &current).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
+        let session = match crate::refresh(&self.http, metadata, &current).await {
+            Ok(session) => session,
+            Err(message) => {
+                self.token_store.clear(&current.resource, &current.issuer, &current.client_id, current.account.as_deref()).await;
+                return Err(RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None });
+            }
+        };
+        self.token_store.save(session.clone()).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
         *self.token.lock().await = Some(session.access_token.clone());
         *self.oauth_session.lock().await = Some(session);
         Ok(())
@@ -451,8 +489,12 @@ impl RemoteClient {
     pub async fn logout(&self, metadata: Option<&crate::AuthorizationServerMetadata>) -> Result<()> {
         let current = self.oauth_session.lock().await.take();
         *self.token.lock().await = None;
-        if let (Some(metadata), Some(session)) = (metadata, current) {
-            crate::revoke(&self.http, metadata, &session).await.map_err(|message| RemoteError::RemoteRejected { remote: self.name.clone(), status: 401, body: message })?;
+        if let Some(session) = current {
+            let result = if let Some(metadata) = metadata {
+                crate::revoke(&self.http, metadata, &session).await
+            } else { Ok(()) };
+            self.token_store.clear(&session.resource, &session.issuer, &session.client_id, session.account.as_deref()).await;
+            result.map_err(|message| RemoteError::RemoteRejected { remote: self.name.clone(), status: 401, body: message })?;
         }
         Ok(())
     }

@@ -582,10 +582,12 @@ The optional `federation` section of `~/.agentpalace/config.json` controls routi
 - `timeout_ms`: HTTP request timeout in milliseconds. Default: `5000`
 
 OAuth is not represented by a token or secret field in `config.json`. Library callers select
-provider-neutral public-client mode with `RemoteEndpoint::with_oauth`; its `client_id` is not a
-secret. The interactive login operation is explicit, while unattended calls return an
-authentication-required result. Credential persistence is supplied by a secure `TokenStore`, or
-an explicitly enabled volatile session for tests/offline use.
+provider-neutral public-client mode with `RemoteEndpoint::with_oauth`; its `client_id` and optional
+`account` label are not secrets. The interactive login operation is explicit, while unattended calls
+return an authentication-required result. Credential persistence is supplied by a secure
+`TokenStore` passed in the OAuth configuration, or an explicitly enabled volatile session for
+tests/offline use. `allow_loopback_demo` is required for an exact loopback issuer; other discovered
+metadata and endpoints must use HTTPS.
 
 Validation:
 - Duplicate `name` values across remotes fail config load.
