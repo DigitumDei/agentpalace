@@ -7631,7 +7631,9 @@ mod tests {
         let bob_payload = json!({
             "wing": "wing_route_isolation",
             "room": "receipt-boundary",
-            "content": "owner bob's independently committed drawer",
+            // Keep the two mutations deliberately unrelated so the real duplicate-content
+            // guard does not reject Bob before the owner-scoped receipt boundary is exercised.
+            "content": "bob's route isolation fixture: q7m-violet-orbit-4319",
             "added_by": shared_agent,
             "drawer_id": "route-isolation-owner-bob",
             "operation_id": operation_id,
