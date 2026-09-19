@@ -3611,6 +3611,7 @@ async fn kg_invalidate_both_replication_fails_with_remote_rejection() {
             name: "hub".to_owned(),
             url: hub_url,
             token: Some(bad_token.to_owned()),
+            oauth: None,
             timeout: Duration::from_secs(5),
         },
     );

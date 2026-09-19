@@ -4023,6 +4023,7 @@ mod tests {
             name: name.to_owned(),
             url: "https://test.example".to_owned(),
             token: None,
+            oauth: None,
             timeout: Duration::from_secs(5),
         }
     }
