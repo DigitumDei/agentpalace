@@ -701,7 +701,9 @@ mod tests {
             )),
             agentpalace_core::RecordingTime::now_utc().unwrap(),
             agentpalace_core::StorageOrigin::local_default(),
-        );
+        )
+        .with_operation_key(key.clone())
+        .unwrap();
         let mut input = receipt("provenance-op", "hash");
         input.operation_key = key.clone();
         input.provenance = Some(provenance.clone());
