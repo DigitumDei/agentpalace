@@ -227,6 +227,12 @@ diagnostics and substantive final review establish successful publication, but t
 expected HTML completion marker was absent, so the `claude-review` check is not claimed
 as passed.
 
+The immutable source assertions for that head are: the receipt provenance test uses an
+explicit `agentpalace_core::OwnerId`, the empty-key regression calls
+`OwnerScopedKey::new(None, "")` directly and checks `EmptyField { field: "raw_key" }`,
+and the persisted provenance is created with `.with_operation_key(key.clone())` before
+the receipt is begun. No source change or CI rerun is implied by this evidence record.
+
 ## Supplemental Windows validation — bounded drawer reads (2026-09-11)
 
 Issues #136 and #39 were tested locally on `fix/bounded-wakeup-taxonomy` with
