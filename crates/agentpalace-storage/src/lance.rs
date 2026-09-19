@@ -157,6 +157,7 @@ impl LanceDrawerStore {
             Field::new("view_merge_base", DataType::Utf8, true),
             Field::new("view_worktree_id", DataType::Utf8, true),
             Field::new("view_path_state", DataType::Utf8, true),
+            Field::new("provenance_json", DataType::Utf8, true),
             Field::new(
                 "embedding",
                 DataType::FixedSizeList(
@@ -738,6 +739,7 @@ fn layer_metadata_from_batch(batch: &RecordBatch) -> Result<Vec<DrawerRecord>> {
                 embedding: Vec::new(),
                 locator: None,
                 view_metadata: None,
+                provenance: None,
             })
         })
         .collect()
@@ -911,6 +913,12 @@ fn drawers_to_reader(
                     .iter()
                     .map(|drawer| drawer.view_metadata.as_ref().map(|vm| vm.path_state.as_str()))
                     .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                drawers
+                    .iter()
+                    .map(|drawer| drawer.provenance.as_ref().map(serde_json::to_string).transpose())
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
             )),
             Arc::new(FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
                 drawers.iter().map(|drawer| {
@@ -1092,6 +1100,7 @@ fn records_from_batches(batches: &[RecordBatch]) -> Result<Vec<DrawerRecord>> {
             batch.column_by_name("view_worktree_id").map(|col| col.as_string::<i32>());
         let view_path_state =
             batch.column_by_name("view_path_state").map(|col| col.as_string::<i32>());
+        let provenance = batch.column_by_name("provenance_json").map(|col| col.as_string::<i32>());
         let embedding = batch
             .column_by_name("embedding")
             .ok_or_else(|| StorageError::Invariant("missing `embedding` column".to_owned()))?
@@ -1145,6 +1154,11 @@ fn records_from_batches(batches: &[RecordBatch]) -> Result<Vec<DrawerRecord>> {
                     view_worktree_id,
                     view_path_state,
                 ),
+                provenance: provenance
+                    .and_then(|values| (!values.is_null(row)).then(|| values.value(row)))
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|error| StorageError::Invariant(format!("invalid drawer provenance: {error}")))?,
             });
         }
     }
@@ -1325,6 +1339,7 @@ mod tests {
             embedding: embedding(seed),
             locator: None,
             view_metadata: None,
+            provenance: None,
         }
     }
 
@@ -1779,6 +1794,7 @@ mod tests {
             embedding: embedding([0.1, 0.2, 0.3, 0.4]),
             locator: Some(locator_with_commit.clone()),
             view_metadata: None,
+            provenance: None,
         };
         store.put_drawers(&[new_row], DuplicateStrategy::Error).await.unwrap();
 
@@ -1823,6 +1839,7 @@ mod tests {
             embedding: embedding([0.2, 0.3, 0.4, 0.5]),
             locator: Some(locator_no_commit),
             view_metadata: None,
+            provenance: None,
         };
         store.put_drawers(&[row_no_commit], DuplicateStrategy::Error).await.unwrap();
 

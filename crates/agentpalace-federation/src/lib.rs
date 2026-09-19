@@ -170,6 +170,9 @@ pub struct RemoteDrawerResult {
     /// Agent name recorded at ingest time.
     #[serde(default)]
     pub added_by: Option<String>,
+    /// Redacted durable provenance, or absent for legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Value>,
     /// True when the drawer's mined source file changed since mining
     /// (locator-backed rows).  Absent unless true; `serde(default)` keeps old
     /// servers/clients wire-compatible.
@@ -1187,6 +1190,7 @@ mod tests {
                 content_hash: None,
                 filed_at: None,
                 added_by: None,
+                provenance: None,
                 stale: false,
             }],
         };

@@ -3782,6 +3782,7 @@ mod tests {
                     content_hash: v["content_hash"].as_str().map(|s| s.to_owned()),
                     filed_at: None,
                     added_by: None,
+                    provenance: None,
                     stale: false,
                 })
                 .collect();

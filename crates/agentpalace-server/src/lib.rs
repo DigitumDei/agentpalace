@@ -1719,6 +1719,7 @@ where
             content_hash: None,
             filed_at: None,
             added_by: None,
+            provenance: result.provenance,
             stale: result.stale,
         })
         .collect();
@@ -1913,7 +1914,7 @@ where
     };
     let source_file = body.source_file.unwrap_or_default();
     let added_by = effective_added_by;
-    let record = build_drawer_record(
+    let mut record = build_drawer_record(
         &state,
         drawer_id.clone(),
         wing.clone(),
@@ -1925,6 +1926,7 @@ where
         now,
     )
     .await?;
+    record.provenance = Some(domain_provenance(&auth.0)?);
 
     state
         .storage
@@ -3652,6 +3654,7 @@ where
                 embedding,
                 locator,
                 view_metadata: Some(view_metadata.clone()),
+                provenance: None,
             });
         }
 
@@ -5057,6 +5060,7 @@ fn drawer_record_to_json_with_stale(drawer: &DrawerRecord, stale: bool) -> Value
         "filed_at": format_rfc3339(drawer.filed_at).ok(),
         "content": drawer.content,
         "content_hash": drawer.content_hash,
+        "provenance": drawer.provenance.as_ref().map(|value| value.response()),
     });
     if stale {
         v["stale"] = json!(true);
@@ -5151,6 +5155,7 @@ where
         embedding,
         locator: None,
         view_metadata: None,
+        provenance: None,
     })
 }
 

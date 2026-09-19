@@ -4374,6 +4374,7 @@ where
             embedding,
             locator: None,
             view_metadata: None,
+            provenance: None,
         })
     }
 
@@ -6766,6 +6767,7 @@ mod tests {
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
             view_metadata: None,
+            provenance: None,
         }
     }
 
@@ -6832,6 +6834,7 @@ mod tests {
                 embedding: vec![1.0; EmbeddingProfile::Balanced.metadata().dimensions],
                 locator: None,
                 view_metadata: None,
+                provenance: None,
             },
             DrawerRecord {
                 id: DrawerId::new("wing_team/auth-migration/0001").unwrap(),
@@ -6855,6 +6858,7 @@ mod tests {
                 embedding: vec![1.0; EmbeddingProfile::Balanced.metadata().dimensions],
                 locator: None,
                 view_metadata: None,
+                provenance: None,
             },
         ];
         runtime
@@ -8418,6 +8422,7 @@ mod tests {
                 commit_hash: None,
             }),
             view_metadata: None,
+            provenance: None,
         };
 
         let fresh =
@@ -8535,6 +8540,7 @@ mod tests {
                     embedding,
                     locator: None,
                     view_metadata: None,
+                    provenance: None,
                 }],
                 DuplicateStrategy::Error,
             )
@@ -9872,6 +9878,7 @@ mod tests {
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
             view_metadata: None,
+            provenance: None,
         };
         let runtime = harness.server.runtime.lock().await;
         runtime
@@ -10459,6 +10466,7 @@ mod tests {
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
             view_metadata: None,
+            provenance: None,
         };
         let colliding_other_agent_drawer = DrawerRecord {
             id: DrawerId::new("diary_worker_one_colliding_agent").unwrap(),
@@ -10480,6 +10488,7 @@ mod tests {
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
             view_metadata: None,
+            provenance: None,
         };
         let runtime = harness.server.runtime.lock().await;
         runtime
@@ -10531,6 +10540,7 @@ mod tests {
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
             view_metadata: None,
+            provenance: None,
         };
         let legacy_diary_drawer = DrawerRecord {
             id: DrawerId::new("diary_legacy_worker_one_0002").unwrap(),
@@ -10552,6 +10562,7 @@ mod tests {
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
             view_metadata: None,
+            provenance: None,
         };
 
         let runtime = harness.server.runtime.lock().await;
@@ -10605,6 +10616,7 @@ mod tests {
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
             view_metadata: None,
+            provenance: None,
         };
         let worker_underscore = DrawerRecord {
             id: DrawerId::new("diary_worker_one_primary_0002").unwrap(),
@@ -10626,6 +10638,7 @@ mod tests {
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
             view_metadata: None,
+            provenance: None,
         };
 
         let runtime = harness.server.runtime.lock().await;
@@ -10677,6 +10690,7 @@ mod tests {
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
             view_metadata: None,
+            provenance: None,
         };
         let old = DrawerRecord {
             id: DrawerId::new("diary_filter_old").unwrap(),
@@ -10698,6 +10712,7 @@ mod tests {
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
             view_metadata: None,
+            provenance: None,
         };
         let wrong_topic = DrawerRecord {
             id: DrawerId::new("diary_filter_wrong_topic").unwrap(),
@@ -10719,6 +10734,7 @@ mod tests {
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
             view_metadata: None,
+            provenance: None,
         };
         let wrong_agent = DrawerRecord {
             id: DrawerId::new("diary_filter_wrong_agent").unwrap(),
@@ -10740,6 +10756,7 @@ mod tests {
             embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
             locator: None,
             view_metadata: None,
+            provenance: None,
         };
 
         let runtime = harness.server.runtime.lock().await;
@@ -13102,6 +13119,7 @@ mod tests {
             content_hash: None,
             filed_at: None,
             added_by: None,
+            provenance: None,
             stale: false,
         }];
         let mut remotes: BTreeMap<String, Arc<dyn agentpalace_remote::RemoteApi>> = BTreeMap::new();
@@ -13639,6 +13657,7 @@ mod tests {
                     embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
                     locator: None,
                     view_metadata: None,
+                    provenance: None,
                 }],
                 DuplicateStrategy::Error,
             )
@@ -13707,6 +13726,7 @@ mod tests {
                     embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
                     locator: None,
                     view_metadata: None,
+                    provenance: None,
                 }],
                 DuplicateStrategy::Error,
             )
@@ -13882,6 +13902,7 @@ mod tests {
                     embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
                     locator: None,
                     view_metadata: None,
+                    provenance: None,
                 }],
                 DuplicateStrategy::Error,
             )
@@ -14443,6 +14464,7 @@ mod tests {
                     embedding: vec![0.0; EmbeddingProfile::Balanced.metadata().dimensions],
                     locator: None,
                     view_metadata: None,
+                    provenance: None,
                 }],
                 DuplicateStrategy::Error,
             )

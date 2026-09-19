@@ -2045,6 +2045,7 @@ mod tests {
             embedding: Vec::new(),
             locator: None,
             view_metadata: None,
+            provenance: None,
         }
     }
 }

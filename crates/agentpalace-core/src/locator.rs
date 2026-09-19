@@ -200,6 +200,7 @@ mod tests {
             embedding: vec![],
             locator,
             view_metadata: None,
+            provenance: None,
         }
     }
 

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
 
 use crate::locator::SourceLocator;
+use crate::PersistedProvenance;
 use crate::{DrawerId, EmbeddingProfile, RoomId, WingId};
 
 time::serde::format_description!(date_only, Date, "[year]-[month]-[day]");
@@ -66,6 +67,9 @@ pub struct DrawerRecord {
     /// rows and for legacy rows that predate this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view_metadata: Option<RepositoryViewMetadata>,
+    /// Durable domain provenance; `None` means this legacy row has unknown ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<PersistedProvenance>,
 }
 
 /// Stable priority order used by plain-text and AAAK layer rendering.
@@ -130,6 +134,9 @@ pub struct SearchResult {
     /// Absent for canonical results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<String>,
+    /// Redacted durable provenance when the result came from a provenance-aware drawer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -153,6 +160,7 @@ mod tests {
             stale: false,
             content_hash: None,
             view: None,
+            provenance: None,
         };
 
         let value = serde_json::to_value(&result).unwrap();
@@ -183,6 +191,7 @@ mod tests {
             stale: false,
             content_hash: None,
             view: None,
+            provenance: None,
         };
         let stale = SearchResult { stale: true, ..non_stale.clone() };
         let non_stale_json = serde_json::to_value(&non_stale).unwrap();
@@ -213,6 +222,7 @@ mod tests {
             embedding: vec![0.1, 0.2],
             locator: None,
             view_metadata: None,
+            provenance: None,
         };
 
         let value = serde_json::to_value(&record).unwrap();
