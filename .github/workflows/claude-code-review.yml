@@ -84,7 +84,10 @@ jobs:
             findings, or an explicit statement that no issues were found.
             Include the reviewed commit and any validation limitations.
             Only after completing the review and publishing all findings, include
-            this exact completion marker in that final summary:
+            this exact completion marker in that final summary. The trusted
+            validator also recognizes the action-generated finished wrapper when
+            the comment tool drops this hidden HTML token, but include it whenever
+            possible:
             <!-- agentpalace-claude-review:${{ github.run_id }}:${{ github.run_attempt }}:${{ github.event.pull_request.head.sha }}:completed -->
 
             If a blocker prevents completion or posting findings, update the
@@ -143,7 +146,11 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # A successful SDK exit can still leave only a progress checklist.
+      # A successful SDK exit can still leave only a progress checklist. The marker
+      # is the primary completion signal. Because the comment tool can drop hidden
+      # HTML, validation also accepts the action-generated "Claude finished" wrapper
+      # when diagnostics prove the comment tool ran and the body names this exact
+      # Actions run and full head SHA with no unfinished checklist items.
       # This trusted step reads comments; gh api remains unavailable to the agent.
       - name: Require a completed published review
         if: ${{ always() && !cancelled() }}
