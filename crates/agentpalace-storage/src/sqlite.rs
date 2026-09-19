@@ -2607,6 +2607,19 @@ fn decode_optional_date(raw: Option<String>) -> rusqlite::Result<Option<Date>> {
     .transpose()
 }
 
+fn decode_json_column<T>(column: usize, value: &str) -> rusqlite::Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_str(value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(err),
+        )
+    })
+}
+
 fn decode_fact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeGraphFact> {
     Ok(KnowledgeGraphFact {
         fact_id: row.get(0)?,
@@ -2641,15 +2654,7 @@ fn decode_fact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeGraphFa
         })?,
         provenance: row
             .get::<_, Option<String>>(11)?
-            .map(|value| {
-                serde_json::from_str(&value).map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        11,
-                        rusqlite::types::Type::Text,
-                        Box::new(err),
-                    )
-                })
-            })
+            .map(|value| decode_json_column(11, &value))
             .transpose()?,
     })
 }
