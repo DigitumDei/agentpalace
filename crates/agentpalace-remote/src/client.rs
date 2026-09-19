@@ -478,9 +478,10 @@ impl RemoteClient {
                 return Err(RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None });
             }
         };
-        self.token_store.save(session.clone()).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
         *self.token.lock().await = Some(session.access_token.clone());
         *self.oauth_session.lock().await = Some(session);
+        let session = self.oauth_session.lock().await.clone().ok_or_else(|| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: "refreshed OAuth session was not retained".to_owned(), resource_metadata: None })?;
+        self.token_store.save(session).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
         Ok(())
     }
 
