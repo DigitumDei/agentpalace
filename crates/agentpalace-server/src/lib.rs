@@ -113,6 +113,23 @@ const MAX_KG_TIMELINE_LIMIT: usize = 200;
 /// ever reaches storage, rather than relying on that lower-level guard alone.
 const MAX_LEASE_SECONDS: i64 = 100 * 365 * 24 * 60 * 60;
 
+/// Return the owner-scoped key paired with an operation identifier.
+///
+/// Receipt-backed routes derive the optional key once, then use this helper at
+/// keyed control-flow boundaries. Keeping the pairing explicit prevents an
+/// absent key from becoming a panic while preserving the unkeyed legacy path.
+fn validated_operation_key<'a>(
+    operation_id: Option<&str>,
+    operation_key: Option<&'a OwnerScopedKey>,
+) -> Result<&'a OwnerScopedKey, ServerError> {
+    match (operation_id, operation_key) {
+        (Some(_), Some(operation_key)) => Ok(operation_key),
+        _ => Err(ServerError::InvalidParams(
+            "operation key must be present exactly when operation_id is present".to_owned(),
+        )),
+    }
+}
+
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
 /// Top-level error type for the federation server.
@@ -1780,6 +1797,7 @@ where
     let receipts = state.storage.receipt_store();
 
     if let Some(op) = &operation_id {
+        let operation_key = validated_operation_key(operation_id.as_deref(), operation_key.as_ref())?;
         let request_hash = mutation_request_hash(&[
             ("wing", json!(body.wing)),
             ("room", json!(body.room)),
@@ -1798,7 +1816,7 @@ where
             target_id: resolved_target_id.as_str().to_owned(),
             provenance: Some(receipt_provenance(
                 &auth.0,
-                operation_key.as_ref().expect("operation key"),
+                operation_key,
             )?),
         })?;
 
@@ -1845,12 +1863,12 @@ where
                     restore_added_event(
                         &state,
                         &receipt.target_id,
-                        &operation_key.as_ref().expect("operation key").to_string(),
+                        &operation_key.to_string(),
                         identity.as_str(),
                         wing.as_str(),
                         room.as_str(),
                     )?;
-                    receipts.complete_receipt(operation_key.as_ref().expect("operation key"), &response)?;
+                    receipts.complete_receipt(operation_key, &response)?;
                     return Ok(Json(response));
                 }
             }
@@ -1932,7 +1950,8 @@ where
         details_json: Some(json!({"wing": wing.as_str(), "room": room.as_str()}).to_string()),
     };
     if let Some(op) = &operation_id {
-        state.storage.operational_store().append_event_if_absent_with_operation(&event, &operation_key.as_ref().expect("operation key").to_string())?;
+        let operation_key = validated_operation_key(operation_id.as_deref(), operation_key.as_ref())?;
+        state.storage.operational_store().append_event_if_absent_with_operation(&event, &operation_key.to_string())?;
     } else {
         state.storage.operational_store().append_event(&event)?;
     }
@@ -1943,7 +1962,8 @@ where
         room.as_str(),
     ))?;
     if let Some(op) = operation_id {
-        receipts.complete_receipt(operation_key.as_ref().expect("operation key"), &response)?;
+        let operation_key = validated_operation_key(Some(op.as_str()), operation_key.as_ref())?;
+        receipts.complete_receipt(operation_key, &response)?;
     }
     Ok(Json(response))
 }
@@ -2055,6 +2075,7 @@ where
 
     // Idempotency gate. Without an `operation_id` the behaviour below is exactly the legacy one.
     if let Some(op) = &operation_id {
+        let operation_key = validated_operation_key(operation_id.as_deref(), operation_key.as_ref())?;
         let request_hash = mutation_request_hash(&[("drawer_id", json!(id))]);
         let outcome = receipts.begin_receipt(&NewReceipt {
             operation_key: auth.0.owner_scoped_key(op.clone())?,
@@ -2063,7 +2084,7 @@ where
             target_id: id.clone(),
             provenance: Some(receipt_provenance(
                 &auth.0,
-                operation_key.as_ref().expect("operation key"),
+                operation_key,
             )?),
         })?;
         match outcome {
@@ -2113,7 +2134,8 @@ where
         // losing request still converges instead of returning a transient 404.
         if recovered_details.is_none() {
             if let Some(op) = operation_id.as_ref() {
-                recovered_details = receipts.get_receipt(operation_key.as_ref().expect("operation key"))?.and_then(|receipt| receipt.details);
+                let operation_key = validated_operation_key(Some(op.as_str()), operation_key.as_ref())?;
+                recovered_details = receipts.get_receipt(operation_key)?.and_then(|receipt| receipt.details);
             }
         }
         if let (Some(op), Some(details)) = (&operation_id, recovered_details.as_ref()) {
@@ -2122,9 +2144,10 @@ where
             // change event was never appended. Restore exactly one event, with the wing/room
             // captured on the receipt *before* the delete ran, so scoped change reads can see
             // the deletion.
-            restore_deleted_event(&state, &id, &operation_key.as_ref().expect("operation key").to_string(), auth.0.0.as_str(), Some(details))?;
+            let operation_key = validated_operation_key(Some(op.as_str()), operation_key.as_ref())?;
+            restore_deleted_event(&state, &id, &operation_key.to_string(), auth.0.0.as_str(), Some(details))?;
             let response = json!({"success": true});
-            receipts.complete_receipt(operation_key.as_ref().expect("operation key"), &response)?;
+            receipts.complete_receipt(operation_key, &response)?;
             return Ok(Json(response));
         }
         // Fresh (or metadata-less) not-found: the receipt begun above is deliberately left
@@ -2155,9 +2178,10 @@ where
             let Some(op) = operation_id.as_ref() else {
                 return Err(ServerError::NotFound(format!("drawer {id} not found")));
             };
-            restore_deleted_event(&state, &id, &operation_key.as_ref().expect("operation key").to_string(), identity.as_str(), Some(details))?;
+            let operation_key = validated_operation_key(Some(op.as_str()), operation_key.as_ref())?;
+            restore_deleted_event(&state, &id, &operation_key.to_string(), identity.as_str(), Some(details))?;
             let response = json!({"success": true});
-            receipts.complete_receipt(operation_key.as_ref().expect("operation key"), &response)?;
+            receipts.complete_receipt(operation_key, &response)?;
             return Ok(Json(response));
         }
     }
@@ -2176,10 +2200,11 @@ where
         },
     });
     if let Some(op) = &operation_id {
+        let operation_key = validated_operation_key(Some(op.as_str()), operation_key.as_ref())?;
         // Fresh attempts capture the row before deleting it. Recoveries retain the
         // original details so a replacement row can never overwrite the marker.
         if recovered_details.is_none() {
-            receipts.set_receipt_details(operation_key.as_ref().expect("operation key"), &delete_details)?;
+            receipts.set_receipt_details(operation_key, &delete_details)?;
             recovered_details = Some(delete_details.clone());
         }
     }
@@ -2207,7 +2232,8 @@ where
             details_json: Some(recovered_details.as_ref().unwrap_or(&delete_details).to_string()),
         };
         if let Some(op) = &operation_id {
-            state.storage.operational_store().append_event_if_absent_with_operation(&event, &operation_key.as_ref().expect("operation key").to_string())?;
+            let operation_key = validated_operation_key(Some(op.as_str()), operation_key.as_ref())?;
+            state.storage.operational_store().append_event_if_absent_with_operation(&event, &operation_key.to_string())?;
         } else {
             state.storage.operational_store().append_event(&event)?;
         }
@@ -2219,13 +2245,14 @@ where
         restore_deleted_event(
             &state,
             &id,
-            &operation_key.as_ref().expect("operation key").to_string(),
+            &validated_operation_key(Some(op.as_str()), operation_key.as_ref())?.to_string(),
             identity.as_str(),
             recovered_details.as_ref().or(Some(&delete_details)),
         )?;
     }
     if let Some(op) = operation_id {
-        receipts.complete_receipt(operation_key.as_ref().expect("operation key"), &response)?;
+        let operation_key = validated_operation_key(Some(op.as_str()), operation_key.as_ref())?;
+        receipts.complete_receipt(operation_key, &response)?;
     }
     Ok(Json(response))
 }
@@ -2509,6 +2536,7 @@ where
     // active fact id instead of creating a duplicate), so the real risks on a replay are the
     // duplicate change event and the duplicate work. A completed receipt short-circuits both.
     if let Some(op) = &operation_id {
+        let operation_key = validated_operation_key(operation_id.as_deref(), operation_key.as_ref())?;
         let request_hash = mutation_request_hash(&[
             ("subject", json!(&body.subject)),
             ("predicate", json!(&body.predicate)),
@@ -2522,7 +2550,7 @@ where
             target_id: canonical_kg_triple(&body.subject, &body.predicate, &body.object),
             provenance: Some(receipt_provenance(
                 &auth.0,
-                operation_key.as_ref().expect("operation key"),
+                operation_key,
             )?),
         })?;
         match outcome {
@@ -2571,13 +2599,13 @@ where
                 state
                     .storage
                     .operational_store()
-                    .append_event_if_absent_with_operation(&event, &operation_key.as_ref().expect("operation key").to_string())?;
+                    .append_event_if_absent_with_operation(&event, &operation_key.to_string())?;
                 let response = json!({
                     "success": true,
                     "triple_id": triple_id,
                     "fact": format!("{} → {} → {}", body.subject, body.predicate, body.object),
                 });
-                receipts.complete_receipt(operation_key.as_ref().expect("operation key"), &response)?;
+                receipts.complete_receipt(operation_key, &response)?;
                 return Ok(Json(response));
             }
             ReceiptOutcome::Fresh(_) => {}
@@ -2612,7 +2640,8 @@ where
         ),
     };
     if let Some(op) = &operation_id {
-        state.storage.operational_store().append_event_if_absent_with_operation(&event, &operation_key.as_ref().expect("operation key").to_string())?;
+        let operation_key = validated_operation_key(Some(op.as_str()), operation_key.as_ref())?;
+        state.storage.operational_store().append_event_if_absent_with_operation(&event, &operation_key.to_string())?;
     } else {
         state.storage.operational_store().append_event(&event)?;
     }
@@ -2623,7 +2652,8 @@ where
         "fact": format!("{} → {} → {}", body.subject, body.predicate, body.object),
     });
     if let Some(op) = operation_id {
-        receipts.complete_receipt(operation_key.as_ref().expect("operation key"), &response)?;
+        let operation_key = validated_operation_key(Some(op.as_str()), operation_key.as_ref())?;
+        receipts.complete_receipt(operation_key, &response)?;
     }
     Ok(Json(response))
 }
@@ -2670,6 +2700,7 @@ where
 
     // Idempotency gate for the invalidate replay path.
     if let Some(op) = &operation_id {
+        let operation_key = validated_operation_key(operation_id.as_deref(), operation_key.as_ref())?;
         let request_hash = mutation_request_hash(&[
             ("subject", json!(&body.subject)),
             ("predicate", json!(&body.predicate)),
@@ -2683,7 +2714,7 @@ where
             target_id: canonical_kg_triple(&body.subject, &body.predicate, &body.object),
             provenance: Some(receipt_provenance(
                 &auth.0,
-                operation_key.as_ref().expect("operation key"),
+                operation_key,
             )?),
         })?;
         match outcome {
@@ -2709,7 +2740,7 @@ where
                 }
             }
             ReceiptOutcome::Fresh(_) => {
-                receipts.set_receipt_details(operation_key.as_ref().expect("operation key"), &json!({"ended": format_date(ended)}))?;
+                receipts.set_receipt_details(operation_key, &json!({"ended": format_date(ended)}))?;
             }
         }
     }
@@ -2731,8 +2762,9 @@ where
     if invalidated > 0 {
         recovery_effect_applied = true;
         if let Some(op) = &operation_id {
+            let operation_key = validated_operation_key(Some(op.as_str()), operation_key.as_ref())?;
             if let Err(error) = receipts.set_receipt_details(
-                operation_key.as_ref().expect("operation key"),
+                operation_key,
                 &json!({"ended": format_date(ended), "effect_applied": true}),
             ) {
                 // A concurrent recovery request may have completed the receipt during the
@@ -2740,7 +2772,7 @@ where
                 // effect occurred, so keep going and append the operation-scoped event; a late
                 // marker write must not turn that repair into a lost event.
                 let completed = receipts
-                    .get_receipt(operation_key.as_ref().expect("operation key"))?
+                    .get_receipt(operation_key)?
                     .is_some_and(|receipt| receipt.status == ReceiptState::Completed);
                 if !completed {
                     return Err(error.into());
@@ -2762,7 +2794,8 @@ where
             ),
         };
         if let Some(op) = &operation_id {
-            state.storage.operational_store().append_event_if_absent_with_operation(&event, &operation_key.as_ref().expect("operation key").to_string())?;
+            let operation_key = validated_operation_key(Some(op.as_str()), operation_key.as_ref())?;
+            state.storage.operational_store().append_event_if_absent_with_operation(&event, &operation_key.to_string())?;
         } else {
             state.storage.operational_store().append_event(&event)?;
         }
@@ -2782,7 +2815,8 @@ where
         "ended": format_date(ended),
     });
     if let Some(op) = operation_id {
-        receipts.complete_receipt(operation_key.as_ref().expect("operation key"), &response)?;
+        let operation_key = validated_operation_key(Some(op.as_str()), operation_key.as_ref())?;
+        receipts.complete_receipt(operation_key, &response)?;
     }
     Ok(Json(response))
 }
@@ -3194,9 +3228,10 @@ where
             )),
             provenance: Some(receipt_provenance(
                 &auth.0,
-                replication_operation_key
-                    .as_ref()
-                    .expect("replication operation key"),
+                validated_operation_key(
+                    Some(replication.record_id.as_str()),
+                    replication_operation_key.as_ref(),
+                )?,
             )?),
         })? {
             ReceiptOutcome::Replay(receipt) => {
@@ -3321,10 +3356,14 @@ where
         }
 
         if let Some(replication) = &body.replication {
+            let replication_operation_key = validated_operation_key(
+                Some(replication.record_id.as_str()),
+                replication_operation_key.as_ref(),
+            )?;
             let receipt = state
                 .storage
                 .receipt_store()
-                .get_receipt(replication_operation_key.as_ref().expect("operation key"))?
+                .get_receipt(replication_operation_key)?
                 .expect("receipt was begun under the ingestion lock");
             if receipt.details.is_none() {
                 let previous = state
@@ -3332,7 +3371,7 @@ where
                     .operational_store()
                     .committed_drawer_ids_for_source_key(&source_key)?;
                 state.storage.receipt_store().set_receipt_details(
-                    replication_operation_key.as_ref().expect("operation key"),
+                    replication_operation_key,
                     &json!({"previous_ids": previous, "source_key": source_key}),
                 )?;
             } else if recovering_committed_ingest {
@@ -3699,12 +3738,16 @@ where
             ),
         };
         if let Some(replication) = &body.replication {
+            let replication_operation_key = validated_operation_key(
+                Some(replication.record_id.as_str()),
+                replication_operation_key.as_ref(),
+            )?;
             state
                 .storage
                 .operational_store()
                     .append_event_if_absent_with_operation(
                         &event,
-                        &replication_operation_key.as_ref().expect("operation key").to_string(),
+                        &replication_operation_key.to_string(),
                     )?;
         } else {
             state.storage.operational_store().append_event(&event)?;
@@ -3730,10 +3773,14 @@ where
     if let Some(replication) = &body.replication {
         if response.files.iter().all(|file| file.status != "retryable") {
             if response.files.iter().all(|file| file.status != "failed") {
+                let replication_operation_key = validated_operation_key(
+                    Some(replication.record_id.as_str()),
+                    replication_operation_key.as_ref(),
+                )?;
                 let receipt = state
                     .storage
                     .receipt_store()
-                    .get_receipt(replication_operation_key.as_ref().expect("operation key"))?
+                    .get_receipt(replication_operation_key)?
                     .expect("ingest receipt exists");
                 if let Some(details) = receipt.details {
                     let previous: Vec<DrawerId> =
@@ -3754,7 +3801,13 @@ where
             state
                 .storage
                 .receipt_store()
-                .complete_receipt(replication_operation_key.as_ref().expect("operation key"), &json!(&response))?;
+                .complete_receipt(
+                    validated_operation_key(
+                        Some(replication.record_id.as_str()),
+                        replication_operation_key.as_ref(),
+                    )?,
+                    &json!(&response),
+                )?;
         }
     }
     Ok(Json(response))
