@@ -1637,7 +1637,8 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
                         Vec::new(),
                         None,
                         invalidated_by,
-                    )?;
+                    )
+                    .map_err(StorageError::from)?;
                     Some(serde_json::to_string(&legacy)?)
                 }
                 (other, _) => other,
