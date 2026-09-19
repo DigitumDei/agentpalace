@@ -3450,6 +3450,16 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         assert_column_position(&upgraded_path, "coordination_messages", "provenance_json", 12);
         assert_column_position(&upgraded_path, "coordination_artifacts", "provenance_json", 9);
         assert_column_position(&upgraded_path, "coordination_results", "provenance_json", 6);
+        for (table, column, expected) in [
+            ("coordination_tasks", "provenance_json", 17),
+            ("coordination_events", "wing", 12),
+            ("coordination_messages", "provenance_json", 12),
+            ("coordination_artifacts", "provenance_json", 9),
+            ("coordination_results", "provenance_json", 6),
+        ] {
+            assert_column_position(&fresh_path, table, column, expected);
+            assert_column_position(&upgraded_path, table, column, expected);
+        }
 
         let message = upgraded
             .get_message("legacy-message")
@@ -3463,6 +3473,22 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         assert!(
             message.provenance.is_none(),
             "legacy messages without provenance remain compatible"
+        );
+        let inbox = upgraded
+            .inbox(
+                "legacy-recipient",
+                None,
+                None,
+                10,
+                false,
+                CoordinationVisibility::Trusted,
+            )
+            .expect("legacy inbox");
+        assert_eq!(inbox.messages.len(), 1);
+        assert_eq!(inbox.messages[0].message_id, "legacy-message");
+        assert!(
+            inbox.messages[0].provenance.is_none(),
+            "legacy inbox messages without provenance remain compatible"
         );
 
         let artifact = upgraded
