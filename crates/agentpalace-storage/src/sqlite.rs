@@ -2607,7 +2607,18 @@ fn decode_fact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeGraphFa
                 Box::new(err),
             )
         })?,
-        provenance: row.get::<_, Option<String>>(11)?.map(|value| serde_json::from_str(&value).map_err(sql_conv)).transpose()?,
+        provenance: row
+            .get::<_, Option<String>>(11)?
+            .map(|value| {
+                serde_json::from_str(&value).map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        11,
+                        rusqlite::types::Type::Text,
+                        Box::new(err),
+                    )
+                })
+            })
+            .transpose()?,
     })
 }
 
