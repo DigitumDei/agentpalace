@@ -689,7 +689,7 @@ mod tests {
     #[test]
     fn provenance_is_persisted_with_pending_and_completed_receipt() {
         let (store, dir) = store();
-        let owner = "alice".parse().unwrap();
+        let owner: agentpalace_core::OwnerId = "alice".parse().unwrap();
         let key = OwnerScopedKey::new(Some(owner.clone()), "provenance-op").unwrap();
         let provenance = ProvenanceEnvelope::new(
             agentpalace_core::OwnerIdentity::Authenticated(agentpalace_core::AuthenticatedOwner::new(
