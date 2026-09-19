@@ -1254,6 +1254,7 @@ mod tests {
                 name: remote_name.to_owned(),
                 url: remote_url.to_owned(),
                 token: None,
+                oauth: None,
                 timeout: Duration::from_secs(5),
             },
         );
@@ -1800,6 +1801,7 @@ mod tests {
                     name: "hub".to_owned(),
                     url: "https://palace.example".to_owned(),
                     token: None,
+                    oauth: None,
                     timeout: Duration::from_secs(5),
                 },
             );
