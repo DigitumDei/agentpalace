@@ -1572,7 +1572,6 @@ fn build_drawers<P: EmbeddingProvider>(
     locator_ctx: Option<&ProjectLocatorContext<'_>>,
     view: Option<&str>,
     view_metadata: Option<&agentpalace_core::RepositoryViewMetadata>,
-    provenance: None,
 ) -> Result<Vec<DrawerRecord>> {
     if chunks.is_empty() {
         return Ok(Vec::new());
@@ -1607,7 +1606,6 @@ fn build_drawers_from_embeddings(
     locator_ctx: Option<&ProjectLocatorContext<'_>>,
     view: Option<&str>,
     view_metadata: Option<&agentpalace_core::RepositoryViewMetadata>,
-    provenance: None,
     embeddings: Vec<Vec<f32>>,
 ) -> Result<Vec<DrawerRecord>> {
     let mut drawers = Vec::with_capacity(chunks.len());
@@ -4886,6 +4884,7 @@ mod tests {
 
         assert_eq!(drawers.len(), 5);
         assert_eq!(*batches.borrow(), vec![2, 2, 1]);
+        assert!(drawers.iter().all(|drawer| drawer.provenance.is_none()));
     }
 
     #[test]
