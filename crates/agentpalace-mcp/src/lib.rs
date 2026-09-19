@@ -14504,7 +14504,7 @@ mod tests {
                 url: "http://127.0.0.1:9999".to_owned(),
                 token: Some("test".to_owned()),
                 oauth: None,
-               timeout: std::time::Duration::from_secs(5),
+                timeout: std::time::Duration::from_secs(5),
             },
         );
         let federation = FederationRuntimeConfig {
@@ -14623,9 +14623,9 @@ mod tests {
             ResolvedRemote {
                 name: "alpha".to_owned(),
                 url: "http://127.0.0.1:9999".to_owned(),
-               token: Some("test".to_owned()),
+                token: Some("test".to_owned()),
                 oauth: None,
-               timeout: std::time::Duration::from_secs(5),
+                timeout: std::time::Duration::from_secs(5),
             },
         );
         let federation = FederationRuntimeConfig {
@@ -14725,9 +14725,9 @@ mod tests {
             ResolvedRemote {
                 name: "alpha".to_owned(),
                 url: "http://127.0.0.1:9999".to_owned(),
-               token: Some("test".to_owned()),
+                token: Some("test".to_owned()),
                 oauth: None,
-               timeout: std::time::Duration::from_secs(5),
+                timeout: std::time::Duration::from_secs(5),
             },
         );
         let federation = FederationRuntimeConfig {

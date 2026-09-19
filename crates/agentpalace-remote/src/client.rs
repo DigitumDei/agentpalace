@@ -450,9 +450,10 @@ impl RemoteClient {
             return Ok(());
         }
         let session = crate::browser_login(&self.http, metadata, config, resource).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
-        self.token_store.save(session.clone()).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
         *self.token.lock().await = Some(session.access_token.clone());
         *self.oauth_session.lock().await = Some(session);
+        let retained = self.oauth_session.lock().await.clone().ok_or_else(|| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: "OAuth login session was not retained".to_owned(), resource_metadata: None })?;
+        self.token_store.save(retained).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
         Ok(())
     }
 

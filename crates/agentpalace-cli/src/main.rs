@@ -397,6 +397,9 @@ enum AuthCommands {
     Logout {
         #[arg(long)]
         remote: String,
+        /// Issuer URL used to identify the stored grant.
+        #[arg(long)]
+        issuer: String,
     },
 }
 
@@ -691,9 +694,13 @@ fn execute_auth(
     context: &CliContext,
 ) -> Result<CliOutput, clap::Error> {
     let config = load_runtime_config(palace_override, context).map_err(config_error)?;
+    enum AuthOperation {
+        Login(String),
+        Logout(String),
+    }
     let (remote_name, operation) = match command {
-        AuthCommands::Login { remote, resource_metadata } => (remote, Some(resource_metadata)),
-        AuthCommands::Logout { remote } => (remote, None),
+        AuthCommands::Login { remote, resource_metadata } => (remote, AuthOperation::Login(resource_metadata)),
+        AuthCommands::Logout { remote, issuer } => (remote, AuthOperation::Logout(issuer)),
     };
     let remote = config.federation.remotes.get(&remote_name).ok_or_else(|| {
         clap::Error::raw(clap::error::ErrorKind::InvalidValue, format!("unknown remote `{remote_name}`"))
@@ -719,8 +726,12 @@ fn execute_auth(
         .map_err(|error| clap::Error::raw(clap::error::ErrorKind::Io, error.to_string()))?;
     let result = runtime.block_on(async {
         match operation {
-            Some(resource_metadata) => client.login_from_challenge(&resource_metadata).await.map(|_| "OAuth login completed; credentials were stored by the configured token store.\n".to_owned()),
-            None => client.logout(None).await.map(|_| "OAuth session cleared.\n".to_owned()),
+            AuthOperation::Login(resource_metadata) => client.login_from_challenge(&resource_metadata).await.map(|_| "OAuth login completed; credentials were stored by the configured token store.\n".to_owned()),
+            AuthOperation::Logout(issuer) => {
+                let resource = remote.url.clone();
+                let loaded = client.load_stored_session(&resource, &issuer).await;
+                client.logout(None).await.map(|_| if loaded { "OAuth session cleared.\n".to_owned() } else { "No matching OAuth session was available; nothing was cleared.\n".to_owned() })
+            }
         }
     });
     Ok(match result {

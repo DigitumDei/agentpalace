@@ -2683,9 +2683,9 @@ async fn delete_both_retry_after_restart_replays_same_operation() {
             ResolvedRemote {
                 name: "hub".to_owned(),
                url: dead_url.clone(),
-               token: Some(TEST_TOKEN.to_owned()),
+                token: Some(TEST_TOKEN.to_owned()),
                 oauth: None,
-               timeout: Duration::from_millis(500),
+                timeout: Duration::from_millis(500),
             },
         )]),
         default_mode: RouteMode::Local,

@@ -17,7 +17,7 @@ discovery, opens one native-client browser flow with PKCE, and stores the grant
 through the configured secure token store (or only in memory when
 `allow_in_memory` is explicitly enabled). Background and MCP requests never
 open a browser; they return an actionable authentication-required result.
-`auth logout --remote <NAME>` clears the locally stored grant. Credentials and
+`auth logout --remote <NAME> --issuer <ISSUER>` clears the matching locally stored grant. Credentials and
 tokens are never command-line arguments or config values.
 
 ### `migrate`
