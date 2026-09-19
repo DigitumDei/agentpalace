@@ -211,6 +211,22 @@ per-crate warning counts are from that run and have not been re-measured.
 
 This document covers only the small-VM runtime row of the validation matrix, and today it is still based on local builds. Per the release decision rule in `Packaging-And-Validation.md`, Rust v1 must not be marked release-ready from this document alone — attach the successful GitHub Actions packaging row and the artifact-based runtime rerun before cutting a release tag.
 
+## PR169 exact-head finalization (2026-09-19)
+
+The retained PR169 validation target remains exact head
+`44b3ad3e4c53b302ab10e0b0b2a0c5ac3def30f0`; the repository tree was clean when this
+evidence was recorded. That head contains the explicit `OwnerId` annotation in the
+provenance persistence regression, the direct `OwnerScopedKey::new(None, "")`
+empty-key boundary assertion, and provenance bound to the same receipt operation key.
+
+GitHub Actions run [35430251920](https://github.com/DigitumDei/agentpalace/actions/runs/35430251920)
+completed successfully for that exact SHA. Workspace Build, Clippy, Storage Tests,
+Release Gate, and the remaining feature, package, embedding, and release-contract jobs
+all passed. The separate Claude review workflow remains a validation limitation: its
+diagnostics and substantive final review establish successful publication, but the
+expected HTML completion marker was absent, so the `claude-review` check is not claimed
+as passed.
+
 ## Supplemental Windows validation — bounded drawer reads (2026-09-11)
 
 Issues #136 and #39 were tested locally on `fix/bounded-wakeup-taxonomy` with
