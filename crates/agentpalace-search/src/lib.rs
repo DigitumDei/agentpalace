@@ -1139,7 +1139,6 @@ mod tests {
                     limit: 5,
                     profile: EmbeddingProfile::Balanced,
                     view: None,
-                    provenance: None,
                 },
             )
             .await
@@ -1163,7 +1162,6 @@ mod tests {
                     limit: 0,
                     profile: EmbeddingProfile::Balanced,
                     view: None,
-                    provenance: None,
                 },
             )
             .await

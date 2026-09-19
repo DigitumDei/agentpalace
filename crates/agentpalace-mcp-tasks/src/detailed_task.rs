@@ -964,6 +964,7 @@ mod tests {
             expires_at: None,
             created_at: OffsetDateTime::now_utc(),
             updated_at: OffsetDateTime::now_utc(),
+            provenance: None,
         }
     }
 
