@@ -2556,7 +2556,7 @@ impl From<&ProvenanceHistoryEntry> for ProvenanceResponseEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FederatedOriginalSummary {
-    /// Remote or local origin that created the original record.
+    /// Federated origin that created the original record.
     pub origin: StorageOrigin,
     /// Original record identifier at that origin, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
