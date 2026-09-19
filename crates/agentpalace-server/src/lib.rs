@@ -5364,6 +5364,8 @@ mod tests {
 
     const ALICE_TOKEN: &str = "alice-secret-token";
     const BOB_TOKEN: &str = "bob-secret-token";
+    const OWNER_ALICE_TOKEN: &str = "owner-alice-secret-token";
+    const OWNER_BOB_TOKEN: &str = "owner-bob-secret-token";
     const BAD_TOKEN: &str = "bad-token-xyz";
     // Scoped-token fixtures (issue #102 Stage 2). `alice` above stays
     // unrestricted (no `scopes` field) and is the grandfathering baseline;
@@ -5486,6 +5488,24 @@ mod tests {
         serde_json::json!([
             {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
             {"token": BOB_TOKEN, "name": "bob", "enabled": false},
+            {
+                "token": OWNER_ALICE_TOKEN, "name": "shared-agent", "enabled": true,
+                "owner": {
+                    "id": "usr_01J8Y_OWNER_ALICE00000000001",
+                    "issuer": "https://accounts.google.com",
+                    "subject": "subject_owner_alice",
+                    "email_at_write": "owner-alice@example.com"
+                }
+            },
+            {
+                "token": OWNER_BOB_TOKEN, "name": "shared-agent", "enabled": true,
+                "owner": {
+                    "id": "usr_01J8Y_OWNER_BOB00000000002",
+                    "issuer": "https://accounts.google.com",
+                    "subject": "subject_owner_bob",
+                    "email_at_write": "owner-bob@example.com"
+                }
+            },
             {
                 "token": SCOPED_ALPHA_TOKEN, "name": "scoped_alpha", "enabled": true,
                 "scopes": [{
@@ -7590,6 +7610,186 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn add_route_scopes_same_operation_id_to_authenticated_owner() {
+        let harness = make_harness().await;
+        let operation_id = "op-two-owner-route-isolation";
+        let shared_agent = "same-client-agent";
+
+        // Both callers deliberately use the same raw operation_id, agent label, and wing. The
+        // only identity that distinguishes their receipts is the owner established by auth.
+        let alice_payload = json!({
+            "wing": "wing_route_isolation",
+            "room": "receipt-boundary",
+            "content": "owner alice's independently committed drawer",
+            "added_by": shared_agent,
+            "drawer_id": "route-isolation-owner-alice",
+            "operation_id": operation_id,
+        });
+        let bob_payload = json!({
+            "wing": "wing_route_isolation",
+            "room": "receipt-boundary",
+            "content": "owner bob's independently committed drawer",
+            "added_by": shared_agent,
+            "drawer_id": "route-isolation-owner-bob",
+            "operation_id": operation_id,
+        });
+
+        let alice_first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                OWNER_ALICE_TOKEN,
+                alice_payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(alice_first.status(), StatusCode::OK);
+        let alice_response = body_json(alice_first).await;
+        assert_eq!(alice_response["drawer_id"], "route-isolation-owner-alice");
+
+        let bob_first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                OWNER_BOB_TOKEN,
+                bob_payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bob_first.status(), StatusCode::OK);
+        let bob_response = body_json(bob_first).await;
+        assert_eq!(bob_response["drawer_id"], "route-isolation-owner-bob");
+        assert_ne!(alice_response["drawer_id"], bob_response["drawer_id"]);
+
+        // A same-owner retry replays the original response and does not append another drawer.
+        let alice_retry = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                OWNER_ALICE_TOKEN,
+                alice_payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(alice_retry.status(), StatusCode::OK);
+        assert_eq!(body_json(alice_retry).await, alice_response);
+
+        // Reusing the raw operation_id at the other owner's route boundary with Alice's request
+        // is a conflict against Bob's own receipt; it cannot replay Alice's response or target.
+        let bob_attempted_alice = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                OWNER_BOB_TOKEN,
+                alice_payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bob_attempted_alice.status(), StatusCode::CONFLICT);
+        let bob_conflict = body_json(bob_attempted_alice).await;
+        assert_eq!(bob_conflict["code"], "operation_id_conflict");
+        assert!(bob_conflict.get("drawer_id").is_none());
+
+        // The inverse attempt is independently rejected by Alice's owner-scoped receipt.
+        let alice_attempted_bob = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                OWNER_ALICE_TOKEN,
+                bob_payload,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(alice_attempted_bob.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(alice_attempted_bob).await["code"], "operation_id_conflict");
+
+        let alice_identity = harness.state.tokens.authenticate(OWNER_ALICE_TOKEN).unwrap();
+        let bob_identity = harness.state.tokens.authenticate(OWNER_BOB_TOKEN).unwrap();
+        let alice_key = alice_identity.owner_scoped_key(operation_id).unwrap();
+        let bob_key = bob_identity.owner_scoped_key(operation_id).unwrap();
+        let alice_receipt = harness
+            .state
+            .storage
+            .receipt_store()
+            .get_receipt(&alice_key)
+            .unwrap()
+            .expect("Alice receipt exists");
+        let bob_receipt = harness
+            .state
+            .storage
+            .receipt_store()
+            .get_receipt(&bob_key)
+            .unwrap()
+            .expect("Bob receipt exists");
+        assert_eq!(alice_receipt.status, agentpalace_storage::ReceiptState::Completed);
+        assert_eq!(bob_receipt.status, agentpalace_storage::ReceiptState::Completed);
+        assert_eq!(alice_receipt.operation_key.owner_id(), alice_identity.owner_id());
+        assert_eq!(bob_receipt.operation_key.owner_id(), bob_identity.owner_id());
+        assert_ne!(alice_receipt.operation_key, bob_receipt.operation_key);
+        assert_eq!(alice_receipt.target_id, "route-isolation-owner-alice");
+        assert_eq!(bob_receipt.target_id, "route-isolation-owner-bob");
+        assert_eq!(alice_receipt.response, Some(alice_response.clone()));
+        assert_eq!(bob_receipt.response, Some(bob_response.clone()));
+
+        // The authenticated read route returns each committed target with its authenticated
+        // owner attribution. Shared read visibility is separate from receipt/write ownership.
+        for (token, drawer_id, owner_id) in [
+            (
+                OWNER_ALICE_TOKEN,
+                "route-isolation-owner-alice",
+                "usr_01J8Y_OWNER_ALICE00000000001",
+            ),
+            (
+                OWNER_BOB_TOKEN,
+                "route-isolation-owner-bob",
+                "usr_01J8Y_OWNER_BOB00000000002",
+            ),
+        ] {
+            let response = harness
+                .router
+                .clone()
+                .oneshot(authed_get(&format!("/v1/drawers/{drawer_id}"), token))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            assert_eq!(body["id"], drawer_id);
+            assert_eq!(body["provenance"]["creator"]["id"], owner_id);
+            assert_eq!(body["provenance"]["authenticated_submitter"]["id"], owner_id);
+        }
+
+        let drawers = harness
+            .state
+            .storage
+            .drawer_store()
+            .list_drawers(&agentpalace_storage::DrawerFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            drawers
+                .iter()
+                .filter(|drawer| {
+                    matches!(
+                        drawer.id.as_str(),
+                        "route-isolation-owner-alice" | "route-isolation-owner-bob"
+                    )
+                })
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
