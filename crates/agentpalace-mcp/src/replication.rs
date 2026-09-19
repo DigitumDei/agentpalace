@@ -370,6 +370,7 @@ mod tests {
             name: "hub".into(),
             base_url: format!("http://{address}"),
             token: Some("test-token".into()),
+            oauth: None,
             timeout: std::time::Duration::from_secs(2),
         })
         .unwrap();
@@ -377,6 +378,7 @@ mod tests {
             name: "hub".into(),
             base_url: "http://127.0.0.1:1".into(),
             token: Some("test-token".into()),
+            oauth: None,
             timeout: std::time::Duration::from_millis(100),
         })
         .unwrap();

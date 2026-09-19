@@ -579,7 +579,13 @@ The optional `federation` section of `~/.agentpalace/config.json` controls routi
   - `token`: inline bearer token string (optional)
   - `token_env`: name of an environment variable holding the bearer token (optional, preferred over `token` — keeps secrets out of config.json)
   - Token resolution: the environment variable value wins if both are set; if `token_env` is set but the variable is not present in the environment, the config loader warns and falls back to the inline `token` (or proceeds unauthenticated if neither is set)
-  - `timeout_ms`: HTTP request timeout in milliseconds. Default: `5000`
+- `timeout_ms`: HTTP request timeout in milliseconds. Default: `5000`
+
+OAuth is not represented by a token or secret field in `config.json`. Library callers select
+provider-neutral public-client mode with `RemoteEndpoint::with_oauth`; its `client_id` is not a
+secret. The interactive login operation is explicit, while unattended calls return an
+authentication-required result. Credential persistence is supplied by a secure `TokenStore`, or
+an explicitly enabled volatile session for tests/offline use.
 
 Validation:
 - Duplicate `name` values across remotes fail config load.

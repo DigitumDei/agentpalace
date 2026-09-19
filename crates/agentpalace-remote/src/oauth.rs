@@ -1,0 +1,322 @@
+//! Provider-neutral OAuth discovery and native-client primitives.
+//!
+//! This module deliberately contains no provider names or provider-specific assumptions. It
+//! handles the metadata and PKCE/state invariants that are common to standards-compliant
+//! protected resources. Token persistence is injected through [`TokenStore`]; the default
+//! in-memory store is explicit and is never serialized or logged.
+
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::Mutex;
+
+/// Public client configuration for an OAuth native application.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthConfig {
+    /// Registered public client identifier.
+    pub client_id: String,
+    /// Explicitly permit volatile in-memory credentials instead of an OS credential store.
+    #[serde(default)]
+    pub allow_in_memory: bool,
+    /// Optional absolute login timeout (defaults to five minutes).
+    #[serde(default = "default_login_timeout_seconds")]
+    pub login_timeout_seconds: u64,
+}
+
+fn default_login_timeout_seconds() -> u64 { 300 }
+
+/// RFC 9728 protected-resource metadata.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProtectedResourceMetadata {
+    pub resource: String,
+    #[serde(default)]
+    pub authorization_servers: Vec<String>,
+}
+
+/// RFC 8414 authorization-server metadata.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthorizationServerMetadata {
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    #[serde(default)]
+    pub revocation_endpoint: Option<String>,
+    #[serde(default)]
+    pub device_authorization_endpoint: Option<String>,
+}
+
+/// Extract the resource-metadata URL from a Bearer challenge without treating arbitrary
+/// authentication parameters as URLs. The value is returned opaque and is validated only by
+/// the discovery caller.
+pub(crate) fn resource_metadata_from_challenge(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let start = lower.find("resource_metadata=")? + "resource_metadata=".len();
+    let rest = value.get(start..)?.trim_start();
+    if let Some(quoted) = rest.strip_prefix('"') {
+        return quoted.split_once('"').map(|(url, _)| url.to_owned());
+    }
+    rest.split([',', ' ']).next().filter(|url| !url.is_empty()).map(str::to_owned)
+}
+
+/// Access and rotating refresh credentials. This type intentionally has no `Display` impl.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OAuthSession {
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    pub resource: String,
+    pub issuer: String,
+    pub client_id: String,
+}
+
+/// Storage boundary for credentials. Implementations must scope records by all session identity
+/// fields and must not use ordinary config files for secret material.
+#[async_trait::async_trait]
+pub trait TokenStore: Send + Sync {
+    async fn load(&self, resource: &str, issuer: &str, client_id: &str) -> Option<OAuthSession>;
+    async fn save(&self, session: OAuthSession) -> Result<(), String>;
+    async fn clear(&self, resource: &str, issuer: &str, client_id: &str);
+}
+
+/// Explicit volatile credential storage for offline/test use.
+#[derive(Debug, Default)]
+pub struct InMemoryTokenStore(Mutex<Option<OAuthSession>>);
+
+#[async_trait::async_trait]
+impl TokenStore for InMemoryTokenStore {
+    async fn load(&self, resource: &str, issuer: &str, client_id: &str) -> Option<OAuthSession> {
+        let value = self.0.lock().await.clone()?;
+        (value.resource == resource && value.issuer == issuer && value.client_id == client_id).then_some(value)
+    }
+    async fn save(&self, session: OAuthSession) -> Result<(), String> {
+        *self.0.lock().await = Some(session);
+        Ok(())
+    }
+    async fn clear(&self, resource: &str, issuer: &str, client_id: &str) {
+        let mut guard = self.0.lock().await;
+        if guard.as_ref().is_some_and(|s| s.resource == resource && s.issuer == issuer && s.client_id == client_id) {
+            *guard = None;
+        }
+    }
+}
+
+/// Generate an RFC 7636 verifier and its S256 challenge.
+pub fn new_pkce_pair() -> (String, String) {
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    let verifier = URL_SAFE_NO_PAD.encode(bytes);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+/// Generate unpredictable state for the authorization response.
+pub fn new_state() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Validate that a discovered URL is HTTPS, or is on the exact configured loopback origin.
+pub fn validate_oauth_url(raw: &str, configured_origin: &reqwest::Url, allow_loopback_demo: bool) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(raw).map_err(|_| "OAuth metadata contains an invalid URL".to_owned())?;
+    if url.scheme() == "https" { return Ok(url); }
+    if allow_loopback_demo && url.scheme() == "http" && url.origin() == configured_origin.origin()
+        && url.host_str().is_some_and(|h| h == "localhost" || h == "127.0.0.1" || h == "[::1]") {
+        return Ok(url);
+    }
+    Err("OAuth metadata must use HTTPS (only the exact opted-in loopback origin may use HTTP)".to_owned())
+}
+
+/// Validate discovery relationships before accepting any endpoint or credential.
+pub fn validate_metadata(resource: &ProtectedResourceMetadata, server: &AuthorizationServerMetadata, configured_resource: &reqwest::Url, configured_origin: &reqwest::Url, allow_loopback_demo: bool) -> Result<(), String> {
+    let advertised = reqwest::Url::parse(&resource.resource).map_err(|_| "invalid protected resource URL".to_owned())?;
+    if advertised != *configured_resource { return Err("protected-resource metadata does not identify the configured remote".to_owned()); }
+    let issuer = validate_oauth_url(&server.issuer, configured_origin, allow_loopback_demo)?;
+    if !resource.authorization_servers.iter().any(|candidate| candidate.trim_end_matches('/') == server.issuer.trim_end_matches('/')) {
+        return Err("authorization-server issuer is not advertised by the protected resource".to_owned());
+    }
+    if issuer.origin() != reqwest::Url::parse(&server.authorization_endpoint).map_err(|_| "invalid authorization endpoint".to_owned())?.origin()
+        && issuer.host_str() != reqwest::Url::parse(&server.authorization_endpoint).map_err(|_| "invalid authorization endpoint".to_owned())?.host_str() {
+        return Err("authorization endpoint is unrelated to the discovered issuer".to_owned());
+    }
+    let _ = validate_oauth_url(&server.authorization_endpoint, configured_origin, allow_loopback_demo)?;
+    let _ = validate_oauth_url(&server.token_endpoint, configured_origin, allow_loopback_demo)?;
+    if let Some(endpoint) = &server.revocation_endpoint { let _ = validate_oauth_url(endpoint, configured_origin, allow_loopback_demo)?; }
+    Ok(())
+}
+
+/// Check an authorization callback without ever accepting a mismatched or replayed state.
+pub fn validate_callback_state(expected: &str, returned: &str) -> Result<(), String> {
+    if expected.is_empty() || returned.is_empty() || expected != returned { return Err("OAuth callback state mismatch".to_owned()); }
+    Ok(())
+}
+
+/// Shared session slot used by a client to single-flight token updates.
+pub type SharedTokenStore = Arc<dyn TokenStore>;
+
+/// Return a unix timestamp, useful for bounded expiry checks without exposing credentials.
+pub fn now_seconds() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) }
+
+/// Default bounded interactive timeout.
+pub fn login_timeout(config: &OAuthConfig) -> Duration { Duration::from_secs(config.login_timeout_seconds.clamp(1, 900)) }
+
+/// Fetch and validate protected-resource and authorization-server metadata. Redirects are not
+/// followed, so a malicious metadata endpoint cannot silently move discovery to another origin.
+pub async fn discover_metadata(
+    http: &reqwest::Client,
+    metadata_url: &str,
+    configured_resource: &reqwest::Url,
+    configured_origin: &reqwest::Url,
+    allow_loopback_demo: bool,
+) -> Result<(ProtectedResourceMetadata, AuthorizationServerMetadata), String> {
+    let metadata_url = validate_oauth_url(metadata_url, configured_origin, allow_loopback_demo)?;
+    let protected = http.get(metadata_url).send().await.map_err(|_| "protected-resource metadata is unreachable".to_owned())?
+        .error_for_status().map_err(|_| "protected-resource metadata was rejected".to_owned())?
+        .json::<ProtectedResourceMetadata>().await.map_err(|_| "protected-resource metadata is malformed".to_owned())?;
+    let issuer = protected.authorization_servers.first().ok_or_else(|| "protected-resource metadata advertises no authorization server".to_owned())?;
+    let issuer_url = validate_oauth_url(issuer, configured_origin, allow_loopback_demo)?;
+    let server_url = issuer_url.join(".well-known/oauth-authorization-server").map_err(|_| "cannot construct authorization-server metadata URL".to_owned())?;
+    let server = http.get(server_url).send().await.map_err(|_| "authorization-server metadata is unreachable".to_owned())?
+        .error_for_status().map_err(|_| "authorization-server metadata was rejected".to_owned())?
+        .json::<AuthorizationServerMetadata>().await.map_err(|_| "authorization-server metadata is malformed".to_owned())?;
+    validate_metadata(&protected, &server, configured_resource, configured_origin, allow_loopback_demo)?;
+    Ok((protected, server))
+}
+
+/// Build the native-client authorization request. Only public protocol parameters are placed in
+/// the URL; access and refresh credentials never are.
+pub fn authorization_url(
+    metadata: &AuthorizationServerMetadata,
+    config: &OAuthConfig,
+    redirect_uri: &str,
+    state: &str,
+    challenge: &str,
+    resource: &str,
+) -> Result<reqwest::Url, String> {
+    let mut url = validate_oauth_url(&metadata.authorization_endpoint, &reqwest::Url::parse(resource).map_err(|_| "invalid resource URL".to_owned())?, false)?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &config.client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state)
+        .append_pair("resource", resource);
+    Ok(url)
+}
+
+/// Run one bounded native browser login. Callers decide whether this function is appropriate;
+/// unattended/background requests must return [`RemoteError::AuthenticationRequired`] instead.
+pub async fn browser_login(
+    http: &reqwest::Client,
+    metadata: &AuthorizationServerMetadata,
+    config: &OAuthConfig,
+    resource: &str,
+) -> Result<OAuthSession, String> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.map_err(|_| "cannot bind the loopback OAuth callback".to_owned())?;
+    let port = listener.local_addr().map_err(|_| "cannot determine loopback callback port".to_owned())?.port();
+    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+    let (verifier, challenge) = new_pkce_pair();
+    let state = new_state();
+    let url = authorization_url(metadata, config, &redirect_uri, &state, &challenge, resource)?;
+    open_browser(url.as_str())?;
+    let result = tokio::time::timeout(login_timeout(config), async {
+        let (mut socket, _) = listener.accept().await.map_err(|_| "OAuth callback was not accepted".to_owned())?;
+        let mut bytes = vec![0_u8; 8192];
+        let count = tokio::io::AsyncReadExt::read(&mut socket, &mut bytes).await.map_err(|_| "OAuth callback could not be read".to_owned())?;
+        let request = std::str::from_utf8(&bytes[..count]).map_err(|_| "OAuth callback was not valid HTTP".to_owned())?;
+        let target = request.lines().next().and_then(|line| line.split_whitespace().nth(1)).ok_or_else(|| "OAuth callback request was malformed".to_owned())?;
+        let callback = reqwest::Url::parse(&format!("http://127.0.0.1{target}")).map_err(|_| "OAuth callback URL was malformed".to_owned())?;
+        let returned_state = callback.query_pairs().find(|(key, _)| key == "state").map(|(_, value)| value.into_owned()).unwrap_or_default();
+        validate_callback_state(&state, &returned_state)?;
+        let code = callback.query_pairs().find(|(key, _)| key == "code").map(|(_, value)| value.into_owned()).ok_or_else(|| "OAuth consent did not return an authorization code".to_owned())?;
+        let body = http.post(&metadata.token_endpoint).form(&[
+            ("grant_type", "authorization_code"), ("client_id", config.client_id.as_str()),
+            ("code", code.as_str()), ("redirect_uri", redirect_uri.as_str()),
+            ("code_verifier", verifier.as_str()), ("resource", resource),
+        ]).send().await.map_err(|_| "OAuth token exchange was unreachable".to_owned())?
+            .error_for_status().map_err(|_| "OAuth token exchange was rejected".to_owned())?
+            .json::<TokenResponse>().await.map_err(|_| "OAuth token response was malformed".to_owned())?;
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 24\r\nContent-Type: text/plain\r\n\r\nLogin complete; you may close this window.";
+        let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response).await;
+        Ok::<_, String>(OAuthSession { access_token: body.access_token, refresh_token: body.refresh_token, expires_at: body.expires_in.map(|seconds| now_seconds().saturating_add(seconds)), resource: resource.to_owned(), issuer: metadata.issuer.clone(), client_id: config.client_id.clone() })
+    }).await.map_err(|_| "OAuth login timed out".to_owned())??;
+    Ok(result)
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    #[serde(default)] refresh_token: Option<String>,
+    #[serde(default)] expires_in: Option<u64>,
+}
+
+fn open_browser(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let command = ("cmd", vec!["/C", "start", "", url]);
+    #[cfg(target_os = "macos")]
+    let command = ("open", vec![url]);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let command = ("xdg-open", vec![url]);
+    std::process::Command::new(command.0).args(command.1).spawn().map(|_| ()).map_err(|_| "cannot open the system browser; use an explicit headless login mode".to_owned())
+}
+
+/// Exchange a rotating refresh token once. The caller replaces the stored session with the
+/// returned session; a failed exchange must clear the old refresh token rather than retrying it.
+pub async fn refresh(
+    http: &reqwest::Client,
+    metadata: &AuthorizationServerMetadata,
+    session: &OAuthSession,
+) -> Result<OAuthSession, String> {
+    let refresh_token = session.refresh_token.as_deref().ok_or_else(|| "OAuth session has no refresh token".to_owned())?;
+    let body = http.post(&metadata.token_endpoint).form(&[
+        ("grant_type", "refresh_token"), ("refresh_token", refresh_token),
+        ("client_id", session.client_id.as_str()), ("resource", session.resource.as_str()),
+    ]).send().await.map_err(|_| "OAuth refresh was unreachable".to_owned())?
+        .error_for_status().map_err(|_| "OAuth refresh was rejected; reauthorization is required".to_owned())?
+        .json::<TokenResponse>().await.map_err(|_| "OAuth refresh response was malformed".to_owned())?;
+    Ok(OAuthSession { access_token: body.access_token, refresh_token: body.refresh_token.or_else(|| Some(refresh_token.to_owned())), expires_at: body.expires_in.map(|seconds| now_seconds().saturating_add(seconds)), ..session.clone() })
+}
+
+/// Revoke a grant where the issuer advertises RFC 7009 revocation.
+pub async fn revoke(http: &reqwest::Client, metadata: &AuthorizationServerMetadata, session: &OAuthSession) -> Result<(), String> {
+    let endpoint = metadata.revocation_endpoint.as_deref().ok_or_else(|| "the authorization server does not advertise revocation".to_owned())?;
+    http.post(endpoint).form(&[("token", session.refresh_token.as_deref().unwrap_or(&session.access_token)), ("client_id", session.client_id.as_str())]).send().await
+        .map_err(|_| "OAuth revocation was unreachable".to_owned())?.error_for_status().map(|_| ()).map_err(|_| "OAuth revocation was rejected".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn pkce_is_s256_and_state_is_unpredictable() {
+        let (verifier, challenge) = new_pkce_pair();
+        assert_eq!(challenge, URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())));
+        assert_ne!(new_state(), new_state());
+    }
+    #[test]
+    fn callback_state_rejects_replay_or_mismatch() {
+        assert!(validate_callback_state("a", "a").is_ok());
+        assert!(validate_callback_state("a", "b").is_err());
+        assert!(validate_callback_state("a", "").is_err());
+    }
+    #[test]
+    fn metadata_rejects_resource_and_endpoint_mismatch() {
+        let resource = reqwest::Url::parse("https://hub.example").expect("test URL");
+        let origin = resource.clone();
+        let protected = ProtectedResourceMetadata { resource: "https://other.example".to_owned(), authorization_servers: vec!["https://issuer.example".to_owned()] };
+        let server = AuthorizationServerMetadata { issuer: "https://issuer.example".to_owned(), authorization_endpoint: "https://issuer.example/authorize".to_owned(), token_endpoint: "https://issuer.example/token".to_owned(), revocation_endpoint: None, device_authorization_endpoint: None };
+        assert!(validate_metadata(&protected, &server, &resource, &origin, false).is_err());
+    }
+    #[test]
+    fn non_loopback_http_is_rejected() {
+        let origin = reqwest::Url::parse("https://hub.example").expect("test URL");
+        assert!(validate_oauth_url("http://issuer.example/token", &origin, true).is_err());
+    }
+}

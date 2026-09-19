@@ -18,6 +18,7 @@
 //!     name: "friend-palace".to_owned(),
 //!     base_url: "https://palace.example".to_owned(),
 //!     token: Some("secret-token".to_owned()),
+//!     oauth: None,
 //!     timeout: DEFAULT_TIMEOUT,
 //! };
 //! let client = RemoteClient::new(endpoint)?;
@@ -29,9 +30,13 @@
 
 mod client;
 mod error;
+mod oauth;
 
 pub use client::RemoteClient;
 pub use error::{RemoteError, Result};
+pub use oauth::{authorization_url, browser_login, discover_metadata, new_pkce_pair, new_state,
+    refresh, revoke, validate_callback_state, validate_metadata, validate_oauth_url,
+    AuthorizationServerMetadata, OAuthConfig, OAuthSession, ProtectedResourceMetadata, TokenStore};
 
 use agentpalace_federation::{
     AckMessageRequest, AddDrawerRequest, AddDrawerResponse, ChangesQuery, ChangesResponse,
@@ -109,8 +114,23 @@ pub struct RemoteEndpoint {
     pub base_url: String,
     /// Bearer token, if the remote requires authentication.
     pub token: Option<String>,
+    /// Optional provider-neutral OAuth configuration. When set, it is used only after a
+    /// protected-resource challenge; it never silently replaces an explicitly configured token.
+    pub oauth: Option<OAuthConfig>,
     /// Per-request timeout applied to every call made through this endpoint.
     pub timeout: std::time::Duration,
+}
+
+impl RemoteEndpoint {
+    /// Construct an endpoint using explicit provider-neutral OAuth public-client mode.
+    pub fn with_oauth(
+        name: impl Into<String>,
+        base_url: impl Into<String>,
+        config: OAuthConfig,
+        timeout: std::time::Duration,
+    ) -> Self {
+        Self { name: name.into(), base_url: base_url.into(), token: None, oauth: Some(config), timeout }
+    }
 }
 
 /// One method per `/v1` endpoint of the federation REST API.
