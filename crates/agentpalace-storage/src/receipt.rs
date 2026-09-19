@@ -502,7 +502,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use agentpalace_core::{OwnerScopedKey, ProvenanceEnvelope};
+    use agentpalace_core::{OwnerScopedKey, ProvenanceEnvelope, ProvenanceError};
     use super::{
         MutationReceiptStore, NewReceipt, RECEIPT_KIND_DRAWER_ADD, ReceiptOutcome, ReceiptState,
     };
@@ -644,10 +644,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_operation_id_is_rejected() {
-        let (store, _dir) = store();
-        let err = store.begin_receipt(&receipt("", "hash-a")).unwrap_err();
-        assert!(err.to_string().contains("operation_id"), "{err}");
+    fn owner_scoped_key_rejects_empty_raw_key() {
+        assert_eq!(
+            OwnerScopedKey::new(None, ""),
+            Err(ProvenanceError::EmptyField { field: "raw_key" }),
+        );
     }
 
     #[test]
