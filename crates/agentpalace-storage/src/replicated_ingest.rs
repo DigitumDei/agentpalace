@@ -183,6 +183,7 @@ mod tests {
             embedding: vec![0.1; 384],
             locator: None,
             view_metadata: None,
+            provenance: None,
         }
     }
 

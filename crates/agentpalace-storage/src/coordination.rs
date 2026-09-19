@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 pub use agentpalace_core::UNSCOPED_WING;
-use agentpalace_core::{SHARED_AGENT_DIARY_WING, WingId};
+use agentpalace_core::{PersistedProvenance, SHARED_AGENT_DIARY_WING, WingId};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -207,6 +207,9 @@ pub struct Task {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    /// Durable attribution; `None` means this row predates provenance storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<PersistedProvenance>,
 }
 
 /// Input for an idempotent addressed message.
@@ -241,6 +244,9 @@ pub struct Message {
     pub acknowledged_by: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Durable attribution; absent on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<PersistedProvenance>,
 }
 
 /// Input for an immutable artifact.
@@ -266,6 +272,9 @@ pub struct Artifact {
     pub content_hash: String,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Durable attribution; absent on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<PersistedProvenance>,
 }
 
 /// Input for an immutable, idempotent task result.
@@ -286,6 +295,9 @@ pub struct TaskResult {
     pub payload: Value,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Durable attribution; absent on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<PersistedProvenance>,
 }
 
 /// Opaque local ordering cursor.
@@ -460,23 +472,23 @@ CREATE TABLE IF NOT EXISTS coordination_tasks (
  revision INTEGER NOT NULL, created_by TEXT NOT NULL, owner TEXT, parent_id TEXT,
  dependencies_json TEXT NOT NULL, budget_json TEXT, lease_expires_at TEXT, expires_at TEXT,
  idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
- wing TEXT NOT NULL DEFAULT 'wing_unscoped',
+ wing TEXT NOT NULL DEFAULT 'wing_unscoped', executor_affinity TEXT, provenance_json TEXT,
  UNIQUE(created_by, idempotency_key), FOREIGN KEY(parent_id) REFERENCES coordination_tasks(task_id));
 CREATE TABLE IF NOT EXISTS coordination_messages (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE NOT NULL, task_id TEXT NOT NULL,
  sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL, payload_json TEXT NOT NULL,
  envelope_version INTEGER NOT NULL, idempotency_key TEXT NOT NULL, acknowledged_at TEXT,
- acknowledged_by TEXT, created_at TEXT NOT NULL, UNIQUE(sender, idempotency_key),
+ acknowledged_by TEXT, created_at TEXT NOT NULL, provenance_json TEXT, UNIQUE(sender, idempotency_key),
  FOREIGN KEY(task_id) REFERENCES coordination_tasks(task_id));
 CREATE INDEX IF NOT EXISTS idx_coordination_inbox ON coordination_messages(recipient, sequence);
 CREATE TABLE IF NOT EXISTS coordination_artifacts (
  artifact_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, created_by TEXT NOT NULL, role TEXT NOT NULL,
  media_type TEXT NOT NULL, content TEXT NOT NULL, content_hash TEXT NOT NULL, idempotency_key TEXT NOT NULL,
- created_at TEXT NOT NULL, UNIQUE(created_by, idempotency_key),
+ created_at TEXT NOT NULL, provenance_json TEXT, UNIQUE(created_by, idempotency_key),
  FOREIGN KEY(task_id) REFERENCES coordination_tasks(task_id));
 CREATE TABLE IF NOT EXISTS coordination_results (
  result_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, created_by TEXT NOT NULL,
- payload_json TEXT NOT NULL, idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL,
+ payload_json TEXT NOT NULL, idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL, provenance_json TEXT,
  UNIQUE(created_by, idempotency_key), FOREIGN KEY(task_id) REFERENCES coordination_tasks(task_id));
 CREATE TABLE IF NOT EXISTS coordination_events (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL, entity_type TEXT NOT NULL,
@@ -510,6 +522,10 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             "TEXT NOT NULL DEFAULT 'wing_unscoped'",
         )?;
         add_column_if_missing(&tx, "coordination_tasks", "executor_affinity", "TEXT")?;
+        add_column_if_missing(&tx, "coordination_tasks", "provenance_json", "TEXT")?;
+        add_column_if_missing(&tx, "coordination_messages", "provenance_json", "TEXT")?;
+        add_column_if_missing(&tx, "coordination_artifacts", "provenance_json", "TEXT")?;
+        add_column_if_missing(&tx, "coordination_results", "provenance_json", "TEXT")?;
         add_column_if_missing(&tx, "coordination_tasks", "sequence", "INTEGER")?;
         // A separate AUTOINCREMENT allocator prevents sequence reuse after deletions/VACUUM.
         // Backfill and trigger installation share the schema upgrade's write lock.
@@ -568,7 +584,16 @@ END;
     /// `claim_task`/`transition_task` to reach that state would fabricate audit history (e.g. a
     /// claim by a worker that never existed).
     pub fn create_task(&self, input: &NewTask) -> Result<Task> {
-        Ok(self.create_task_with_state(input, TaskState::Pending, false)?.0)
+        self.create_task_with_provenance(input, None)
+    }
+
+    /// Create a task while atomically retaining its validated domain provenance.
+    pub fn create_task_with_provenance(
+        &self,
+        input: &NewTask,
+        provenance: Option<&PersistedProvenance>,
+    ) -> Result<Task> {
+        Ok(self.create_task_with_state(input, TaskState::Pending, false, provenance)?.0)
     }
 
     /// Create a task directly in `initial_state`, or return the prior committed task for an
@@ -609,7 +634,7 @@ END;
                 "TaskState::Expired is a lifecycle outcome this palace produces itself; an imported task cannot assert it as an initial state".into(),
             ));
         }
-        let (task, replayed) = self.create_task_with_state(input, initial_state, true)?;
+        let (task, replayed) = self.create_task_with_state(input, initial_state, true, None)?;
         Ok(ImportedTask { task, replayed })
     }
 
@@ -618,6 +643,7 @@ END;
         input: &NewTask,
         initial_state: TaskState,
         is_import: bool,
+        provenance: Option<&PersistedProvenance>,
     ) -> Result<(Task, bool)> {
         validate_key(&input.idempotency_key)?;
         validate_actor(&input.created_by)?;
@@ -646,7 +672,7 @@ END;
         }
         let now = OffsetDateTime::now_utc();
         let id = format!("task_{}", Uuid::new_v4().simple());
-        tx.execute("INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,idempotency_key,created_at,updated_at,wing) VALUES (?1,?2,?3,?12,0,?4,NULL,?5,?6,?7,NULL,?8,?9,?10,?10,?11)", params![id,input.title,input.description,input.created_by,input.parent_id,serde_json::to_string(&input.dependencies)?,input.budget.as_ref().map(serde_json::to_string).transpose()?,format_time_opt(input.expires_at)?,input.idempotency_key,format_time(now)?,wing,initial_state.as_str()])?;
+        tx.execute("INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,idempotency_key,created_at,updated_at,wing,provenance_json) VALUES (?1,?2,?3,?12,0,?4,NULL,?5,?6,?7,NULL,?8,?9,?10,?10,?11,?13)", params![id,input.title,input.description,input.created_by,input.parent_id,serde_json::to_string(&input.dependencies)?,input.budget.as_ref().map(serde_json::to_string).transpose()?,format_time_opt(input.expires_at)?,input.idempotency_key,format_time(now)?,wing,initial_state.as_str(),provenance.map(serde_json::to_string).transpose()?])?;
         let details = is_import.then(|| serde_json::json!({"imported": true}));
         append_event(
             &tx,
@@ -994,6 +1020,15 @@ END;
 
     /// Send an addressed message idempotently.
     pub fn send_message(&self, input: &NewMessage) -> Result<Message> {
+        self.send_message_with_provenance(input, None)
+    }
+
+    /// Send a message while atomically retaining its validated domain provenance.
+    pub fn send_message_with_provenance(
+        &self,
+        input: &NewMessage,
+        provenance: Option<&PersistedProvenance>,
+    ) -> Result<Message> {
         validate_key(&input.idempotency_key)?;
         validate_actor(&input.sender)?;
         validate_actor(&input.recipient)?;
@@ -1007,7 +1042,7 @@ END;
         let task = require_task(&tx, &input.task_id)?;
         let now = OffsetDateTime::now_utc();
         let id = format!("message_{}", Uuid::new_v4().simple());
-        tx.execute("INSERT INTO coordination_messages(message_id,task_id,sender,recipient,kind,payload_json,envelope_version,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![id,input.task_id,input.sender,input.recipient,input.kind,serde_json::to_string(&input.payload)?,input.envelope_version,input.idempotency_key,format_time(now)?])?;
+        tx.execute("INSERT INTO coordination_messages(message_id,task_id,sender,recipient,kind,payload_json,envelope_version,idempotency_key,created_at,provenance_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![id,input.task_id,input.sender,input.recipient,input.kind,serde_json::to_string(&input.payload)?,input.envelope_version,input.idempotency_key,format_time(now)?,provenance.map(serde_json::to_string).transpose()?])?;
         append_event(
             &tx,
             "message",
@@ -1056,7 +1091,7 @@ END;
         }
         let conn = self.connection()?;
         let requested = limit.clamp(1, 500);
-        let mut sql = "SELECT m.message_id,m.sequence,m.task_id,m.sender,m.recipient,m.kind,m.payload_json,m.envelope_version,m.acknowledged_at,m.acknowledged_by,m.created_at FROM coordination_messages m".to_owned();
+        let mut sql = "SELECT m.message_id,m.sequence,m.task_id,m.sender,m.recipient,m.kind,m.payload_json,m.envelope_version,m.acknowledged_at,m.acknowledged_by,m.created_at,m.provenance_json FROM coordination_messages m".to_owned();
         let mut predicates = vec!["m.recipient=?1".to_owned(), "m.sequence>?2".to_owned()];
         let mut bindings: Vec<Box<dyn rusqlite::ToSql>> =
             vec![Box::new(recipient.to_owned()), Box::new(cursor.map_or(0, |c| c.0))];
@@ -1150,6 +1185,15 @@ END;
     }
     /// Store an immutable artifact idempotently.
     pub fn put_artifact(&self, input: &NewArtifact) -> Result<Artifact> {
+        self.put_artifact_with_provenance(input, None)
+    }
+
+    /// Store an artifact while atomically retaining its validated domain provenance.
+    pub fn put_artifact_with_provenance(
+        &self,
+        input: &NewArtifact,
+        provenance: Option<&PersistedProvenance>,
+    ) -> Result<Artifact> {
         validate_key(&input.idempotency_key)?;
         validate_actor(&input.created_by)?;
         if input.content.len() > MAX_PAYLOAD_BYTES {
@@ -1166,7 +1210,7 @@ END;
         let id = format!("artifact_{}", Uuid::new_v4().simple());
         let hash = blake3::hash(input.content.as_bytes()).to_hex().to_string();
         tx.execute(
-            "INSERT INTO coordination_artifacts(artifact_id,task_id,created_by,role,media_type,content,content_hash,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            "INSERT INTO coordination_artifacts(artifact_id,task_id,created_by,role,media_type,content,content_hash,idempotency_key,created_at,provenance_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 id,
                 input.task_id,
@@ -1176,7 +1220,8 @@ END;
                 input.content,
                 hash,
                 input.idempotency_key,
-                format_time(now)?
+                format_time(now)?,
+                provenance.map(serde_json::to_string).transpose()?
             ],
         )?;
         append_event(
@@ -1204,6 +1249,15 @@ END;
     }
     /// Store an immutable task result idempotently.
     pub fn put_result(&self, input: &NewTaskResult) -> Result<TaskResult> {
+        self.put_result_with_provenance(input, None)
+    }
+
+    /// Store a result while atomically retaining its validated domain provenance.
+    pub fn put_result_with_provenance(
+        &self,
+        input: &NewTaskResult,
+        provenance: Option<&PersistedProvenance>,
+    ) -> Result<TaskResult> {
         validate_key(&input.idempotency_key)?;
         validate_actor(&input.created_by)?;
         bounded_json(&input.payload)?;
@@ -1217,8 +1271,8 @@ END;
         let now = OffsetDateTime::now_utc();
         let id = format!("result_{}", Uuid::new_v4().simple());
         tx.execute(
-            "INSERT INTO coordination_results(result_id,task_id,created_by,payload_json,idempotency_key,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![id, input.task_id, input.created_by, serde_json::to_string(&input.payload)?, input.idempotency_key, format_time(now)?],
+            "INSERT INTO coordination_results(result_id,task_id,created_by,payload_json,idempotency_key,created_at,provenance_json) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![id, input.task_id, input.created_by, serde_json::to_string(&input.payload)?, input.idempotency_key, format_time(now)?, provenance.map(serde_json::to_string).transpose()?],
         )?;
         append_event(
             &tx,
@@ -1578,7 +1632,7 @@ fn task_wing(tx: &Transaction<'_>, task_id: &str) -> Result<String> {
         .ok_or_else(|| StorageError::Invariant(format!("task `{task_id}`{NOT_FOUND_SUFFIX}")))
 }
 fn get_task_conn(conn: &Connection, id: &str) -> Result<Option<Task>> {
-    let mut s=conn.prepare("SELECT task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,created_at,updated_at,wing,executor_affinity FROM coordination_tasks WHERE task_id=?1")?;
+    let mut s=conn.prepare("SELECT task_id,title,description,state,revision,created_by,owner,parent_id,dependencies_json,budget_json,lease_expires_at,expires_at,created_at,updated_at,wing,executor_affinity,provenance_json FROM coordination_tasks WHERE task_id=?1")?;
     s.query_row([id], task_row).optional().map_err(Into::into)
 }
 fn get_task_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<Task>> {
@@ -1603,6 +1657,7 @@ fn task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let created: String = r.get(12)?;
     let updated: String = r.get(13)?;
     let wing: String = r.get(14)?;
+    let provenance: Option<String> = r.get(16)?;
     Ok(Task {
         task_id: r.get(0)?,
         title: r.get(1)?,
@@ -1620,12 +1675,14 @@ fn task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         expires_at: parse_time_opt(expiry).map_err(sql_conv)?,
         created_at: parse_time(created).map_err(sql_conv)?,
         updated_at: parse_time(updated).map_err(sql_conv)?,
+        provenance: provenance.map(|value| serde_json::from_str(&value)).transpose().map_err(sql_conv)?,
     })
 }
 fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     let payload: String = r.get(6)?;
     let ack: Option<String> = r.get(8)?;
     let created: String = r.get(10)?;
+    let provenance: Option<String> = r.get(11)?;
     Ok(Message {
         message_id: r.get(0)?,
         sequence: r.get(1)?,
@@ -1638,10 +1695,11 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         acknowledged_at: parse_time_opt(ack).map_err(sql_conv)?,
         acknowledged_by: r.get(9)?,
         created_at: parse_time(created).map_err(sql_conv)?,
+        provenance: provenance.map(|value| serde_json::from_str(&value)).transpose().map_err(sql_conv)?,
     })
 }
 fn get_message_conn(conn: &Connection, id: &str) -> Result<Option<Message>> {
-    let mut s=conn.prepare("SELECT message_id,sequence,task_id,sender,recipient,kind,payload_json,envelope_version,acknowledged_at,acknowledged_by,created_at FROM coordination_messages WHERE message_id=?1")?;
+    let mut s=conn.prepare("SELECT message_id,sequence,task_id,sender,recipient,kind,payload_json,envelope_version,acknowledged_at,acknowledged_by,created_at,provenance_json FROM coordination_messages WHERE message_id=?1")?;
     s.query_row([id], message_row).optional().map_err(Into::into)
 }
 fn get_message_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<Message>> {
@@ -1663,6 +1721,7 @@ fn find_message_by_key(tx: &Transaction<'_>, actor: &str, key: &str) -> Result<O
 }
 fn artifact_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
     let created: String = r.get(7)?;
+    let provenance: Option<String> = r.get(8)?;
     Ok(Artifact {
         artifact_id: r.get(0)?,
         task_id: r.get(1)?,
@@ -1672,10 +1731,11 @@ fn artifact_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
         content: r.get(5)?,
         content_hash: r.get(6)?,
         created_at: parse_time(created).map_err(sql_conv)?,
+        provenance: provenance.map(|value| serde_json::from_str(&value)).transpose().map_err(sql_conv)?,
     })
 }
 fn get_artifact_conn(conn: &Connection, id: &str) -> Result<Option<Artifact>> {
-    let mut s=conn.prepare("SELECT artifact_id,task_id,created_by,role,media_type,content,content_hash,created_at FROM coordination_artifacts WHERE artifact_id=?1")?;
+    let mut s=conn.prepare("SELECT artifact_id,task_id,created_by,role,media_type,content,content_hash,created_at,provenance_json FROM coordination_artifacts WHERE artifact_id=?1")?;
     s.query_row([id], artifact_row).optional().map_err(Into::into)
 }
 fn get_artifact_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<Artifact>> {
@@ -1692,17 +1752,19 @@ fn find_artifact_by_key(tx: &Transaction<'_>, actor: &str, key: &str) -> Result<
 fn result_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskResult> {
     let payload: String = r.get(3)?;
     let created: String = r.get(4)?;
+    let provenance: Option<String> = r.get(5)?;
     Ok(TaskResult {
         result_id: r.get(0)?,
         task_id: r.get(1)?,
         created_by: r.get(2)?,
         payload: serde_json::from_str(&payload).map_err(sql_conv)?,
         created_at: parse_time(created).map_err(sql_conv)?,
+        provenance: provenance.map(|value| serde_json::from_str(&value)).transpose().map_err(sql_conv)?,
     })
 }
 fn get_result_conn(conn: &Connection, id: &str) -> Result<Option<TaskResult>> {
     let mut statement = conn.prepare(
-        "SELECT result_id,task_id,created_by,payload_json,created_at FROM coordination_results WHERE result_id=?1",
+        "SELECT result_id,task_id,created_by,payload_json,created_at,provenance_json FROM coordination_results WHERE result_id=?1",
     )?;
     statement.query_row([id], result_row).optional().map_err(Into::into)
 }
@@ -2617,6 +2679,12 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             .collect::<rusqlite::Result<Vec<_>>>()
             .expect("collect pragma rows")
     }
+    fn assert_column_position(path: &Path, table: &str, column: &str, expected: usize) {
+        let actual = table_info(path, table)
+            .iter()
+            .position(|(name, ..)| name == column);
+        assert_eq!(actual, Some(expected), "{table}.{column} column position");
+    }
     /// `(name, unique)` for every index on `table`, sorted — enough to catch an index that
     /// exists on only one of a fresh and an upgraded schema. `table_info` alone would miss
     /// that: columns can match while an index is silently absent on one side.
@@ -3346,8 +3414,108 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         {
             let conn = Connection::open(&upgraded_path).expect("open");
             conn.execute_batch(LEGACY_SCHEMA_SQL).expect("legacy schema");
+            conn.execute(
+                "INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,dependencies_json,idempotency_key,created_at,updated_at) \
+                 VALUES ('legacy-coordination-task','legacy title','legacy description','pending',0,'legacy-owner','[]','legacy-task-key','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("legacy task row");
+            conn.execute(
+                "INSERT INTO coordination_messages(message_id,task_id,sender,recipient,kind,payload_json,envelope_version,idempotency_key,created_at) \
+                 VALUES ('legacy-message','legacy-coordination-task','legacy-sender','legacy-recipient','request','{}',1,'legacy-message-key','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("legacy message row");
+            conn.execute(
+                "INSERT INTO coordination_artifacts(artifact_id,task_id,created_by,role,media_type,content,content_hash,idempotency_key,created_at) \
+                 VALUES ('legacy-artifact','legacy-coordination-task','legacy-owner','evidence','text/plain','legacy content','legacy-hash','legacy-artifact-key','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("legacy artifact row");
+            conn.execute(
+                "INSERT INTO coordination_results(result_id,task_id,created_by,payload_json,idempotency_key,created_at) \
+                 VALUES ('legacy-result','legacy-coordination-task','legacy-owner','{}','legacy-result-key','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("legacy result row");
         }
-        CoordinationStore::new(&upgraded_path).ensure_schema().expect("upgrade schema");
+        let upgraded = CoordinationStore::new(&upgraded_path);
+        upgraded.ensure_schema().expect("upgrade schema");
+
+        // The migration appends each nullable column to the legacy table. Keep the physical
+        // order explicit: the normal decoders project provenance_json into the final selected
+        // slot (11, 8, and 5 respectively), even though its post-upgrade table positions are
+        // 12, 9, and 6. This catches a migration that merely adds the column while changing
+        // the ordered schema contract covered by the fresh path.
+        assert_column_position(&upgraded_path, "coordination_messages", "provenance_json", 12);
+        assert_column_position(&upgraded_path, "coordination_artifacts", "provenance_json", 9);
+        assert_column_position(&upgraded_path, "coordination_results", "provenance_json", 6);
+        for (table, column, expected) in [
+            ("coordination_tasks", "provenance_json", 17),
+            ("coordination_events", "wing", 12),
+            ("coordination_messages", "provenance_json", 12),
+            ("coordination_artifacts", "provenance_json", 9),
+            ("coordination_results", "provenance_json", 6),
+        ] {
+            assert_column_position(&fresh_path, table, column, expected);
+            assert_column_position(&upgraded_path, table, column, expected);
+        }
+
+        let message = upgraded
+            .get_message("legacy-message")
+            .expect("legacy message")
+            .expect("legacy message row");
+        assert_eq!(message.task_id, "legacy-coordination-task");
+        assert_eq!(message.sender, "legacy-sender");
+        assert_eq!(message.recipient, "legacy-recipient");
+        assert_eq!(message.kind, "request");
+        assert_eq!(message.payload, serde_json::json!({}));
+        assert!(
+            message.provenance.is_none(),
+            "legacy messages without provenance remain compatible"
+        );
+        let inbox = upgraded
+            .inbox(
+                "legacy-recipient",
+                None,
+                None,
+                10,
+                false,
+                CoordinationVisibility::Trusted,
+            )
+            .expect("legacy inbox");
+        assert_eq!(inbox.messages.len(), 1);
+        assert_eq!(inbox.messages[0].message_id, "legacy-message");
+        assert!(
+            inbox.messages[0].provenance.is_none(),
+            "legacy inbox messages without provenance remain compatible"
+        );
+
+        let artifact = upgraded
+            .get_artifact("legacy-artifact")
+            .expect("legacy artifact")
+            .expect("legacy artifact row");
+        assert_eq!(artifact.task_id, "legacy-coordination-task");
+        assert_eq!(artifact.created_by, "legacy-owner");
+        assert_eq!(artifact.role, "evidence");
+        assert_eq!(artifact.media_type, "text/plain");
+        assert_eq!(artifact.content, "legacy content");
+        assert!(
+            artifact.provenance.is_none(),
+            "legacy artifacts without provenance remain compatible"
+        );
+
+        let result = upgraded
+            .get_result("legacy-result")
+            .expect("legacy result")
+            .expect("legacy result row");
+        assert_eq!(result.task_id, "legacy-coordination-task");
+        assert_eq!(result.created_by, "legacy-owner");
+        assert_eq!(result.payload, serde_json::json!({}));
+        assert!(
+            result.provenance.is_none(),
+            "legacy results without provenance remain compatible"
+        );
 
         assert_eq!(
             table_info(&fresh_path, "coordination_tasks"),
@@ -3358,6 +3526,21 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             table_info(&fresh_path, "coordination_events"),
             table_info(&upgraded_path, "coordination_events"),
             "a fresh palace and an upgraded palace must agree on coordination_events"
+        );
+        assert_eq!(
+            table_info(&fresh_path, "coordination_messages"),
+            table_info(&upgraded_path, "coordination_messages"),
+            "a fresh palace and an upgraded palace must agree on coordination_messages"
+        );
+        assert_eq!(
+            table_info(&fresh_path, "coordination_artifacts"),
+            table_info(&upgraded_path, "coordination_artifacts"),
+            "a fresh palace and an upgraded palace must agree on coordination_artifacts"
+        );
+        assert_eq!(
+            table_info(&fresh_path, "coordination_results"),
+            table_info(&upgraded_path, "coordination_results"),
+            "a fresh palace and an upgraded palace must agree on coordination_results"
         );
         // Columns matching is not enough — an index present on only one path is invisible to
         // `table_info` but still a real divergence (e.g. a full scan on one side, an index seek

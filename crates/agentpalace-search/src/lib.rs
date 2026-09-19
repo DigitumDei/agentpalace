@@ -343,6 +343,7 @@ where
                     stale: entry.stale,
                     content_hash: Some(entry.record.content_hash.clone()),
                     view,
+                    provenance: entry.record.provenance.as_ref().and_then(|value| serde_json::to_value(value.response()).ok()),
                 }
             })
             .collect())
@@ -808,6 +809,7 @@ mod tests {
             embedding: embedding(score.unwrap_or(0.0)),
             locator: None,
             view_metadata: None,
+            provenance: None,
         }
     }
 
@@ -1803,6 +1805,7 @@ mod tests {
                     stale: false,
                     content_hash: None,
                     view: None,
+                    provenance: None,
                 },
                 agentpalace_core::SearchResult {
                     drawer_id: None,
@@ -1815,6 +1818,7 @@ mod tests {
                     stale: false,
                     content_hash: None,
                     view: None,
+                    provenance: None,
                 },
             ],
             None,
@@ -2655,6 +2659,7 @@ mod tests {
                 commit_hash: None,
             }),
             view_metadata: None,
+            provenance: None,
         }
     }
 

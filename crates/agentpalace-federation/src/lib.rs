@@ -170,6 +170,9 @@ pub struct RemoteDrawerResult {
     /// Agent name recorded at ingest time.
     #[serde(default)]
     pub added_by: Option<String>,
+    /// Redacted durable provenance, or absent for legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Value>,
     /// True when the drawer's mined source file changed since mining
     /// (locator-backed rows).  Absent unless true; `serde(default)` keeps old
     /// servers/clients wire-compatible.
@@ -629,6 +632,9 @@ pub struct CoordinationTaskDto {
     pub created_at: String,
     /// RFC 3339 timestamp.
     pub updated_at: String,
+    /// Redacted durable provenance, or absent for legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Value>,
 }
 
 /// Request body for `POST /v1/coordination/tasks`. Mirrors
@@ -720,6 +726,9 @@ pub struct CoordinationMessageDto {
     pub acknowledged_by: Option<String>,
     /// RFC 3339 timestamp.
     pub created_at: String,
+    /// Redacted durable provenance, or absent for legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Value>,
 }
 
 /// Request body for `POST /v1/coordination/messages`. Mirrors
@@ -809,6 +818,9 @@ pub struct CoordinationArtifactDto {
     pub content_hash: String,
     /// RFC 3339 timestamp.
     pub created_at: String,
+    /// Redacted durable provenance, or absent for legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Value>,
 }
 
 /// Request body for `POST /v1/coordination/artifacts`. Mirrors
@@ -845,6 +857,9 @@ pub struct CoordinationTaskResultDto {
     pub payload: Value,
     /// RFC 3339 timestamp.
     pub created_at: String,
+    /// Redacted durable provenance, or absent for legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Value>,
 }
 
 /// Request body for `POST /v1/coordination/results`. Mirrors
@@ -1175,6 +1190,7 @@ mod tests {
                 content_hash: None,
                 filed_at: None,
                 added_by: None,
+                provenance: None,
                 stale: false,
             }],
         };
@@ -1498,6 +1514,7 @@ mod tests {
             expires_at: None,
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             updated_at: "2026-01-01T00:01:00Z".to_owned(),
+            provenance: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let decoded: CoordinationTaskDto = serde_json::from_str(&json).unwrap();
@@ -1603,6 +1620,7 @@ mod tests {
             acknowledged_at: Some("2026-01-01T00:00:00Z".to_owned()),
             acknowledged_by: Some("bob".to_owned()),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
+            provenance: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let decoded: CoordinationMessageDto = serde_json::from_str(&json).unwrap();
@@ -1701,6 +1719,7 @@ mod tests {
                 acknowledged_at: None,
                 acknowledged_by: None,
                 created_at: "2026-01-01T00:00:00Z".to_owned(),
+                provenance: None,
             }],
             next_cursor: Some("7".to_owned()),
         };
@@ -1728,6 +1747,7 @@ mod tests {
             content: "hello".to_owned(),
             content_hash: "abc123".to_owned(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
+            provenance: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let decoded: CoordinationArtifactDto = serde_json::from_str(&json).unwrap();
@@ -1767,6 +1787,7 @@ mod tests {
             created_by: "alice".to_owned(),
             payload: json!({"score": 1}),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
+            provenance: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let decoded: CoordinationTaskResultDto = serde_json::from_str(&json).unwrap();

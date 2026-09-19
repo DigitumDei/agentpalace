@@ -155,6 +155,7 @@ mod tests {
             content: new_artifact.content.clone(),
             content_hash: "irrelevant-for-this-test".to_owned(),
             created_at: time::OffsetDateTime::now_utc(),
+            provenance: None,
         };
         let decoded = artifact_to_a2a_artifact(&stored).unwrap();
         assert_eq!(decoded, original);
@@ -171,6 +172,7 @@ mod tests {
             content: "{}".to_owned(),
             content_hash: "irrelevant-for-this-test".to_owned(),
             created_at: time::OffsetDateTime::now_utc(),
+            provenance: None,
         };
         let err = artifact_to_a2a_artifact(&stored).expect_err("wrong role must be rejected");
         assert!(matches!(err, A2aError::InvalidStoredShape { shape: "Artifact", .. }));
@@ -200,6 +202,7 @@ mod tests {
             .to_string(),
             content_hash: "irrelevant-for-this-test".to_owned(),
             created_at: time::OffsetDateTime::now_utc(),
+            provenance: None,
         };
         let err = artifact_to_a2a_artifact(&stored)
             .expect_err("a stored artifact with an empty parts list must be rejected");
@@ -230,6 +233,7 @@ mod tests {
             .to_string(),
             content_hash: "irrelevant-for-this-test".to_owned(),
             created_at: time::OffsetDateTime::now_utc(),
+            provenance: None,
         };
         let err = artifact_to_a2a_artifact(&stored)
             .expect_err("a stored part with two content fields set must be rejected");

@@ -71,6 +71,10 @@ pub const MAX_RFC3339_CHARS: usize = 64;
 /// Maximum number of source references attached to a single provenance envelope.
 pub const MAX_SOURCE_REFS: usize = 128;
 
+/// Maximum number of modifier or additional-submission events retained in a
+/// [`PersistedProvenance`] history.
+pub const MAX_PROVENANCE_HISTORY: usize = 128;
+
 /// Error returned when validating or parsing provenance fields.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ProvenanceError {
@@ -113,12 +117,25 @@ pub enum ProvenanceError {
     #[error("invalid storage origin: {0}")]
     InvalidStorageOrigin(String),
 
+    /// Persisted provenance fields contradict one another.
+    #[error("invalid provenance: {0}")]
+    InvalidProvenance(String),
+
     /// Too many source references in envelope.
     #[error("source references count ({count}) exceeds maximum allowed ({max})")]
     TooManySourceRefs {
         /// Actual count encountered.
         count: usize,
         /// Maximum permitted count.
+        max: usize,
+    },
+
+    /// Too many modifier or additional-submission events in persisted provenance history.
+    #[error("provenance history count ({count}) exceeds maximum allowed ({max})")]
+    TooManyHistoryEntries {
+        /// Actual number of history entries encountered.
+        count: usize,
+        /// Maximum permitted number of history entries.
         max: usize,
     },
 
@@ -2061,6 +2078,512 @@ pub struct ProvenanceEnvelope {
     pub source_refs: Vec<SourceReference>,
 }
 
+/// The durable kinds of authenticated provenance changes.
+///
+/// This is deliberately an attribution taxonomy, not an evidence or
+/// authorization state machine.  A deletion or invalidation records who did
+/// it; it does not assert that the underlying content was false or that the
+/// caller was entitled to do it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceAction {
+    /// The first durable submission of a record.
+    Created,
+    /// A later authenticated change to an existing record.
+    Modified,
+    /// A duplicate or additional submission that retained the original creator.
+    AdditionalSubmission,
+    /// A hard deletion or attributed deletion event.
+    Deleted,
+    /// An invalidation event, with its evidence/date stored by the owning domain.
+    Invalidated,
+}
+
+/// One authenticated provenance event retained with a durable record.
+///
+/// `owner` is the authenticated human identity at write time.  `agent` is a
+/// separate caller assertion and must never be used as a substitute owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvenanceHistoryEntry {
+    /// What happened to the record.
+    pub action: ProvenanceAction,
+    /// Authenticated owner responsible for this event, or explicit legacy unknown.
+    pub owner: OwnerIdentity,
+    /// Caller-asserted agent or harness, if supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentAttribution>,
+    /// Server-assigned time of the event.
+    pub recorded_at: RecordingTime,
+}
+
+impl ProvenanceHistoryEntry {
+    /// Construct an event using the server-assigned recording time.
+    pub fn new(
+        action: ProvenanceAction,
+        owner: OwnerIdentity,
+        recorded_at: RecordingTime,
+    ) -> Self {
+        Self { action, owner, agent: None, recorded_at }
+    }
+
+    /// Attach a caller-asserted agent label.
+    pub fn with_agent(mut self, agent: AgentAttribution) -> Self {
+        self.agent = Some(agent);
+        self
+    }
+
+    /// Validate all nested provenance values at a persistence boundary.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        self.owner.validate()?;
+        if let Some(agent) = &self.agent {
+            agent.validate()?;
+        }
+        self.recorded_at.validate()
+    }
+}
+
+fn require_provenance_action(
+    entry: &ProvenanceHistoryEntry,
+    field: &'static str,
+    expected: ProvenanceAction,
+) -> Result<(), ProvenanceError> {
+    if entry.action != expected {
+        return Err(ProvenanceError::InvalidProvenance(format!(
+            "{field} must use action {expected:?}, got {:?}",
+            entry.action
+        )));
+    }
+    Ok(())
+}
+
+/// Full provenance retained by a persistent store.
+///
+/// This is the storage model: issuer and provider subject remain available for
+/// audit, while [`ProvenanceResponse`] below is the intentionally redacted
+/// model for ordinary shared reads.  `federated_original` is kept separate
+/// from `authenticated_submitter`, so importing a remote record never makes
+/// the local submitter appear to be its original creator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "PersistedProvenanceWire")]
+pub struct PersistedProvenance {
+    /// Immutable creator attribution from the first durable submission.
+    pub creator: ProvenanceHistoryEntry,
+    /// Authenticated owner that submitted this copy to the local store.
+    pub authenticated_submitter: OwnerIdentity,
+    /// Original source author, when known independently of the submitter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_author: Option<SourceAuthor>,
+    /// References to the original file, commit, URL, or citation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<SourceReference>,
+    /// Where this copy is stored.
+    pub storage_origin: StorageOrigin,
+    /// Original federated provenance, if this record was copied from elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federated_original: Option<FederatedOriginalProvenance>,
+    /// Later modifiers and additional submissions, in append order. This is
+    /// independently bounded by [`MAX_PROVENANCE_HISTORY`]; source references
+    /// use the separate [`MAX_SOURCE_REFS`] bound.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<ProvenanceHistoryEntry>,
+    /// Attributed deletion event, if the record was deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_by: Option<ProvenanceHistoryEntry>,
+    /// Attributed invalidation event, if the record was invalidated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalidated_by: Option<ProvenanceHistoryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedProvenanceWire {
+    creator: ProvenanceHistoryEntry,
+    authenticated_submitter: OwnerIdentity,
+    #[serde(default)]
+    source_author: Option<SourceAuthor>,
+    #[serde(default)]
+    source_refs: Vec<SourceReference>,
+    storage_origin: StorageOrigin,
+    #[serde(default)]
+    federated_original: Option<FederatedOriginalProvenance>,
+    #[serde(default)]
+    history: Vec<ProvenanceHistoryEntry>,
+    #[serde(default)]
+    deleted_by: Option<ProvenanceHistoryEntry>,
+    #[serde(default)]
+    invalidated_by: Option<ProvenanceHistoryEntry>,
+}
+
+impl TryFrom<PersistedProvenanceWire> for PersistedProvenance {
+    type Error = ProvenanceError;
+
+    fn try_from(wire: PersistedProvenanceWire) -> Result<Self, Self::Error> {
+        Self::new(
+            wire.creator,
+            wire.authenticated_submitter,
+            wire.source_author,
+            wire.source_refs,
+            wire.storage_origin,
+            wire.federated_original,
+            wire.history,
+            wire.deleted_by,
+            wire.invalidated_by,
+        )
+    }
+}
+
+impl PersistedProvenance {
+    /// Construct and validate durable provenance, including all collection
+    /// bounds. Legacy records may pass an empty `history` collection.
+    pub fn new(
+        creator: ProvenanceHistoryEntry,
+        authenticated_submitter: OwnerIdentity,
+        source_author: Option<SourceAuthor>,
+        source_refs: Vec<SourceReference>,
+        storage_origin: StorageOrigin,
+        federated_original: Option<FederatedOriginalProvenance>,
+        history: Vec<ProvenanceHistoryEntry>,
+        deleted_by: Option<ProvenanceHistoryEntry>,
+        invalidated_by: Option<ProvenanceHistoryEntry>,
+    ) -> Result<Self, ProvenanceError> {
+        let value = Self {
+            creator,
+            authenticated_submitter,
+            source_author,
+            source_refs,
+            storage_origin,
+            federated_original,
+            history,
+            deleted_by,
+            invalidated_by,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Append one validated modifier or additional-submission event.
+    ///
+    /// History is retained in full up to [`MAX_PROVENANCE_HISTORY`]. Once the
+    /// bound is reached, the append is rejected and the existing history is
+    /// left unchanged; entries are never silently discarded.
+    pub fn append_history(
+        &mut self,
+        entry: ProvenanceHistoryEntry,
+    ) -> Result<(), ProvenanceError> {
+        if self.history.len() >= MAX_PROVENANCE_HISTORY {
+            return Err(ProvenanceError::TooManyHistoryEntries {
+                count: self.history.len() + 1,
+                max: MAX_PROVENANCE_HISTORY,
+            });
+        }
+        entry.validate()?;
+        if !matches!(
+            entry.action,
+            ProvenanceAction::Modified | ProvenanceAction::AdditionalSubmission
+        ) {
+            return Err(ProvenanceError::InvalidProvenance(format!(
+                "history entries must use action Modified or AdditionalSubmission, got {:?}",
+                entry.action
+            )));
+        }
+        self.history.push(entry);
+        Ok(())
+    }
+
+    /// Validate nested values and the bounded history/reference collections.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        self.creator.validate()?;
+        require_provenance_action(&self.creator, "creator", ProvenanceAction::Created)?;
+        self.authenticated_submitter.validate()?;
+        if let Some(author) = &self.source_author {
+            author.validate()?;
+        }
+        if self.source_refs.len() > MAX_SOURCE_REFS {
+            return Err(ProvenanceError::TooManySourceRefs {
+                count: self.source_refs.len(),
+                max: MAX_SOURCE_REFS,
+            });
+        }
+        for reference in &self.source_refs {
+            reference.validate()?;
+        }
+        self.storage_origin.validate()?;
+        if let Some(original) = &self.federated_original {
+            original.validate()?;
+        }
+        if self.history.len() > MAX_PROVENANCE_HISTORY {
+            return Err(ProvenanceError::TooManyHistoryEntries {
+                count: self.history.len(),
+                max: MAX_PROVENANCE_HISTORY,
+            });
+        }
+        for entry in &self.history {
+            entry.validate()?;
+            if !matches!(
+                entry.action,
+                ProvenanceAction::Modified | ProvenanceAction::AdditionalSubmission
+            ) {
+                return Err(ProvenanceError::InvalidProvenance(format!(
+                    "history entries must use action Modified or AdditionalSubmission, got {:?}",
+                    entry.action
+                )));
+            }
+        }
+        if let Some(entry) = &self.deleted_by {
+            entry.validate()?;
+            require_provenance_action(entry, "deleted_by", ProvenanceAction::Deleted)?;
+        }
+        if let Some(entry) = &self.invalidated_by {
+            entry.validate()?;
+            require_provenance_action(entry, "invalidated_by", ProvenanceAction::Invalidated)?;
+        }
+        Ok(())
+    }
+
+    /// Project full persistence metadata into the redacted shared response.
+    pub fn response(&self) -> ProvenanceResponse {
+        ProvenanceResponse {
+            creator: OwnerSummary::from_identity(&self.creator.owner),
+            authenticated_submitter: OwnerSummary::from_identity(&self.authenticated_submitter),
+            creator_agent: self.creator.agent.clone(),
+            source_author: self.source_author.clone(),
+            source_refs: self.source_refs.clone(),
+            storage_origin: self.storage_origin.clone(),
+            federated_original: self.federated_original.as_ref().map(FederatedOriginalSummary::from),
+            history: self.history.iter().map(ProvenanceResponseEvent::from).collect(),
+            deleted_by: self.deleted_by.as_ref().map(ProvenanceResponseEvent::from),
+            invalidated_by: self.invalidated_by.as_ref().map(ProvenanceResponseEvent::from),
+        }
+    }
+}
+
+/// Original provenance carried by a federated/imported record.
+///
+/// It is intentionally not folded into the local authenticated submitter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "FederatedOriginalProvenanceWire")]
+pub struct FederatedOriginalProvenance {
+    /// Origin node or remote palace identifier.
+    pub origin: StorageOrigin,
+    /// Identifier of the record at that origin, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<String>,
+    /// Original owner attribution, which may be explicitly unknown.
+    pub creator: OwnerIdentity,
+    /// Original source author, independent of both owners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_author: Option<SourceAuthor>,
+    /// Original source references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<SourceReference>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FederatedOriginalProvenanceWire {
+    origin: StorageOrigin,
+    #[serde(default)]
+    record_id: Option<String>,
+    creator: OwnerIdentity,
+    #[serde(default)]
+    source_author: Option<SourceAuthor>,
+    #[serde(default)]
+    source_refs: Vec<SourceReference>,
+}
+
+impl TryFrom<FederatedOriginalProvenanceWire> for FederatedOriginalProvenance {
+    type Error = String;
+
+    fn try_from(wire: FederatedOriginalProvenanceWire) -> Result<Self, Self::Error> {
+        let value = Self {
+            origin: wire.origin,
+            record_id: wire.record_id,
+            creator: wire.creator,
+            source_author: wire.source_author,
+            source_refs: wire.source_refs,
+        };
+        value.validate().map_err(|error| error.to_string())?;
+        Ok(value)
+    }
+}
+
+impl FederatedOriginalProvenance {
+    /// Validate the federated provenance boundary.
+    pub fn validate(&self) -> Result<(), ProvenanceError> {
+        self.origin.validate()?;
+        if !self.origin.is_federated() {
+            return Err(ProvenanceError::InvalidProvenance(
+                "federated_original.origin must be federated".to_string(),
+            ));
+        }
+        if let Some(record_id) = &self.record_id {
+            validate_record_id(record_id)?;
+        }
+        if self.record_id.as_deref() != self.origin.original_record_id() {
+            return Err(ProvenanceError::InvalidProvenance(
+                "federated_original.record_id must match origin.original_record_id".to_string(),
+            ));
+        }
+        self.creator.validate()?;
+        if let Some(author) = &self.source_author {
+            author.validate()?;
+        }
+        if self.source_refs.len() > MAX_SOURCE_REFS {
+            return Err(ProvenanceError::TooManySourceRefs {
+                count: self.source_refs.len(),
+                max: MAX_SOURCE_REFS,
+            });
+        }
+        for reference in &self.source_refs {
+            reference.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Redacted provenance returned in ordinary shared REST responses.
+///
+/// Provider issuer and subject are intentionally absent.  They remain in
+/// [`PersistedProvenance`] for audit and owner scoping, but ordinary readers
+/// receive only the stable owner ID and the email snapshot captured at write.
+/// The authenticated owner, claimed agent, original source attribution, and
+/// storage origin are separate dimensions. Evidence status and execution
+/// authority are domain- and policy-level concerns, not claims made by this
+/// attribution response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvenanceResponse {
+    /// Immutable creator, with provider-sensitive fields redacted.
+    pub creator: OwnerSummary,
+    /// Owner that submitted the local copy, with provider-sensitive fields redacted.
+    pub authenticated_submitter: OwnerSummary,
+    /// Caller-asserted agent on the creation event, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_agent: Option<AgentAttribution>,
+    /// Original source author and references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_author: Option<SourceAuthor>,
+    /// References to the original source, kept separate from the authenticated
+    /// owner and from the storage origin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<SourceReference>,
+    /// Local/federated storage origin and original record ID, if any.
+    pub storage_origin: StorageOrigin,
+    /// Provenance attributed to the record before it was federated or imported,
+    /// if this copy came from another palace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federated_original: Option<FederatedOriginalSummary>,
+    /// Later public attribution events, also redacted to owner ID/email.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<ProvenanceResponseEvent>,
+    /// The authenticated owner and agent recorded for a deletion, if one occurred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_by: Option<ProvenanceResponseEvent>,
+    /// The authenticated owner and agent recorded for an invalidation, if one occurred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalidated_by: Option<ProvenanceResponseEvent>,
+}
+
+/// Owner fields allowed in an ordinary shared response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerSummary {
+    /// Stable owner identifier, or `None` for explicit legacy/unknown ownership.
+    pub id: Option<OwnerId>,
+    /// Email snapshot captured at write, when the owner was authenticated.
+    pub email_at_write: Option<EmailAtWrite>,
+    /// Explicitly distinguishes migrated legacy records from authenticated owners.
+    pub status: OwnerSummaryStatus,
+}
+
+impl OwnerSummary {
+    /// Redact provider issuer and subject while preserving explicit unknown status.
+    pub fn from_identity(identity: &OwnerIdentity) -> Self {
+        match identity {
+            OwnerIdentity::Authenticated(owner) => Self {
+                id: Some(owner.id.clone()),
+                email_at_write: Some(owner.email_at_write.clone()),
+                status: OwnerSummaryStatus::Authenticated,
+            },
+            OwnerIdentity::Unknown => Self {
+                id: None,
+                email_at_write: None,
+                status: OwnerSummaryStatus::Unknown,
+            },
+        }
+    }
+}
+
+/// Public owner status; unknown is never inferred from an agent or source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerSummaryStatus {
+    /// The response includes the stable owner ID and email captured at write time.
+    Authenticated,
+    /// The record predates authenticated ownership or otherwise has no known owner.
+    /// This status is explicit and is never inferred from an agent or source author.
+    Unknown,
+}
+
+/// Redacted history entry for an ordinary shared response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvenanceResponseEvent {
+    /// Kind of durable attribution event represented by this entry.
+    pub action: ProvenanceAction,
+    /// Authenticated owner at event time, or explicit legacy/unknown ownership.
+    pub owner: OwnerSummary,
+    /// Caller-asserted agent or harness, if supplied; this is not the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentAttribution>,
+    /// Server-assigned UTC time at which the event was recorded.
+    pub recorded_at: RecordingTime,
+}
+
+impl From<&ProvenanceHistoryEntry> for ProvenanceResponseEvent {
+    fn from(entry: &ProvenanceHistoryEntry) -> Self {
+        Self {
+            action: entry.action,
+            owner: OwnerSummary::from_identity(&entry.owner),
+            agent: entry.agent.clone(),
+            recorded_at: entry.recorded_at,
+        }
+    }
+}
+
+/// Federated provenance summary safe for an ordinary shared response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FederatedOriginalSummary {
+    /// Federated origin that created the original record.
+    pub origin: StorageOrigin,
+    /// Original record identifier at that origin, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<String>,
+    /// Original creator, summarized without provider issuer or subject.
+    pub creator: OwnerSummary,
+    /// Author of the original source, distinct from both the creator and the
+    /// authenticated owner that submitted this copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_author: Option<SourceAuthor>,
+    /// References to the original source, separate from the storage origin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<SourceReference>,
+}
+
+impl From<&FederatedOriginalProvenance> for FederatedOriginalSummary {
+    fn from(original: &FederatedOriginalProvenance) -> Self {
+        Self {
+            origin: original.origin.clone(),
+            record_id: original.record_id.clone(),
+            creator: OwnerSummary::from_identity(&original.creator),
+            source_author: original.source_author.clone(),
+            source_refs: original.source_refs.clone(),
+        }
+    }
+}
+
 impl Serialize for ProvenanceEnvelope {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -3511,5 +4034,264 @@ mod tests {
 
         assert!(corrupted_env.validate().is_err());
         assert!(serde_json::to_string(&corrupted_env).is_err());
+    }
+
+    #[test]
+    fn persisted_provenance_preserves_creator_and_redacts_provider_fields() {
+        let owner = AuthenticatedOwner::parse(
+            "usr_creator",
+            "https://accounts.google.com",
+            "google-subject",
+            "creator@example.com",
+        )
+        .unwrap();
+        let owner_identity = OwnerIdentity::Authenticated(owner.clone());
+        let recorded_at = RecordingTime::from_rfc3339("2026-09-18T12:00:00Z").unwrap();
+        let creator = ProvenanceHistoryEntry::new(
+            ProvenanceAction::Created,
+            owner_identity.clone(),
+            recorded_at,
+        )
+        .with_agent(AgentAttribution::caller_asserted("codex").unwrap());
+        let mut persisted = PersistedProvenance {
+            creator,
+            authenticated_submitter: owner_identity,
+            source_author: Some(SourceAuthor::new("Original Author").unwrap()),
+            source_refs: vec![SourceReference::new("git:commit:abc123").unwrap()],
+            storage_origin: StorageOrigin::local_default(),
+            federated_original: None,
+            history: vec![ProvenanceHistoryEntry::new(
+                ProvenanceAction::AdditionalSubmission,
+                OwnerIdentity::Unknown,
+                recorded_at,
+            )],
+            deleted_by: None,
+            invalidated_by: None,
+        };
+        persisted.validate().unwrap();
+
+        let response = persisted.response();
+        assert_eq!(response.creator.id.as_ref().map(OwnerId::as_str), Some("usr_creator"));
+        assert_eq!(response.creator.email_at_write.as_ref().map(EmailAtWrite::as_str), Some("creator@example.com"));
+        assert_eq!(response.creator.status, OwnerSummaryStatus::Authenticated);
+        assert_eq!(response.history[0].owner.status, OwnerSummaryStatus::Unknown);
+        let wire = serde_json::to_string(&response).unwrap();
+        assert!(wire.contains("usr_creator"));
+        assert!(wire.contains("creator@example.com"));
+        assert!(!wire.contains("google-subject"));
+        assert!(!wire.contains("accounts.google.com"));
+
+        persisted.deleted_by = Some(ProvenanceHistoryEntry::new(
+            ProvenanceAction::Deleted,
+            OwnerIdentity::Authenticated(owner),
+            recorded_at,
+        ));
+        persisted.invalidated_by = Some(ProvenanceHistoryEntry::new(
+            ProvenanceAction::Invalidated,
+            OwnerIdentity::Unknown,
+            recorded_at,
+        ));
+        persisted.validate().unwrap();
+    }
+
+    #[test]
+    fn federated_original_provenance_stays_separate_from_local_submitter() {
+        let original = FederatedOriginalProvenance {
+            origin: StorageOrigin::federated("https://source.example", Some("drawer-7".into()))
+                .unwrap(),
+            record_id: Some("drawer-7".into()),
+            creator: OwnerIdentity::Unknown,
+            source_author: None,
+            source_refs: vec![SourceReference::new("https://source.example/item/7").unwrap()],
+        };
+        original.validate().unwrap();
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("\"status\":\"unknown"));
+        assert!(json.contains("drawer-7"));
+    }
+
+    #[test]
+    fn persisted_provenance_deserialization_rejects_action_role_mismatches() {
+        let owner = AuthenticatedOwner::parse(
+            "usr_creator",
+            "https://accounts.google.com",
+            "google-subject",
+            "creator@example.com",
+        )
+        .unwrap();
+        let identity = OwnerIdentity::Authenticated(owner);
+        let recorded_at = RecordingTime::from_rfc3339("2026-09-18T12:00:00Z").unwrap();
+        let valid = PersistedProvenance {
+            creator: ProvenanceHistoryEntry::new(
+                ProvenanceAction::Created,
+                identity.clone(),
+                recorded_at,
+            ),
+            authenticated_submitter: identity.clone(),
+            source_author: None,
+            source_refs: Vec::new(),
+            storage_origin: StorageOrigin::local_default(),
+            federated_original: None,
+            history: Vec::new(),
+            deleted_by: None,
+            invalidated_by: None,
+        };
+
+        let mut creator = serde_json::to_value(&valid).unwrap();
+        creator["creator"]["action"] = serde_json::json!("modified");
+        assert!(serde_json::from_value::<PersistedProvenance>(creator).is_err());
+
+        let mut unknown = serde_json::to_value(&valid).unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<PersistedProvenance>(unknown).is_err());
+
+        let history_entry = serde_json::json!({
+            "action": "created",
+            "owner": serde_json::to_value(&identity).unwrap(),
+            "recorded_at": "2026-09-18T12:00:00Z"
+        });
+        let mut history = serde_json::to_value(&valid).unwrap();
+        history["history"] = serde_json::json!([history_entry]);
+        assert!(serde_json::from_value::<PersistedProvenance>(history).is_err());
+
+        let mut deleted = serde_json::to_value(&valid).unwrap();
+        deleted["deleted_by"] = serde_json::json!({
+            "action": "modified",
+            "owner": serde_json::to_value(&identity).unwrap(),
+            "recorded_at": "2026-09-18T12:00:00Z"
+        });
+        assert!(serde_json::from_value::<PersistedProvenance>(deleted).is_err());
+
+        let mut invalidated = serde_json::to_value(&valid).unwrap();
+        invalidated["invalidated_by"] = serde_json::json!({
+            "action": "deleted",
+            "owner": serde_json::to_value(&identity).unwrap(),
+            "recorded_at": "2026-09-18T12:00:00Z"
+        });
+        assert!(serde_json::from_value::<PersistedProvenance>(invalidated).is_err());
+    }
+
+    #[test]
+    fn persisted_provenance_history_is_bounded_without_truncation() {
+        let owner = OwnerIdentity::Unknown;
+        let recorded_at = RecordingTime::from_rfc3339("2026-09-18T12:00:00Z").unwrap();
+        let mut persisted = PersistedProvenance {
+            creator: ProvenanceHistoryEntry::new(
+                ProvenanceAction::Created,
+                owner.clone(),
+                recorded_at,
+            ),
+            authenticated_submitter: owner.clone(),
+            source_author: None,
+            source_refs: Vec::new(),
+            storage_origin: StorageOrigin::local_default(),
+            federated_original: None,
+            history: Vec::new(),
+            deleted_by: None,
+            invalidated_by: None,
+        };
+
+        for _ in 0..MAX_PROVENANCE_HISTORY {
+            persisted
+                .append_history(ProvenanceHistoryEntry::new(
+                    ProvenanceAction::Modified,
+                    owner.clone(),
+                    recorded_at,
+                ))
+                .unwrap();
+        }
+        assert_eq!(persisted.history.len(), MAX_PROVENANCE_HISTORY);
+        let error = persisted
+            .append_history(ProvenanceHistoryEntry::new(
+                ProvenanceAction::AdditionalSubmission,
+                owner.clone(),
+                recorded_at,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ProvenanceError::TooManyHistoryEntries {
+                count: MAX_PROVENANCE_HISTORY + 1,
+                max: MAX_PROVENANCE_HISTORY,
+            }
+        );
+        assert_eq!(persisted.history.len(), MAX_PROVENANCE_HISTORY);
+
+        // The history and source-reference bounds are independent collections.
+        persisted.source_refs = (0..MAX_SOURCE_REFS)
+            .map(|_| SourceReference::new("git:commit:abc123").unwrap())
+            .collect();
+        persisted.validate().unwrap();
+
+        let mut over_limit = serde_json::to_value(&persisted).unwrap();
+        over_limit["history"] = serde_json::json!(
+            (0..=MAX_PROVENANCE_HISTORY)
+                .map(|_| serde_json::json!({
+                    "action": "modified",
+                    "owner": {"status": "unknown"},
+                    "recorded_at": "2026-09-18T12:00:00Z"
+                }))
+                .collect::<Vec<_>>()
+        );
+        let error = serde_json::from_value::<PersistedProvenance>(over_limit).unwrap_err();
+        assert!(error.to_string().contains("provenance history count"));
+    }
+
+    #[test]
+    fn persisted_provenance_legacy_history_field_is_optional() {
+        let owner = OwnerIdentity::Unknown;
+        let recorded_at = RecordingTime::from_rfc3339("2026-09-18T12:00:00Z").unwrap();
+        let persisted = PersistedProvenance {
+            creator: ProvenanceHistoryEntry::new(
+                ProvenanceAction::Created,
+                owner.clone(),
+                recorded_at,
+            ),
+            authenticated_submitter: owner,
+            source_author: None,
+            source_refs: Vec::new(),
+            storage_origin: StorageOrigin::local_default(),
+            federated_original: None,
+            history: Vec::new(),
+            deleted_by: None,
+            invalidated_by: None,
+        };
+        let mut legacy = serde_json::to_value(&persisted).unwrap();
+        legacy.as_object_mut().unwrap().remove("history");
+        let restored = serde_json::from_value::<PersistedProvenance>(legacy).unwrap();
+        assert!(restored.history.is_empty());
+    }
+
+    #[test]
+    fn federated_original_deserialization_rejects_local_and_contradictory_origins() {
+        let valid = FederatedOriginalProvenance {
+            origin: StorageOrigin::federated("https://source.example", Some("drawer-7".into()))
+                .unwrap(),
+            record_id: Some("drawer-7".into()),
+            creator: OwnerIdentity::Unknown,
+            source_author: None,
+            source_refs: Vec::new(),
+        };
+
+        let mut local_origin = serde_json::to_value(&valid).unwrap();
+        local_origin["origin"] = serde_json::json!({
+            "kind": "local",
+            "origin_id": "local"
+        });
+        assert!(serde_json::from_value::<FederatedOriginalProvenance>(local_origin).is_err());
+
+        let mut unknown = serde_json::to_value(&valid).unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<FederatedOriginalProvenance>(unknown).is_err());
+
+        let mut mismatched_record_id = serde_json::to_value(&valid).unwrap();
+        mismatched_record_id["record_id"] = serde_json::json!("drawer-8");
+        assert!(
+            serde_json::from_value::<FederatedOriginalProvenance>(mismatched_record_id).is_err()
+        );
+
+        let mut missing_record_id = serde_json::to_value(&valid).unwrap();
+        missing_record_id["record_id"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<FederatedOriginalProvenance>(missing_record_id).is_err());
     }
 }

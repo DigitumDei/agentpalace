@@ -3690,6 +3690,7 @@ mod tests {
             expires_at: None,
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            provenance: None,
         }
     }
 
@@ -3781,6 +3782,7 @@ mod tests {
                     content_hash: v["content_hash"].as_str().map(|s| s.to_owned()),
                     filed_at: None,
                     added_by: None,
+                    provenance: None,
                     stale: false,
                 })
                 .collect();

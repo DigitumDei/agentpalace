@@ -4,7 +4,7 @@
 //! after the server applied it) or resend after a crash. Without a shared identity, such a retry
 //! would apply the mutation twice — a duplicate drawer, a duplicated KG fact, or a rejected
 //! duplicate-content add. This module supplies the receiving-side substrate: a SQLite-backed
-//! receipt row, keyed by the client's stable `operation_id`, that records the request and the
+//! receipt row, keyed by the validated owner-scoped operation key, that records the request and the
 //! completed response so a replayed mutation can be answered from durable state instead of being
 //! re-applied.
 //!
@@ -15,7 +15,7 @@
 //! ```
 //!
 //! [`MutationReceiptStore::begin_receipt`] is the only entry point. Given a
-//! `(operation_id, operation_kind, request_hash, target_id)` it atomically:
+//! `(owner_scoped_key, operation_kind, request_hash, target_id)` it atomically:
 //!
 //! - creates a fresh `pending` receipt when the `operation_id` is unknown, telling the caller to
 //!   perform the mutation and confirm with [`MutationReceiptStore::complete_receipt`]
@@ -25,7 +25,7 @@
 //! - returns the pending receipt when a prior attempt started but never completed — a crash
 //!   between `begin_receipt` and `complete_receipt` — so the caller can inspect the target's
 //!   stable state and converge ([`ReceiptOutcome::Recover`]);
-//! - reports a conflict when the `operation_id` is reused with a **different** request hash
+//! - reports a conflict when the scoped operation key is reused with a **different** request hash
 //!   ([`ReceiptOutcome::Conflict`]).
 //!
 //! The request hash is caller-computed over the mutation-affecting request fields, so no two
@@ -49,6 +49,7 @@ use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::coordination::add_column_if_missing;
+use agentpalace_core::{OwnerId, OwnerScopedKey, ProvenanceEnvelope};
 use crate::{Result, StorageError};
 
 const MAX_IDENTIFIER_BYTES: usize = 256;
@@ -79,6 +80,8 @@ pub enum ReceiptState {
 pub struct MutationReceipt {
     /// The client-supplied stable operation identity this receipt is keyed on.
     pub operation_id: String,
+    /// Validated owner scope for this operation. Legacy rows are explicitly unscoped.
+    pub operation_key: OwnerScopedKey,
     /// Which kind of mutation this receipt covers (see `RECEIPT_KIND_*`).
     pub operation_kind: String,
     /// Caller-computed hash of the mutation-affecting request fields.
@@ -95,6 +98,8 @@ pub struct MutationReceipt {
     /// and its completion can be converged from. Populated via
     /// [`MutationReceiptStore::set_receipt_details`].
     pub details: Option<Value>,
+    /// Immutable provenance captured with the mutation intent, when supplied.
+    pub provenance: Option<ProvenanceEnvelope>,
     /// When the receipt was first created.
     pub created_at: OffsetDateTime,
     /// When the mutation confirmed completion, if it has.
@@ -126,13 +131,43 @@ pub enum ReceiptOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewReceipt {
     /// Stable client operation identity; must be non-empty and at most 256 bytes.
-    pub operation_id: String,
+    pub operation_key: OwnerScopedKey,
     /// One of the `RECEIPT_KIND_*` constants.
     pub operation_kind: String,
     /// Hash of the mutation-affecting request fields.
     pub request_hash: String,
     /// Stable target identity the mutation converges on.
     pub target_id: String,
+    /// Provenance envelope captured atomically with the pending receipt.
+    pub provenance: Option<ProvenanceEnvelope>,
+}
+
+/// A receipt lookup key. Raw strings are accepted only as an explicit legacy-scope
+/// compatibility path; authenticated callers must pass an [`OwnerScopedKey`].
+pub trait ReceiptKey {
+    /// Convert the lookup key to its validated storage representation.
+    fn into_receipt_key(self) -> Result<OwnerScopedKey>;
+}
+
+impl ReceiptKey for OwnerScopedKey {
+    fn into_receipt_key(self) -> Result<OwnerScopedKey> {
+        self.validate().map_err(|error| StorageError::Invariant(error.to_string()))?;
+        Ok(self)
+    }
+}
+impl ReceiptKey for &OwnerScopedKey {
+    fn into_receipt_key(self) -> Result<OwnerScopedKey> { self.clone().into_receipt_key() }
+}
+impl ReceiptKey for &str {
+    fn into_receipt_key(self) -> Result<OwnerScopedKey> {
+        OwnerScopedKey::new(None, self).map_err(|error| StorageError::Invariant(error.to_string()))
+    }
+}
+impl ReceiptKey for String {
+    fn into_receipt_key(self) -> Result<OwnerScopedKey> { self.as_str().into_receipt_key() }
+}
+impl ReceiptKey for &String {
+    fn into_receipt_key(self) -> Result<OwnerScopedKey> { self.as_str().into_receipt_key() }
 }
 
 /// SQLite-backed durable mutation receipt repository.
@@ -158,18 +193,19 @@ impl MutationReceiptStore {
         conn.execute_batch(
             r#"
 CREATE TABLE IF NOT EXISTS mutation_receipts (
-    operation_id   TEXT PRIMARY KEY,
+    owner_scope    TEXT NOT NULL DEFAULT 'legacy',
+    operation_id   TEXT NOT NULL,
     operation_kind TEXT NOT NULL,
     request_hash   TEXT NOT NULL,
     target_id      TEXT NOT NULL,
     status         TEXT NOT NULL CHECK(status IN ('pending', 'completed')),
     response_json  TEXT,
     details_json   TEXT,
+    provenance_json TEXT,
     created_at     TEXT NOT NULL,
-    completed_at   TEXT
+    completed_at   TEXT,
+    PRIMARY KEY(owner_scope, operation_id)
 );
-CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
-    ON mutation_receipts(status, created_at);
 "#,
         )?;
         // Upgrade path: a palace created before finding 6 has `mutation_receipts` without
@@ -178,7 +214,22 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
         // IMMEDIATE` serialises the check-then-act across processes (see the identical pattern
         // in `CoordinationStore::ensure_schema`).
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let columns = table_columns(&tx, "mutation_receipts")?;
+        if !columns.iter().any(|column| column == "owner_scope") {
+            tx.execute_batch("ALTER TABLE mutation_receipts RENAME TO mutation_receipts_legacy")?;
+            tx.execute_batch(
+                "CREATE TABLE mutation_receipts (owner_scope TEXT NOT NULL DEFAULT 'legacy', operation_id TEXT NOT NULL, operation_kind TEXT NOT NULL, request_hash TEXT NOT NULL, target_id TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending', 'completed')), response_json TEXT, details_json TEXT, provenance_json TEXT, created_at TEXT NOT NULL, completed_at TEXT, PRIMARY KEY(owner_scope, operation_id))",
+            )?;
+            let legacy_columns = table_columns(&tx, "mutation_receipts_legacy")?;
+            let details = if legacy_columns.iter().any(|column| column == "details_json") { "details_json" } else { "NULL" };
+            tx.execute_batch(&format!(
+                "INSERT INTO mutation_receipts(owner_scope, operation_id, operation_kind, request_hash, target_id, status, response_json, details_json, provenance_json, created_at, completed_at) SELECT 'legacy', operation_id, operation_kind, request_hash, target_id, status, response_json, {details}, NULL, created_at, completed_at FROM mutation_receipts_legacy"
+            ))?;
+            tx.execute_batch("DROP TABLE mutation_receipts_legacy")?;
+        }
         add_column_if_missing(&tx, "mutation_receipts", "details_json", "TEXT")?;
+        add_column_if_missing(&tx, "mutation_receipts", "provenance_json", "TEXT")?;
+        tx.execute_batch("CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status ON mutation_receipts(status, created_at)")?;
         tx.commit()?;
         Ok(())
     }
@@ -189,7 +240,8 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
     /// the prior request hash is what turns "same operation, different request" into a conflict:
     /// only a byte-identical request is allowed to reuse a completed receipt.
     pub fn begin_receipt(&self, input: &NewReceipt) -> Result<ReceiptOutcome> {
-        bounded_identifier(&input.operation_id, "operation_id")?;
+        input.operation_key.validate().map_err(|error| StorageError::Invariant(error.to_string()))?;
+        validate_provenance_scope(input.provenance.as_ref(), &input.operation_key)?;
         bounded_identifier(&input.operation_kind, "operation_kind")?;
         bounded_identifier(&input.request_hash, "request_hash")?;
         // Target ids are validated by the owning domain (e.g. `DrawerId`), which
@@ -200,10 +252,10 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
 
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(existing) = receipt_by_id(&tx, &input.operation_id)? {
+        if let Some(existing) = receipt_by_key(&tx, &input.operation_key)? {
             if existing.request_hash != input.request_hash {
                 tx.commit()?;
-                return Ok(ReceiptOutcome::Conflict { operation_id: input.operation_id.clone() });
+                return Ok(ReceiptOutcome::Conflict { operation_id: input.operation_key.raw_key().to_owned() });
             }
             tx.commit()?;
             return match existing.status {
@@ -215,18 +267,18 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
         let now = OffsetDateTime::now_utc();
         let created = format_time(now)?;
         tx.execute(
-            "INSERT INTO mutation_receipts(operation_id, operation_kind, request_hash, target_id,\
-             status, response_json, details_json, created_at, completed_at)\
-             VALUES(?1, ?2, ?3, ?4, 'pending', NULL, NULL, ?5, NULL)",
+            "INSERT INTO mutation_receipts(owner_scope, operation_id, operation_kind, request_hash, target_id, status, response_json, details_json, provenance_json, created_at, completed_at) VALUES(?1, ?2, ?3, ?4, ?5, 'pending', NULL, NULL, ?6, ?7, NULL)",
             params![
-                input.operation_id,
+                input.operation_key.owner_id().map(|owner| owner.as_str()).unwrap_or("legacy"),
+                input.operation_key.raw_key(),
                 input.operation_kind,
                 input.request_hash,
                 input.target_id,
+                input.provenance.as_ref().map(serde_json::to_string).transpose()?,
                 created,
             ],
         )?;
-        let receipt = receipt_by_id(&tx, &input.operation_id)?
+        let receipt = receipt_by_key(&tx, &input.operation_key)?
             .ok_or_else(|| StorageError::Invariant("inserted receipt disappeared".into()))?;
         tx.commit()?;
         Ok(ReceiptOutcome::Fresh(receipt))
@@ -238,8 +290,8 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
     /// response, so two concurrent handlers racing to finish the same operation cannot overwrite
     /// one another's committed response. Completing an unknown `operation_id` is an invariant
     /// error — a receipt can only be completed after [`Self::begin_receipt`] created it.
-    pub fn complete_receipt(&self, operation_id: &str, response: &Value) -> Result<()> {
-        bounded_identifier(operation_id, "operation_id")?;
+    pub fn complete_receipt<K: ReceiptKey>(&self, key: K, response: &Value) -> Result<()> {
+        let key = key.into_receipt_key()?;
         if serde_json::to_vec(response)?.len() > MAX_RESPONSE_BYTES {
             return Err(StorageError::Invariant(format!(
                 "receipt response exceeds {MAX_RESPONSE_BYTES} bytes"
@@ -247,10 +299,10 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
         }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some(existing) = receipt_by_id(&tx, operation_id)? else {
+        let Some(existing) = receipt_by_key(&tx, &key)? else {
             tx.commit()?;
             return Err(StorageError::Invariant(format!(
-                "cannot complete unknown receipt `{operation_id}`"
+                "cannot complete unknown receipt `{}`", key
             )));
         };
         if existing.status != ReceiptState::Pending {
@@ -260,18 +312,18 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
         let completed = format_time(OffsetDateTime::now_utc())?;
         let response_json = serde_json::to_string(response)?;
         tx.execute(
-            "UPDATE mutation_receipts SET status='completed', response_json=?1, completed_at=?2 \
-             WHERE operation_id=?3 AND status='pending'",
-            params![response_json, completed, operation_id],
+            "UPDATE mutation_receipts SET status='completed', response_json=?1, completed_at=?2 WHERE owner_scope=?3 AND operation_id=?4 AND status='pending'",
+            params![response_json, completed, key.owner_id().map(|owner| owner.as_str()).unwrap_or("legacy"), key.raw_key()],
         )?;
         tx.commit()?;
         Ok(())
     }
 
     /// Fetch a receipt by exact operation id. `None` is an explicit authoritative miss.
-    pub fn get_receipt(&self, operation_id: &str) -> Result<Option<MutationReceipt>> {
+    pub fn get_receipt<K: ReceiptKey>(&self, key: K) -> Result<Option<MutationReceipt>> {
+        let key = key.into_receipt_key()?;
         let conn = self.connection()?;
-        receipt_by_id(&conn, operation_id)
+        receipt_by_key(&conn, &key)
     }
 
     /// Durably attach caller-supplied metadata (`details`) to a **pending** receipt.
@@ -283,8 +335,8 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
     /// state the mutation already destroyed. Commits in its own transaction, so it is durable as
     /// soon as it returns. Rejecting a completed receipt is an invariant error — details can only
     /// be attached while the mutation is still in flight.
-    pub fn set_receipt_details(&self, operation_id: &str, details: &Value) -> Result<()> {
-        bounded_identifier(operation_id, "operation_id")?;
+    pub fn set_receipt_details<K: ReceiptKey>(&self, key: K, details: &Value) -> Result<()> {
+        let key = key.into_receipt_key()?;
         let details_json = serde_json::to_string(details)?;
         if details_json.len() > MAX_RESPONSE_BYTES {
             return Err(StorageError::Invariant(format!(
@@ -293,22 +345,21 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
         }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some(existing) = receipt_by_id(&tx, operation_id)? else {
+        let Some(existing) = receipt_by_key(&tx, &key)? else {
             tx.commit()?;
             return Err(StorageError::Invariant(format!(
-                "cannot annotate unknown receipt `{operation_id}`"
+                "cannot annotate unknown receipt `{}`", key
             )));
         };
         if existing.status != ReceiptState::Pending {
             tx.commit()?;
             return Err(StorageError::Invariant(format!(
-                "cannot annotate completed receipt `{operation_id}`"
+                "cannot annotate completed receipt `{}`", key
             )));
         }
         tx.execute(
-            "UPDATE mutation_receipts SET details_json=?1 \
-             WHERE operation_id=?2 AND status='pending'",
-            params![details_json, operation_id],
+            "UPDATE mutation_receipts SET details_json=?1 WHERE owner_scope=?2 AND operation_id=?3 AND status='pending'",
+            params![details_json, key.owner_id().map(|owner| owner.as_str()).unwrap_or("legacy"), key.raw_key()],
         )?;
         tx.commit()?;
         Ok(())
@@ -319,8 +370,8 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
         let conn = self.connection()?;
         collect_receipts(
             &conn,
-            "SELECT operation_id, operation_kind, request_hash, target_id, status, response_json, \
-             created_at, completed_at, details_json FROM mutation_receipts WHERE status='pending' \
+            "SELECT owner_scope, operation_id, operation_kind, request_hash, target_id, status, response_json, \
+             created_at, completed_at, details_json, provenance_json FROM mutation_receipts WHERE status='pending' \
              ORDER BY created_at ASC",
         )
     }
@@ -330,12 +381,11 @@ CREATE INDEX IF NOT EXISTS idx_mutation_receipts_status
     }
 }
 
-fn receipt_by_id(conn: &Connection, operation_id: &str) -> Result<Option<MutationReceipt>> {
+fn receipt_by_key(conn: &Connection, key: &OwnerScopedKey) -> Result<Option<MutationReceipt>> {
     conn.prepare(
-        "SELECT operation_id, operation_kind, request_hash, target_id, status, response_json, \
-         created_at, completed_at, details_json FROM mutation_receipts WHERE operation_id=?1",
+        "SELECT owner_scope, operation_id, operation_kind, request_hash, target_id, status, response_json, created_at, completed_at, details_json, provenance_json FROM mutation_receipts WHERE owner_scope=?1 AND operation_id=?2",
     )?
-    .query_row([operation_id], receipt_row)
+    .query_row(params![key.owner_id().map(|owner| owner.as_str()).unwrap_or("legacy"), key.raw_key()], receipt_row)
     .optional()
     .map_err(Into::into)
 }
@@ -347,25 +397,57 @@ fn collect_receipts(conn: &Connection, sql: &str) -> Result<Vec<MutationReceipt>
 }
 
 fn receipt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MutationReceipt> {
-    let status: String = row.get(4)?;
-    let response: Option<String> = row.get(5)?;
-    let details: Option<String> = row.get(8)?;
-    let created: String = row.get(6)?;
-    let completed: Option<String> = row.get(7)?;
+    let scope: String = row.get(0)?;
+    let operation_id: String = row.get(1)?;
+    let status: String = row.get(5)?;
+    let response: Option<String> = row.get(6)?;
+    let created: String = row.get(7)?;
+    let completed: Option<String> = row.get(8)?;
+    let details: Option<String> = row.get(9)?;
+    let provenance: Option<String> = row.get(10)?;
+    let owner = if scope == "legacy" {
+        None
+    } else {
+        Some(scope.parse::<OwnerId>().map_err(sql_conv)?)
+    };
+    let operation_key = OwnerScopedKey::new(owner, operation_id.clone()).map_err(sql_conv)?;
     Ok(MutationReceipt {
-        operation_id: row.get(0)?,
-        operation_kind: row.get(1)?,
-        request_hash: row.get(2)?,
-        target_id: row.get(3)?,
+        operation_id,
+        operation_key,
+        operation_kind: row.get(2)?,
+        request_hash: row.get(3)?,
+        target_id: row.get(4)?,
         status: ReceiptState::parse(&status).map_err(sql_conv)?,
         response: response
             .map(|value| serde_json::from_str(&value))
             .transpose()
             .map_err(sql_conv)?,
         details: details.map(|value| serde_json::from_str(&value)).transpose().map_err(sql_conv)?,
+        provenance: provenance.map(|value| serde_json::from_str(&value)).transpose().map_err(sql_conv)?,
         created_at: parse_time(created).map_err(sql_conv)?,
         completed_at: parse_time_opt(completed).map_err(sql_conv)?,
     })
+}
+
+fn validate_provenance_scope(
+    provenance: Option<&ProvenanceEnvelope>,
+    operation_key: &OwnerScopedKey,
+) -> Result<()> {
+    let Some(provenance) = provenance else {
+        return Ok(());
+    };
+    provenance.validate().map_err(|error| StorageError::Invariant(error.to_string()))?;
+    if provenance.operation_id() != Some(operation_key) {
+        return Err(StorageError::Invariant(
+            "receipt provenance operation key does not match receipt key".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    Ok(statement.query_map([], |row| row.get(1))?.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 fn sql_conv<E: std::fmt::Display>(error: E) -> rusqlite::Error {
@@ -416,9 +498,11 @@ impl ReceiptState {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use rusqlite::Connection;
     use serde_json::json;
     use tempfile::tempdir;
 
+    use agentpalace_core::{OwnerScopedKey, ProvenanceEnvelope, ProvenanceError};
     use super::{
         MutationReceiptStore, NewReceipt, RECEIPT_KIND_DRAWER_ADD, ReceiptOutcome, ReceiptState,
     };
@@ -432,10 +516,11 @@ mod tests {
 
     fn receipt(op: &str, hash: &str) -> NewReceipt {
         NewReceipt {
-            operation_id: op.to_owned(),
+            operation_key: OwnerScopedKey::new(None, op).unwrap(),
             operation_kind: RECEIPT_KIND_DRAWER_ADD.to_owned(),
             request_hash: hash.to_owned(),
             target_id: "drawer_x".to_owned(),
+            provenance: None,
         }
     }
 
@@ -559,10 +644,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_operation_id_is_rejected() {
-        let (store, _dir) = store();
-        let err = store.begin_receipt(&receipt("", "hash-a")).unwrap_err();
-        assert!(err.to_string().contains("operation_id"), "{err}");
+    fn owner_scoped_key_rejects_empty_raw_key() {
+        assert_eq!(
+            OwnerScopedKey::new(None, ""),
+            Err(ProvenanceError::EmptyField { field: "raw_key" }),
+        );
     }
 
     #[test]
@@ -571,15 +657,98 @@ mod tests {
         let target_id = format!("drawer_{}", "x".repeat(512));
         let outcome = store
             .begin_receipt(&NewReceipt {
-                operation_id: "op-long-target".to_owned(),
+                operation_key: OwnerScopedKey::new(None, "op-long-target").unwrap(),
                 operation_kind: RECEIPT_KIND_DRAWER_ADD.to_owned(),
                 request_hash: "hash-long-target".to_owned(),
                 target_id: target_id.clone(),
+                provenance: None,
             })
             .unwrap();
         let ReceiptOutcome::Fresh(receipt) = outcome else {
             panic!("expected Fresh, got {outcome:?}");
         };
         assert_eq!(receipt.target_id, target_id);
+    }
+
+    #[test]
+    fn identical_raw_keys_are_isolated_by_authenticated_owner() {
+        let (store, _dir) = store();
+        let alice = OwnerScopedKey::new(Some("alice".parse().unwrap()), "same-op").unwrap();
+        let bob = OwnerScopedKey::new(Some("bob".parse().unwrap()), "same-op").unwrap();
+        let mut first = receipt("same-op", "hash-a");
+        first.operation_key = alice.clone();
+        assert!(matches!(store.begin_receipt(&first).unwrap(), ReceiptOutcome::Fresh(_)));
+        store.complete_receipt(&alice, &json!({"owner": "alice"})).unwrap();
+
+        let mut second = receipt("same-op", "hash-b");
+        second.operation_key = bob.clone();
+        assert!(matches!(store.begin_receipt(&second).unwrap(), ReceiptOutcome::Fresh(_)));
+        assert_eq!(store.get_receipt(&alice).unwrap().unwrap().response, Some(json!({"owner": "alice"})));
+        assert!(store.get_receipt("same-op").unwrap().is_none());
+    }
+
+    #[test]
+    fn provenance_is_persisted_with_pending_and_completed_receipt() {
+        let (store, dir) = store();
+        let owner: agentpalace_core::OwnerId = "alice".parse().unwrap();
+        let key = OwnerScopedKey::new(Some(owner.clone()), "provenance-op").unwrap();
+        let provenance = ProvenanceEnvelope::new(
+            agentpalace_core::OwnerIdentity::Authenticated(agentpalace_core::AuthenticatedOwner::new(
+                owner,
+                "https://accounts.example".parse().unwrap(),
+                "subject-alice".parse().unwrap(),
+                "alice@example.com".parse().unwrap(),
+            )),
+            agentpalace_core::RecordingTime::now_utc().unwrap(),
+            agentpalace_core::StorageOrigin::local_default(),
+        )
+        .with_operation_key(key.clone())
+        .unwrap();
+        let mut input = receipt("provenance-op", "hash");
+        input.operation_key = key.clone();
+        input.provenance = Some(provenance.clone());
+        store.begin_receipt(&input).unwrap();
+        let reopened = MutationReceiptStore::new(dir.path().join("storage.sqlite3"));
+        reopened.ensure_schema().unwrap();
+        assert_eq!(reopened.get_receipt(&key).unwrap().unwrap().provenance, Some(provenance));
+    }
+
+    #[test]
+    fn legacy_receipts_migrate_without_fabricating_owner_scope() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE mutation_receipts (
+                    operation_id TEXT PRIMARY KEY,
+                    operation_kind TEXT NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    response_json TEXT,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+                INSERT INTO mutation_receipts(
+                    operation_id, operation_kind, request_hash, target_id, status,
+                    response_json, created_at, completed_at
+                ) VALUES('old-op', 'drawer_add', 'old-hash', 'drawer_old', 'completed',
+                         '{\"success\":true}', '2026-09-18T00:00:00Z',
+                         '2026-09-18T00:00:01Z');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = MutationReceiptStore::new(&path);
+        store.ensure_schema().unwrap();
+        let migrated = store.get_receipt("old-op").unwrap().unwrap();
+        assert!(migrated.operation_key.is_legacy());
+        assert_eq!(migrated.operation_key.raw_key(), "old-op");
+        assert_eq!(migrated.provenance, None);
+        assert_eq!(migrated.response, Some(json!({"success": true})));
+
+        let owner = OwnerScopedKey::new(Some("alice".parse().unwrap()), "old-op").unwrap();
+        assert!(store.get_receipt(&owner).unwrap().is_none());
     }
 }

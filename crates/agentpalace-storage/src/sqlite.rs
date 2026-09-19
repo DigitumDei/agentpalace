@@ -10,7 +10,10 @@ use crate::types::{
     RetryableRun, RevisionedWrite, SelfObservationRecord, SelfObservationScope,
     SelfObservationStatus, ToolStateEntry,
 };
-use agentpalace_core::{DIARY_SUMMARY_MAX_CHARS, DrawerId};
+use agentpalace_core::{
+    DIARY_SUMMARY_MAX_CHARS, DrawerId, OwnerIdentity, PersistedProvenance, ProvenanceAction,
+    ProvenanceHistoryEntry,
+};
 use time::Date;
 
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -263,6 +266,12 @@ CREATE INDEX IF NOT EXISTS idx_change_log_operation_event
 ON change_log(operation_id, event_type);
         "#,
     ),
+    (
+        "0011_provenance_columns",
+        r#"
+ALTER TABLE knowledge_graph_facts ADD COLUMN provenance_json TEXT;
+        "#,
+    ),
 ];
 
 pub trait IngestManifestStore {
@@ -336,6 +345,28 @@ pub trait KnowledgeGraphStore {
         ended_at: Date,
         updated_at: OffsetDateTime,
     ) -> Result<usize>;
+
+    /// Invalidate an active fact while retaining its original provenance and, when present,
+    /// the authenticated invalidation attribution. The default preserves compatibility for
+    /// storage adapters that do not yet persist provenance columns.
+    fn invalidate_active_fact_with_provenance(
+        &self,
+        subject_entity_id: &str,
+        predicate: &str,
+        object_entity_id: &str,
+        ended_at: Date,
+        updated_at: OffsetDateTime,
+        provenance: Option<&PersistedProvenance>,
+    ) -> Result<usize> {
+        let _ = provenance;
+        self.invalidate_active_fact(
+            subject_entity_id,
+            predicate,
+            object_entity_id,
+            ended_at,
+            updated_at,
+        )
+    }
 }
 
 pub trait ToolStateStore {
@@ -547,6 +578,7 @@ impl SqliteOperationalStore {
             "0008_maintenance_leases",
             "0009_agent_lineages",
             "0010_change_log_operation_identity",
+            "0011_provenance_columns",
         ]
     }
 
@@ -1406,9 +1438,9 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
         connection.execute(
             "INSERT INTO knowledge_graph_facts (
                  fact_id, subject_entity_id, predicate, object_entity_id, valid_from, valid_to,
-                 confidence, source_drawer_id, source_file, created_at, updated_at
+                 confidence, source_drawer_id, source_file, created_at, updated_at, provenance_json
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(fact_id) DO UPDATE SET
                  subject_entity_id = excluded.subject_entity_id,
                  predicate = excluded.predicate,
@@ -1418,7 +1450,8 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
                  confidence = excluded.confidence,
                  source_drawer_id = excluded.source_drawer_id,
                  source_file = excluded.source_file,
-                 updated_at = excluded.updated_at",
+                 updated_at = excluded.updated_at,
+                 provenance_json = excluded.provenance_json",
             params![
                 fact.fact_id,
                 fact.subject_entity_id,
@@ -1431,6 +1464,7 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
                 fact.source_file,
                 encode_time(fact.created_at),
                 encode_time(fact.updated_at),
+                fact.provenance.as_ref().map(serde_json::to_string).transpose()?,
             ],
         )?;
         Ok(())
@@ -1441,7 +1475,7 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
         connection
             .query_row(
                 "SELECT fact_id, subject_entity_id, predicate, object_entity_id, valid_from,
-                        valid_to, confidence, source_drawer_id, source_file, created_at, updated_at
+                        valid_to, confidence, source_drawer_id, source_file, created_at, updated_at, provenance_json
                  FROM knowledge_graph_facts
                  WHERE fact_id = ?1",
                 [fact_id],
@@ -1454,7 +1488,7 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
     fn list_facts(&self) -> Result<Vec<KnowledgeGraphFact>> {
         self.list_facts_matching(
             "SELECT fact_id, subject_entity_id, predicate, object_entity_id, valid_from,
-                    valid_to, confidence, source_drawer_id, source_file, created_at, updated_at
+                    valid_to, confidence, source_drawer_id, source_file, created_at, updated_at, provenance_json
              FROM knowledge_graph_facts
              ORDER BY COALESCE(valid_from, '9999-12-31') ASC, predicate ASC, fact_id ASC",
             [],
@@ -1464,7 +1498,7 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
     fn list_facts_limited(&self, limit: usize) -> Result<Vec<KnowledgeGraphFact>> {
         self.list_facts_matching(
             "SELECT fact_id, subject_entity_id, predicate, object_entity_id, valid_from,
-                    valid_to, confidence, source_drawer_id, source_file, created_at, updated_at
+                    valid_to, confidence, source_drawer_id, source_file, created_at, updated_at, provenance_json
              FROM knowledge_graph_facts
              ORDER BY COALESCE(valid_from, '9999-12-31') ASC, predicate ASC, fact_id ASC
              LIMIT ?1",
@@ -1475,7 +1509,7 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
     fn list_facts_for_entity(&self, entity_id: &str) -> Result<Vec<KnowledgeGraphFact>> {
         self.list_facts_matching(
             "SELECT fact_id, subject_entity_id, predicate, object_entity_id, valid_from,
-                    valid_to, confidence, source_drawer_id, source_file, created_at, updated_at
+                    valid_to, confidence, source_drawer_id, source_file, created_at, updated_at, provenance_json
              FROM knowledge_graph_facts
              WHERE subject_entity_id = ?1 OR object_entity_id = ?1
              ORDER BY COALESCE(valid_from, '9999-12-31') ASC, predicate ASC, fact_id ASC",
@@ -1493,7 +1527,7 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
         connection
             .query_row(
                 "SELECT fact_id, subject_entity_id, predicate, object_entity_id, valid_from,
-                        valid_to, confidence, source_drawer_id, source_file, created_at, updated_at
+                 valid_to, confidence, source_drawer_id, source_file, created_at, updated_at, provenance_json
                  FROM knowledge_graph_facts
                  WHERE subject_entity_id = ?1
                    AND predicate = ?2
@@ -1533,6 +1567,88 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
                 encode_time(updated_at)
             ],
         )?;
+        Ok(changed)
+    }
+
+    fn invalidate_active_fact_with_provenance(
+        &self,
+        subject_entity_id: &str,
+        predicate: &str,
+        object_entity_id: &str,
+        ended_at: Date,
+        updated_at: OffsetDateTime,
+        provenance: Option<&PersistedProvenance>,
+    ) -> Result<usize> {
+        let connection = self.open_connection()?;
+        let rows = {
+            let mut statement = connection.prepare(
+                "SELECT fact_id, provenance_json FROM knowledge_graph_facts
+                 WHERE subject_entity_id = ?1 AND predicate = ?2 AND object_entity_id = ?3
+                   AND valid_to IS NULL AND (valid_from IS NULL OR valid_from <= ?4)",
+            )?;
+            statement
+                .query_map(
+                    params![subject_entity_id, predicate, object_entity_id, encode_date(ended_at)],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let invalidation_json = provenance
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(StorageError::from)?;
+        let mut changed = 0;
+        for (fact_id, existing_json) in rows {
+            let merged = match (existing_json, invalidation_json.as_deref()) {
+                (Some(raw), Some(incoming)) => {
+                    let mut existing: PersistedProvenance = serde_json::from_str(&raw)?;
+                    let incoming: PersistedProvenance = serde_json::from_str(incoming)?;
+                    existing.invalidated_by = incoming.invalidated_by;
+                    Some(serde_json::to_string(&existing)?)
+                }
+                (None, Some(incoming)) => {
+                    // Legacy facts have no creator record to merge into. Preserve that
+                    // absence explicitly as Unknown while retaining the authenticated
+                    // invalidator from the incoming provenance.
+                    let incoming: PersistedProvenance = serde_json::from_str(incoming)?;
+                    let invalidated_by = incoming.invalidated_by.clone();
+                    let recorded_at = invalidated_by
+                        .as_ref()
+                        .map(|entry| entry.recorded_at.clone())
+                        .ok_or_else(|| StorageError::Invariant(
+                            "invalidation provenance is missing invalidated_by".to_owned(),
+                        ))?;
+                    let legacy = PersistedProvenance::new(
+                        ProvenanceHistoryEntry::new(
+                            ProvenanceAction::Created,
+                            OwnerIdentity::Unknown,
+                            recorded_at,
+                        ),
+                        OwnerIdentity::Unknown,
+                        None,
+                        Vec::new(),
+                        incoming.storage_origin,
+                        None,
+                        Vec::new(),
+                        None,
+                        invalidated_by,
+                    )
+                    .map_err(StorageError::from)?;
+                    Some(serde_json::to_string(&legacy)?)
+                }
+                (other, _) => other,
+            };
+            changed += connection.execute(
+                "UPDATE knowledge_graph_facts SET valid_to = ?2, updated_at = ?3, provenance_json = ?4
+                 WHERE fact_id = ?1 AND valid_to IS NULL",
+                params![fact_id, encode_date(ended_at), encode_time(updated_at), merged],
+            )?;
+        }
         Ok(changed)
     }
 }
@@ -2189,13 +2305,25 @@ fn append_event_if_absent_inner(
     connection.busy_timeout(std::time::Duration::from_millis(5_000))?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let exists: bool = match operation_id {
-        Some(operation_id) => transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM change_log WHERE operation_id=?1 AND event_type=?2)",
-                params![operation_id, event.event_type],
-                |row| row.get(0),
-            )
-            .map_err(StorageError::from)?,
+        Some(operation_id) => {
+            // Before owner-scoped receipts, recovery stored the raw operation ID. Keep
+            // recognizing that legacy spelling when the new composite spelling is retried;
+            // otherwise an upgrade between the effect and its change-log append duplicates the
+            // visible event. The fallback is deliberately limited to the suffix of a composite
+            // key and does not alter newly-written owner-scoped rows.
+            let legacy_operation_id = operation_id.split_once(':').map(|(_, raw)| raw);
+            transaction
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM change_log
+                        WHERE event_type=?1
+                          AND (operation_id=?2 OR (?3 IS NOT NULL AND operation_id=?3))
+                    )",
+                    params![event.event_type, operation_id, legacy_operation_id],
+                    |row| row.get(0),
+                )
+                .map_err(StorageError::from)?
+        }
         None => transaction
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM change_log WHERE entity_id=?1 AND event_type=?2)",
@@ -2480,6 +2608,19 @@ fn decode_optional_date(raw: Option<String>) -> rusqlite::Result<Option<Date>> {
     .transpose()
 }
 
+fn decode_json_column<T>(column: usize, value: &str) -> rusqlite::Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_str(value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(err),
+        )
+    })
+}
+
 fn decode_fact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeGraphFact> {
     Ok(KnowledgeGraphFact {
         fact_id: row.get(0)?,
@@ -2512,6 +2653,10 @@ fn decode_fact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeGraphFa
                 Box::new(err),
             )
         })?,
+        provenance: row
+            .get::<_, Option<String>>(11)?
+            .map(|value| decode_json_column(11, &value))
+            .transpose()?,
     })
 }
 
@@ -2671,7 +2816,10 @@ mod tests {
         KnowledgeGraphFact, LineageMigrationRecord, RevisionedWrite, SelfObservationRecord,
         SelfObservationScope, SelfObservationStatus, ToolStateEntry,
     };
-    use agentpalace_core::{DIARY_SUMMARY_MAX_CHARS, DrawerId};
+    use agentpalace_core::{
+        AuthenticatedOwner, DIARY_SUMMARY_MAX_CHARS, DrawerId, OwnerIdentity, PersistedProvenance,
+        ProvenanceAction, ProvenanceHistoryEntry, RecordingTime, StorageOrigin,
+    };
     use serde_json::json;
     use time::macros::date;
     use time::{Duration, OffsetDateTime};
@@ -2833,6 +2981,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(operation_count, 2);
+    }
+
+    #[test]
+    fn owner_scoped_event_recovery_recognizes_pre_migration_raw_operation_id() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+        let event = ChangeEvent {
+            event_type: "drawer_added".to_owned(),
+            occurred_at: datetime!(2026-06-01 12:00:00 UTC),
+            entity_id: "legacy-drawer".to_owned(),
+            actor: Some("legacy".to_owned()),
+            details_json: None,
+        };
+
+        assert!(store.append_event_if_absent_with_operation(&event, "old-op").unwrap());
+        assert!(!store
+            .append_event_if_absent_with_operation(&event, "alice:old-op")
+            .unwrap());
+
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM change_log WHERE entity_id='legacy-drawer' AND event_type='drawer_added'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -3382,6 +3559,7 @@ mod tests {
             source_file: Some("docs/plan.md".to_owned()),
             created_at: datetime!(2026-04-03 09:00:00 UTC),
             updated_at: datetime!(2026-04-03 09:00:00 UTC),
+            provenance: None,
         };
 
         store.upsert_fact(&fact).unwrap();
@@ -3416,6 +3594,72 @@ mod tests {
     }
 
     #[test]
+    fn legacy_fact_invalidation_keeps_unknown_creator_and_known_invalidator() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+        store
+            .upsert_fact(&KnowledgeGraphFact {
+                fact_id: "legacy-fact".to_owned(),
+                subject_entity_id: "subject".to_owned(),
+                predicate: "relates_to".to_owned(),
+                object_entity_id: "object".to_owned(),
+                valid_from: None,
+                valid_to: None,
+                confidence: 1.0,
+                source_drawer_id: None,
+                source_file: None,
+                created_at: datetime!(2026-04-03 09:00:00 UTC),
+                updated_at: datetime!(2026-04-03 09:00:00 UTC),
+                provenance: None,
+            })
+            .unwrap();
+
+        let owner = AuthenticatedOwner::parse(
+            "usr_invalidator",
+            "https://accounts.example",
+            "subject-invalidator",
+            "invalidator@example.com",
+        )
+        .unwrap();
+        let identity = OwnerIdentity::Authenticated(owner);
+        let recorded_at = RecordingTime::from_rfc3339("2026-04-04T00:00:00Z").unwrap();
+        let provenance = PersistedProvenance::new(
+            ProvenanceHistoryEntry::new(ProvenanceAction::Created, identity.clone(), recorded_at.clone()),
+            identity.clone(),
+            None,
+            Vec::new(),
+            StorageOrigin::local_default(),
+            None,
+            Vec::new(),
+            None,
+            Some(ProvenanceHistoryEntry::new(ProvenanceAction::Invalidated, identity, recorded_at)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store
+                .invalidate_active_fact_with_provenance(
+                    "subject",
+                    "relates_to",
+                    "object",
+                    date!(2026 - 04 - 04),
+                    datetime!(2026-04-04 00:00:00 UTC),
+                    Some(&provenance),
+                )
+                .unwrap(),
+            1
+        );
+        let stored = store.get_fact("legacy-fact").unwrap().unwrap();
+        let stored_provenance = stored.provenance.unwrap();
+        assert!(stored_provenance.creator.owner.is_unknown());
+        assert_eq!(
+            stored_provenance.invalidated_by.unwrap().owner.owner_id().map(|id| id.as_str()),
+            Some("usr_invalidator")
+        );
+    }
+
+    #[test]
     fn does_not_invalidate_future_dated_facts() {
         let tempdir = tempdir().unwrap();
         let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
@@ -3434,6 +3678,7 @@ mod tests {
                 source_file: None,
                 created_at: datetime!(2026-04-03 09:00:00 UTC),
                 updated_at: datetime!(2026-04-03 09:00:00 UTC),
+                provenance: None,
             })
             .unwrap();
 

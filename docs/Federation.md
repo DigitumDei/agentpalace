@@ -214,6 +214,21 @@ Federated mutation routes (`POST /v1/drawers`, `DELETE /v1/drawers/{id}`,
 `operation_id`; when present, the server pins the mutation's target identity in
 a receipt table so an idempotent replay — whether from a retried outbox worker
 or a crash-recovered re-apply — lands exactly once and never double-applies.
+Receipt identity is stored as the validated `(authenticated owner ID,
+operation_id)` pair. The same stable owner ID survives credential rotation,
+while different owners may reuse the raw operation ID without replaying one
+another's response. Rows from older installations are migrated into an
+explicit `legacy` scope and remain owner-unknown; they are never assigned to
+an authenticated owner. Pending and completed rows retain the immutable
+provenance envelope supplied with the mutation intent.
+The change log has a separate compatibility boundary: pre-owner-scope rows may
+contain only the raw operation suffix. Recovery first checks the owner-scoped key,
+then performs a plain raw-suffix fallback for any matching `change_log` row; the
+table has no legacy marker, and this fallback is not owner-isolated. The actual
+deduplication key in that branch is `(event_type, operation_id-or-raw-suffix)`;
+`entity_id` is not part of the predicate. New rows always write the full
+owner-scoped key, but a reused raw key can still collide with a pre-migration row
+for the same event type, so operators must account for that compatibility boundary.
 When a crash lands between the storage commit and the change-event append, a
 recovered drawer add or delete also restores the missing `drawer_added`/
 `drawer_deleted` event exactly once — via an atomic append-if-absent — before

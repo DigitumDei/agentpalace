@@ -44,7 +44,7 @@ pub use outbox::{
 pub use receipt::{
     MutationReceipt, MutationReceiptStore, NewReceipt, RECEIPT_KIND_DRAWER_ADD,
     RECEIPT_KIND_DRAWER_DELETE, RECEIPT_KIND_KG_ADD, RECEIPT_KIND_KG_INVALIDATE, ReceiptOutcome,
-    ReceiptState,
+    ReceiptKey, ReceiptState,
 };
 pub use replicated_ingest::ReplicatedSource;
 pub use skills::{

@@ -1125,6 +1125,7 @@ mod tests {
             embedding: embedding(seed),
             locator: None,
             view_metadata: None,
+            provenance: None,
         }
     }
 
@@ -1971,6 +1972,7 @@ mod diary_summary_tests {
             embedding: embedding([0.5, 0.5, 0.5, 0.5]),
             locator: None,
             view_metadata: None,
+            provenance: None,
         }
     }
 

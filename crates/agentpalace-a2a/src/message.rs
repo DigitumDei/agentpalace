@@ -163,6 +163,7 @@ mod tests {
             acknowledged_at: None,
             acknowledged_by: None,
             created_at: time::OffsetDateTime::now_utc(),
+            provenance: None,
         };
         let decoded = message_to_a2a_message(&stored).unwrap();
         assert_eq!(decoded, original);
@@ -182,6 +183,7 @@ mod tests {
             acknowledged_at: None,
             acknowledged_by: None,
             created_at: time::OffsetDateTime::now_utc(),
+            provenance: None,
         };
         let err = message_to_a2a_message(&stored).expect_err("wrong kind must be rejected");
         assert!(matches!(err, A2aError::InvalidStoredShape { shape: "Message", .. }));
@@ -215,6 +217,7 @@ mod tests {
             acknowledged_at: None,
             acknowledged_by: None,
             created_at: time::OffsetDateTime::now_utc(),
+            provenance: None,
         };
         let err = message_to_a2a_message(&stored)
             .expect_err("a stored part with two content fields set must be rejected");

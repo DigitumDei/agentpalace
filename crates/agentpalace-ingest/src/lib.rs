@@ -1659,6 +1659,7 @@ fn build_drawers_from_embeddings(
             embedding,
             locator,
             view_metadata: view_metadata.cloned(),
+            provenance: None,
         });
     }
 
@@ -4883,6 +4884,7 @@ mod tests {
 
         assert_eq!(drawers.len(), 5);
         assert_eq!(*batches.borrow(), vec![2, 2, 1]);
+        assert!(drawers.iter().all(|drawer| drawer.provenance.is_none()));
     }
 
     #[test]

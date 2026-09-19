@@ -38,9 +38,10 @@ use axum::{Json, Router};
 use blake3::Hasher;
 use agentpalace_config::AgentPalaceConfig;
 use agentpalace_core::{
-    BUILD_VERSION, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, RoomId,
-    SHARED_AGENT_DIARY_WING, SearchQuery, SourceLocator, WING_PREFIX, WingId, hash_bytes,
-    mined_drawer_id, resolve_records,
+    BUILD_VERSION, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, PersistedProvenance,
+    ProvenanceAction, ProvenanceHistoryEntry, RoomId, RecordingTime, SHARED_AGENT_DIARY_WING,
+    SearchQuery, SourceLocator, StorageOrigin,
+    WING_PREFIX, WingId, hash_bytes, mined_drawer_id, resolve_records,
 };
 pub use agentpalace_core::{
     reject_payload_owner_claim, AuthenticatedOwner, EmailAtWrite, Issuer, LegacyUnknownOwner,
@@ -112,6 +113,23 @@ const MAX_KG_TIMELINE_LIMIT: usize = 200;
 /// this route-level check turns an obviously-nonsensical value into a clean 400 before a request
 /// ever reaches storage, rather than relying on that lower-level guard alone.
 const MAX_LEASE_SECONDS: i64 = 100 * 365 * 24 * 60 * 60;
+
+/// Derive the optional operation identifier and its owner-scoped key once.
+///
+/// Keeping the identifier and key in one optional value makes the keyed and
+/// legacy paths explicit at every receipt/event boundary without recomputing
+/// the authenticated owner scope.
+fn validated_operation(
+    operation_id: Option<String>,
+    auth: &AuthIdentity,
+) -> Result<Option<(String, OwnerScopedKey)>, ServerError> {
+    operation_id
+        .map(|operation_id| {
+            let operation_key = auth.owner_scoped_key(operation_id.clone())?;
+            Ok((operation_id, operation_key))
+        })
+        .transpose()
+}
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -1701,6 +1719,7 @@ where
             content_hash: None,
             filed_at: None,
             added_by: None,
+            provenance: result.provenance,
             stale: result.stale,
         })
         .collect();
@@ -1754,7 +1773,7 @@ where
         _ => identity.clone(),
     };
 
-    let operation_id = body.operation_id.clone();
+    let operation = validated_operation(body.operation_id.clone(), &auth.0)?;
     // Resolve the drawer identity. A caller-supplied `drawer_id` is preserved
     // verbatim so replicated adds converge on a stable identity instead of the
     // receiver minting a fresh one; when absent, the first attempt derives one
@@ -1775,7 +1794,7 @@ where
     let mut pinned_drawer_id: Option<String> = None;
     let receipts = state.storage.receipt_store();
 
-    if let Some(op) = &operation_id {
+    if let Some((op, operation_key)) = operation.as_ref() {
         let request_hash = mutation_request_hash(&[
             ("wing", json!(body.wing)),
             ("room", json!(body.room)),
@@ -1788,10 +1807,14 @@ where
             ("drawer_id", json!(&body.drawer_id)),
         ]);
         let outcome = receipts.begin_receipt(&NewReceipt {
-            operation_id: op.clone(),
+            operation_key: (*operation_key).clone(),
             operation_kind: RECEIPT_KIND_DRAWER_ADD.to_owned(),
             request_hash,
             target_id: resolved_target_id.as_str().to_owned(),
+            provenance: Some(receipt_provenance(
+                &auth.0,
+                operation_key,
+            )?),
         })?;
 
         match outcome {
@@ -1837,12 +1860,12 @@ where
                     restore_added_event(
                         &state,
                         &receipt.target_id,
-                        op,
+                        &operation_key.to_string(),
                         identity.as_str(),
                         wing.as_str(),
                         room.as_str(),
                     )?;
-                    receipts.complete_receipt(op, &response)?;
+                    receipts.complete_receipt(operation_key, &response)?;
                     return Ok(Json(response));
                 }
             }
@@ -1891,7 +1914,7 @@ where
     };
     let source_file = body.source_file.unwrap_or_default();
     let added_by = effective_added_by;
-    let record = build_drawer_record(
+    let mut record = build_drawer_record(
         &state,
         drawer_id.clone(),
         wing.clone(),
@@ -1903,6 +1926,7 @@ where
         now,
     )
     .await?;
+    record.provenance = Some(domain_provenance(&auth.0)?);
 
     state
         .storage
@@ -1923,8 +1947,8 @@ where
         actor: Some(identity),
         details_json: Some(json!({"wing": wing.as_str(), "room": room.as_str()}).to_string()),
     };
-    if let Some(op) = &operation_id {
-        state.storage.operational_store().append_event_if_absent_with_operation(&event, op)?;
+    if let Some((_, operation_key)) = operation.as_ref() {
+        state.storage.operational_store().append_event_if_absent_with_operation(&event, &operation_key.to_string())?;
     } else {
         state.storage.operational_store().append_event(&event)?;
     }
@@ -1934,8 +1958,8 @@ where
         wing.as_str(),
         room.as_str(),
     ))?;
-    if let Some(op) = operation_id {
-        receipts.complete_receipt(&op, &response)?;
+    if let Some((_, operation_key)) = operation.as_ref() {
+        receipts.complete_receipt(operation_key, &response)?;
     }
     Ok(Json(response))
 }
@@ -2032,7 +2056,7 @@ where
 {
     let drawer_id = DrawerId::new(&id)?;
 
-    let operation_id = params.operation_id.clone();
+    let operation = validated_operation(params.operation_id.clone(), &auth.0)?;
     let receipts = state.storage.receipt_store();
 
     // Durable wing/room captured on a pending receipt by a prior attempt (see
@@ -2042,13 +2066,17 @@ where
     let mut recovered_details: Option<Value> = None;
 
     // Idempotency gate. Without an `operation_id` the behaviour below is exactly the legacy one.
-    if let Some(op) = &operation_id {
+    if let Some((op, operation_key)) = operation.as_ref() {
         let request_hash = mutation_request_hash(&[("drawer_id", json!(id))]);
         let outcome = receipts.begin_receipt(&NewReceipt {
-            operation_id: op.clone(),
+            operation_key: (*operation_key).clone(),
             operation_kind: RECEIPT_KIND_DRAWER_DELETE.to_owned(),
             request_hash,
             target_id: id.clone(),
+            provenance: Some(receipt_provenance(
+                &auth.0,
+                operation_key,
+            )?),
         })?;
         match outcome {
             ReceiptOutcome::Conflict { .. } => {
@@ -2096,19 +2124,19 @@ where
         // durable metadata write. Refresh it once the row is absent so the
         // losing request still converges instead of returning a transient 404.
         if recovered_details.is_none() {
-            if let Some(op) = operation_id.as_ref() {
-                recovered_details = receipts.get_receipt(op)?.and_then(|receipt| receipt.details);
+            if let Some((_, operation_key)) = operation.as_ref() {
+                recovered_details = receipts.get_receipt(operation_key)?.and_then(|receipt| receipt.details);
             }
         }
-        if let (Some(op), Some(details)) = (&operation_id, recovered_details.as_ref()) {
+        if let (Some((_, operation_key)), Some(details)) = (operation.as_ref(), recovered_details.as_ref()) {
             authorize_delete_receipt_scope(&auth.0, Some(details))?;
             // Recover the finding-6 crash window: the delete committed but the `drawer_deleted`
             // change event was never appended. Restore exactly one event, with the wing/room
             // captured on the receipt *before* the delete ran, so scoped change reads can see
             // the deletion.
-            restore_deleted_event(&state, &id, op, auth.0.0.as_str(), Some(details))?;
+            restore_deleted_event(&state, &id, &operation_key.to_string(), auth.0.0.as_str(), Some(details))?;
             let response = json!({"success": true});
-            receipts.complete_receipt(op, &response)?;
+            receipts.complete_receipt(operation_key, &response)?;
             return Ok(Json(response));
         }
         // Fresh (or metadata-less) not-found: the receipt begun above is deliberately left
@@ -2129,19 +2157,19 @@ where
     if !auth.0.allows_wing(Operation::Delete, drawer.wing.as_str()) {
         return Err(ServerError::NotFound(format!("drawer {id} not found")));
     }
-    let identity = auth.0.0;
+    let identity = auth.0.0.clone();
 
     // A pending keyed delete may be recovering after the target id was re-used. The
     // receipt's incarnation marker distinguishes the original row from its replacement;
     // in that case restore the original event and leave the replacement untouched.
     if let Some(details) = recovered_details.as_ref() {
         if !drawer_matches_delete_incarnation(&drawer, details)? {
-            let Some(op) = operation_id.as_ref() else {
+            let Some((_, operation_key)) = operation.as_ref() else {
                 return Err(ServerError::NotFound(format!("drawer {id} not found")));
             };
-            restore_deleted_event(&state, &id, op, identity.as_str(), Some(details))?;
+            restore_deleted_event(&state, &id, &operation_key.to_string(), identity.as_str(), Some(details))?;
             let response = json!({"success": true});
-            receipts.complete_receipt(op, &response)?;
+            receipts.complete_receipt(operation_key, &response)?;
             return Ok(Json(response));
         }
     }
@@ -2159,11 +2187,11 @@ where
             "content_hash": drawer.content_hash.clone(),
         },
     });
-    if let Some(op) = &operation_id {
+    if let Some((_, operation_key)) = operation.as_ref() {
         // Fresh attempts capture the row before deleting it. Recoveries retain the
         // original details so a replacement row can never overwrite the marker.
         if recovered_details.is_none() {
-            receipts.set_receipt_details(op, &delete_details)?;
+            receipts.set_receipt_details(operation_key, &delete_details)?;
             recovered_details = Some(delete_details.clone());
         }
     }
@@ -2177,7 +2205,7 @@ where
     // durably observed the drawer, and the pending receipt's metadata keeps a later crash
     // recovery on the same path. Legacy requests (no `operation_id`) keep the exact historical
     // edge behaviour: a zero-row delete is a 404.
-    if deleted == 0 && operation_id.is_none() {
+    if deleted == 0 && operation.is_none() {
         return Err(ServerError::NotFound(format!("drawer {id} not found")));
     }
     if deleted > 0 {
@@ -2190,12 +2218,12 @@ where
             // events by scope the same way it already filters `drawer_added`.
             details_json: Some(recovered_details.as_ref().unwrap_or(&delete_details).to_string()),
         };
-        if let Some(op) = &operation_id {
-            state.storage.operational_store().append_event_if_absent_with_operation(&event, op)?;
+        if let Some((_, operation_key)) = operation.as_ref() {
+            state.storage.operational_store().append_event_if_absent_with_operation(&event, &operation_key.to_string())?;
         } else {
             state.storage.operational_store().append_event(&event)?;
         }
-    } else if let Some(op) = &operation_id {
+    } else if let Some((_, operation_key)) = operation.as_ref() {
         // Another identical delete may have won between lookup and delete. The
         // losing request still owns the same operation and must restore the event
         // before completing its receipt, otherwise a failed winner/event append can
@@ -2203,13 +2231,13 @@ where
         restore_deleted_event(
             &state,
             &id,
-            op,
+            &operation_key.to_string(),
             identity.as_str(),
             recovered_details.as_ref().or(Some(&delete_details)),
         )?;
     }
-    if let Some(op) = operation_id {
-        receipts.complete_receipt(&op, &response)?;
+    if let Some((_, operation_key)) = operation.as_ref() {
+        receipts.complete_receipt(operation_key, &response)?;
     }
     Ok(Json(response))
 }
@@ -2268,6 +2296,62 @@ fn authorize_delete_receipt_scope(
         return Err(not_found());
     }
     Ok(())
+}
+
+/// Build the immutable provenance captured with a mutation receipt.
+///
+/// The owner and operation scope come only from authentication and the validated
+/// server-derived key. Legacy static-token requests remain explicitly unknown,
+/// while authenticated requests retain the stable owner identity across retries
+/// and credential rotation.
+fn receipt_provenance(
+    auth: &AuthIdentity,
+    operation_key: &OwnerScopedKey,
+) -> Result<ProvenanceEnvelope, ServerError> {
+    Ok(ProvenanceEnvelope::new(
+        auth.owner_identity(),
+        RecordingTime::now_utc()?,
+        StorageOrigin::local_default(),
+    )
+    .with_operation_key(operation_key.clone())?)
+}
+
+/// Build the durable domain attribution for a newly created remote record.
+/// Caller-asserted agent/source fields remain separate and are intentionally not
+/// inferred from the authenticated owner.
+fn domain_provenance(auth: &AuthIdentity) -> Result<PersistedProvenance, ServerError> {
+    let owner = auth.owner_identity();
+    let now = RecordingTime::now_utc()?;
+    let creator = ProvenanceHistoryEntry::new(ProvenanceAction::Created, owner.clone(), now.clone());
+    PersistedProvenance::new(
+        creator,
+        owner,
+        None,
+        Vec::new(),
+        StorageOrigin::local_default(),
+        None,
+        Vec::new(),
+        None,
+        None,
+    )
+    .map_err(|error| ServerError::InvalidParams(format!("invalid provenance: {error}")))
+}
+
+/// Build durable provenance for a KG invalidation while retaining the original
+/// creator fields separately from the authenticated actor performing the change.
+fn invalidation_provenance(auth: &AuthIdentity) -> Result<PersistedProvenance, ServerError> {
+    let mut provenance = domain_provenance(auth)?;
+    let owner = auth.owner_identity();
+    let occurred_at = RecordingTime::now_utc()?;
+    provenance.invalidated_by = Some(ProvenanceHistoryEntry::new(
+        ProvenanceAction::Invalidated,
+        owner,
+        occurred_at,
+    ));
+    provenance
+        .validate()
+        .map_err(|error| ServerError::InvalidParams(format!("invalid provenance: {error}")))?;
+    Ok(provenance)
 }
 
 /// Compare the durable incarnation marker captured before a keyed delete with the
@@ -2456,21 +2540,22 @@ async fn route_kg_add<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let identity = auth.0.0;
+    let identity = auth.0.0.clone();
     validate_kg_field("subject", &body.subject)?;
     validate_kg_field("predicate", &body.predicate)?;
     validate_kg_field("object", &body.object)?;
     let valid_from = body.valid_from.as_deref().map(parse_date).transpose()?;
     let runtime = KnowledgeGraphRuntime::new(state.storage.operational_store());
     let now = OffsetDateTime::now_utc();
+    let provenance = domain_provenance(&auth.0)?;
 
-    let operation_id = body.operation_id.clone();
+    let operation = validated_operation(body.operation_id.clone(), &auth.0)?;
     let receipts = state.storage.receipt_store();
 
     // Idempotency gate. `add_fact` is itself idempotent over the triple (it returns the existing
     // active fact id instead of creating a duplicate), so the real risks on a replay are the
     // duplicate change event and the duplicate work. A completed receipt short-circuits both.
-    if let Some(op) = &operation_id {
+    if let Some((op, operation_key)) = operation.as_ref() {
         let request_hash = mutation_request_hash(&[
             ("subject", json!(&body.subject)),
             ("predicate", json!(&body.predicate)),
@@ -2478,10 +2563,14 @@ where
             ("valid_from", json!(&body.valid_from)),
         ]);
         let outcome = receipts.begin_receipt(&NewReceipt {
-            operation_id: op.clone(),
+            operation_key: (*operation_key).clone(),
             operation_kind: RECEIPT_KIND_KG_ADD.to_owned(),
             request_hash,
             target_id: canonical_kg_triple(&body.subject, &body.predicate, &body.object),
+            provenance: Some(receipt_provenance(
+                &auth.0,
+                operation_key,
+            )?),
         })?;
         match outcome {
             ReceiptOutcome::Conflict { .. } => {
@@ -2497,7 +2586,7 @@ where
                 // A prior attempt started but never completed (crash). Re-applying the add is
                 // idempotent over the triple; the event below is restored for this operation even
                 // when the graph effect was already present.
-                let triple_id = runtime.add_fact(
+                let triple_id = runtime.add_fact_with_provenance(
                     AddFactRequest {
                         subject: body.subject.clone(),
                         subject_type: infer_entity_kind(&body.subject),
@@ -2511,6 +2600,7 @@ where
                         source_file: None,
                     },
                     now,
+                    Some(provenance.clone()),
                 )?;
                 // Whether or not the graph effect was already present, the event is part of the
                 // same operation's durable outcome. Restore it atomically before completing the
@@ -2529,13 +2619,13 @@ where
                 state
                     .storage
                     .operational_store()
-                    .append_event_if_absent_with_operation(&event, op)?;
+                    .append_event_if_absent_with_operation(&event, &operation_key.to_string())?;
                 let response = json!({
                     "success": true,
                     "triple_id": triple_id,
                     "fact": format!("{} → {} → {}", body.subject, body.predicate, body.object),
                 });
-                receipts.complete_receipt(op, &response)?;
+                receipts.complete_receipt(operation_key, &response)?;
                 return Ok(Json(response));
             }
             ReceiptOutcome::Fresh(_) => {}
@@ -2543,7 +2633,7 @@ where
     }
 
     // Apply path: fresh intent, or a recovered intent whose effect was not yet present.
-    let triple_id = runtime.add_fact(
+    let triple_id = runtime.add_fact_with_provenance(
         AddFactRequest {
             subject: body.subject.clone(),
             subject_type: infer_entity_kind(&body.subject),
@@ -2557,6 +2647,7 @@ where
             source_file: None,
         },
         now,
+        Some(provenance),
     )?;
 
     let event = ChangeEvent {
@@ -2569,8 +2660,8 @@ where
                 .to_string(),
         ),
     };
-    if let Some(op) = &operation_id {
-        state.storage.operational_store().append_event_if_absent_with_operation(&event, op)?;
+    if let Some((_, operation_key)) = operation.as_ref() {
+        state.storage.operational_store().append_event_if_absent_with_operation(&event, &operation_key.to_string())?;
     } else {
         state.storage.operational_store().append_event(&event)?;
     }
@@ -2580,8 +2671,8 @@ where
         "triple_id": triple_id,
         "fact": format!("{} → {} → {}", body.subject, body.predicate, body.object),
     });
-    if let Some(op) = operation_id {
-        receipts.complete_receipt(&op, &response)?;
+    if let Some((_, operation_key)) = operation.as_ref() {
+        receipts.complete_receipt(operation_key, &response)?;
     }
     Ok(Json(response))
 }
@@ -2596,7 +2687,7 @@ async fn route_kg_invalidate<P>(
 where
     P: EmbeddingProvider + Send + Sync + 'static,
 {
-    let identity = auth.0.0;
+    let identity = auth.0.0.clone();
     validate_kg_field("subject", &body.subject)?;
     validate_kg_field("predicate", &body.predicate)?;
     validate_kg_field("object", &body.object)?;
@@ -2608,13 +2699,14 @@ where
         .unwrap_or_else(|| OffsetDateTime::now_utc().date());
     let now = OffsetDateTime::now_utc();
     let runtime = KnowledgeGraphRuntime::new(state.storage.operational_store());
+    let provenance = invalidation_provenance(&auth.0)?;
 
-    let operation_id = body.operation_id.clone();
+    let operation = validated_operation(body.operation_id.clone(), &auth.0)?;
     // A graph invalidation and its post-effect receipt marker cannot share one SQLite
     // transaction today. Serialize operation-aware handlers in this server so a concurrent
     // recovery waits for the first handler to record its marker and event, then replays the
     // completed receipt instead of completing a no-op in the window between those writes.
-    let _operation_lock = if operation_id.is_some() {
+    let _operation_lock = if operation.is_some() {
         Some(state.operation_aware_kg_invalidation_lock.lock().await)
     } else {
         None
@@ -2623,7 +2715,7 @@ where
     let receipts = state.storage.receipt_store();
 
     // Idempotency gate for the invalidate replay path.
-    if let Some(op) = &operation_id {
+    if let Some((op, operation_key)) = operation.as_ref() {
         let request_hash = mutation_request_hash(&[
             ("subject", json!(&body.subject)),
             ("predicate", json!(&body.predicate)),
@@ -2631,10 +2723,14 @@ where
             ("ended", json!(&body.ended)),
         ]);
         let outcome = receipts.begin_receipt(&NewReceipt {
-            operation_id: op.clone(),
+            operation_key: (*operation_key).clone(),
             operation_kind: RECEIPT_KIND_KG_INVALIDATE.to_owned(),
             request_hash,
             target_id: canonical_kg_triple(&body.subject, &body.predicate, &body.object),
+            provenance: Some(receipt_provenance(
+                &auth.0,
+                operation_key,
+            )?),
         })?;
         match outcome {
             ReceiptOutcome::Conflict { .. } => {
@@ -2659,7 +2755,7 @@ where
                 }
             }
             ReceiptOutcome::Fresh(_) => {
-                receipts.set_receipt_details(op, &json!({"ended": format_date(ended)}))?;
+                receipts.set_receipt_details(operation_key, &json!({"ended": format_date(ended)}))?;
             }
         }
     }
@@ -2668,9 +2764,16 @@ where
     // invalidated (or absent) fact returns 0, which is a converged end state for an operation-aware
     // replay. An unknown entity is likewise a converged absence rather than a hard error.
     let invalidated =
-        match runtime.invalidate(&body.subject, &body.predicate, &body.object, ended, now) {
+        match runtime.invalidate_with_provenance(
+            &body.subject,
+            &body.predicate,
+            &body.object,
+            ended,
+            now,
+            Some(&provenance),
+        ) {
             Ok(count) => count,
-            Err(agentpalace_graph::GraphError::UnknownEntity { .. }) if operation_id.is_some() => 0,
+            Err(agentpalace_graph::GraphError::UnknownEntity { .. }) if operation.is_some() => 0,
             Err(error) => return Err(error.into()),
         };
 
@@ -2680,9 +2783,9 @@ where
     // the transition.
     if invalidated > 0 {
         recovery_effect_applied = true;
-        if let Some(op) = &operation_id {
+        if let Some((_, operation_key)) = operation.as_ref() {
             if let Err(error) = receipts.set_receipt_details(
-                op,
+                operation_key,
                 &json!({"ended": format_date(ended), "effect_applied": true}),
             ) {
                 // A concurrent recovery request may have completed the receipt during the
@@ -2690,7 +2793,7 @@ where
                 // effect occurred, so keep going and append the operation-scoped event; a late
                 // marker write must not turn that repair into a lost event.
                 let completed = receipts
-                    .get_receipt(op)?
+                    .get_receipt(operation_key)?
                     .is_some_and(|receipt| receipt.status == ReceiptState::Completed);
                 if !completed {
                     return Err(error.into());
@@ -2711,8 +2814,8 @@ where
                 .to_string(),
             ),
         };
-        if let Some(op) = &operation_id {
-            state.storage.operational_store().append_event_if_absent_with_operation(&event, op)?;
+        if let Some((_, operation_key)) = operation.as_ref() {
+            state.storage.operational_store().append_event_if_absent_with_operation(&event, &operation_key.to_string())?;
         } else {
             state.storage.operational_store().append_event(&event)?;
         }
@@ -2721,7 +2824,7 @@ where
     // Legacy shape: `success` mirrors whether a row was invalidated. Operation-aware requests treat
     // a converged state (already invalidated, or absent) as success, so replayed invalidates do not
     // surface an error.
-    let success = match &operation_id {
+    let success = match &operation {
         Some(_) => true,
         None => invalidated > 0,
     };
@@ -2731,8 +2834,8 @@ where
         "fact": format!("{} → {} → {}", body.subject, body.predicate, body.object),
         "ended": format_date(ended),
     });
-    if let Some(op) = operation_id {
-        receipts.complete_receipt(&op, &response)?;
+    if let Some((_, operation_key)) = operation.as_ref() {
+        receipts.complete_receipt(operation_key, &response)?;
     }
     Ok(Json(response))
 }
@@ -3060,7 +3163,13 @@ where
     if !auth.0.allows_wing(Operation::Ingest, wing.as_str()) {
         return Err(ServerError::Forbidden);
     }
-    let identity = auth.0.0;
+    let identity = auth.0.0.clone();
+    let replication_operation = body
+        .replication
+        .as_ref()
+        .map(|replication| validated_operation(Some(replication.record_id.clone()), &auth.0))
+        .transpose()?
+        .flatten();
 
     // ── Request-level validation ──────────────────────────────────────────────
     if body.files.is_empty() {
@@ -3129,14 +3238,21 @@ where
             .await?;
         let request_hash =
             mutation_request_hash(&[("request", json!(&body)), ("identity", json!(&identity))]);
+        let Some((_, replication_operation_key)) = replication_operation.as_ref() else {
+            return Err(ServerError::InvalidParams("replication operation key is missing".to_owned()));
+        };
         match state.storage.receipt_store().begin_receipt(&NewReceipt {
-            operation_id: replication.record_id.clone(),
+            operation_key: (*replication_operation_key).clone(),
             operation_kind: "ingest_file".to_owned(),
             request_hash,
             target_id: hash_text(&format!(
                 "{}:{}:{}",
                 wing, body.repo_id, body.files[0].relative_path
             )),
+            provenance: Some(receipt_provenance(
+                &auth.0,
+                replication_operation_key,
+            )?),
         })? {
             ReceiptOutcome::Replay(receipt) => {
                 let response = serde_json::from_value(receipt.response.unwrap_or(Value::Null))
@@ -3194,6 +3310,7 @@ where
         resolve_root_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
 
     let now = OffsetDateTime::now_utc();
+    let provenance = domain_provenance(&auth.0)?;
 
     // Build repository-view metadata for federated batch.
     let view_metadata = agentpalace_core::RepositoryViewMetadata {
@@ -3259,11 +3376,11 @@ where
             continue;
         }
 
-        if let Some(replication) = &body.replication {
+        if let Some((_, replication_operation_key)) = replication_operation.as_ref() {
             let receipt = state
                 .storage
                 .receipt_store()
-                .get_receipt(&replication.record_id)?
+                .get_receipt(replication_operation_key)?
                 .expect("receipt was begun under the ingestion lock");
             if receipt.details.is_none() {
                 let previous = state
@@ -3271,7 +3388,7 @@ where
                     .operational_store()
                     .committed_drawer_ids_for_source_key(&source_key)?;
                 state.storage.receipt_store().set_receipt_details(
-                    &replication.record_id,
+                    replication_operation_key,
                     &json!({"previous_ids": previous, "source_key": source_key}),
                 )?;
             } else if recovering_committed_ingest {
@@ -3566,6 +3683,7 @@ where
                 embedding,
                 locator,
                 view_metadata: Some(view_metadata.clone()),
+                provenance: Some(provenance.clone()),
             });
         }
 
@@ -3637,11 +3755,14 @@ where
                 .to_string(),
             ),
         };
-        if let Some(replication) = &body.replication {
+        if let Some((_, replication_operation_key)) = replication_operation.as_ref() {
             state
                 .storage
                 .operational_store()
-                .append_event_if_absent_with_operation(&event, &replication.record_id)?;
+                    .append_event_if_absent_with_operation(
+                        &event,
+                        &replication_operation_key.to_string(),
+                    )?;
         } else {
             state.storage.operational_store().append_event(&event)?;
         }
@@ -3663,13 +3784,13 @@ where
         }
     }
     let response = IngestBatchResponse { files: file_results, warnings };
-    if let Some(replication) = &body.replication {
+    if let Some((_, replication_operation_key)) = replication_operation.as_ref() {
         if response.files.iter().all(|file| file.status != "retryable") {
             if response.files.iter().all(|file| file.status != "failed") {
                 let receipt = state
                     .storage
                     .receipt_store()
-                    .get_receipt(&replication.record_id)?
+                    .get_receipt(replication_operation_key)?
                     .expect("ingest receipt exists");
                 if let Some(details) = receipt.details {
                     let previous: Vec<DrawerId> =
@@ -3690,7 +3811,10 @@ where
             state
                 .storage
                 .receipt_store()
-                .complete_receipt(&replication.record_id, &json!(&response))?;
+                .complete_receipt(
+                    replication_operation_key,
+                    &json!(&response),
+                )?;
         }
     }
     Ok(Json(response))
@@ -4119,6 +4243,7 @@ fn task_to_dto(task: CoordinationTask) -> Result<CoordinationTaskDto, ServerErro
         expires_at: task.expires_at.map(format_rfc3339).transpose()?,
         created_at: format_rfc3339(task.created_at)?,
         updated_at: format_rfc3339(task.updated_at)?,
+        provenance: task.provenance.map(|value| serde_json::to_value(value.response())).transpose()?,
     })
 }
 
@@ -4135,6 +4260,7 @@ fn message_to_dto(message: CoordinationMessage) -> Result<CoordinationMessageDto
         acknowledged_at: message.acknowledged_at.map(format_rfc3339).transpose()?,
         acknowledged_by: message.acknowledged_by,
         created_at: format_rfc3339(message.created_at)?,
+        provenance: message.provenance.map(|value| serde_json::to_value(value.response())).transpose()?,
     })
 }
 
@@ -4148,6 +4274,7 @@ fn artifact_to_dto(artifact: CoordinationArtifact) -> Result<CoordinationArtifac
         content: artifact.content,
         content_hash: artifact.content_hash,
         created_at: format_rfc3339(artifact.created_at)?,
+        provenance: artifact.provenance.map(|value| serde_json::to_value(value.response())).transpose()?,
     })
 }
 
@@ -4158,6 +4285,7 @@ fn result_to_dto(result: CoordinationTaskResult) -> Result<CoordinationTaskResul
         created_by: result.created_by,
         payload: result.payload,
         created_at: format_rfc3339(result.created_at)?,
+        provenance: result.provenance.map(|value| serde_json::to_value(value.response())).transpose()?,
     })
 }
 
@@ -4252,7 +4380,11 @@ where
         budget: body.budget,
         expires_at,
     };
-    let task = state.coordination.create_task(&input).map_err(coordination_storage_error)?;
+    let provenance = domain_provenance(&auth.0)?;
+    let task = state
+        .coordination
+        .create_task_with_provenance(&input, Some(&provenance))
+        .map_err(coordination_storage_error)?;
     // An idempotency-key replay returns whatever task storage originally
     // created for `(created_by, idempotency_key)`, regardless of the wing
     // this request named — re-authorize the wing storage actually used.
@@ -4419,7 +4551,11 @@ where
         idempotency_key: body.idempotency_key,
         envelope_version: body.envelope_version,
     };
-    let message = state.coordination.send_message(&input).map_err(coordination_storage_error)?;
+    let provenance = domain_provenance(&auth.0)?;
+    let message = state
+        .coordination
+        .send_message_with_provenance(&input, Some(&provenance))
+        .map_err(coordination_storage_error)?;
     // An idempotency-key replay returns whatever message storage originally
     // created for `(sender, idempotency_key)`, on whatever task that was —
     // possibly not `body.task_id`. Re-authorize the wing storage actually
@@ -4581,7 +4717,11 @@ where
         content: body.content,
         idempotency_key: body.idempotency_key,
     };
-    let artifact = state.coordination.put_artifact(&input).map_err(coordination_storage_error)?;
+    let provenance = domain_provenance(&auth.0)?;
+    let artifact = state
+        .coordination
+        .put_artifact_with_provenance(&input, Some(&provenance))
+        .map_err(coordination_storage_error)?;
     // See the identical note in `route_coordination_message_send`: a replay
     // can return an artifact belonging to a different, unauthorized wing.
     authorize_replay_wing(&auth.0, &owning_task_wing(&state.coordination, &artifact.task_id)?)?;
@@ -4634,7 +4774,11 @@ where
         payload: body.payload,
         idempotency_key: body.idempotency_key,
     };
-    let result = state.coordination.put_result(&input).map_err(coordination_storage_error)?;
+    let provenance = domain_provenance(&auth.0)?;
+    let result = state
+        .coordination
+        .put_result_with_provenance(&input, Some(&provenance))
+        .map_err(coordination_storage_error)?;
     // See the identical note in `route_coordination_message_send`: a replay
     // can return a result belonging to a different, unauthorized wing.
     authorize_replay_wing(&auth.0, &owning_task_wing(&state.coordination, &result.task_id)?)?;
@@ -4945,6 +5089,7 @@ fn drawer_record_to_json_with_stale(drawer: &DrawerRecord, stale: bool) -> Value
         "filed_at": format_rfc3339(drawer.filed_at).ok(),
         "content": drawer.content,
         "content_hash": drawer.content_hash,
+        "provenance": drawer.provenance.as_ref().map(|value| value.response()),
     });
     if stale {
         v["stale"] = json!(true);
@@ -5039,6 +5184,7 @@ where
         embedding,
         locator: None,
         view_metadata: None,
+        provenance: None,
     })
 }
 
@@ -5218,6 +5364,8 @@ mod tests {
 
     const ALICE_TOKEN: &str = "alice-secret-token";
     const BOB_TOKEN: &str = "bob-secret-token";
+    const OWNER_ALICE_TOKEN: &str = "owner-alice-secret-token";
+    const OWNER_BOB_TOKEN: &str = "owner-bob-secret-token";
     const BAD_TOKEN: &str = "bad-token-xyz";
     // Scoped-token fixtures (issue #102 Stage 2). `alice` above stays
     // unrestricted (no `scopes` field) and is the grandfathering baseline;
@@ -5340,6 +5488,24 @@ mod tests {
         serde_json::json!([
             {"token": ALICE_TOKEN, "name": "alice", "enabled": true},
             {"token": BOB_TOKEN, "name": "bob", "enabled": false},
+            {
+                "token": OWNER_ALICE_TOKEN, "name": "shared-agent", "enabled": true,
+                "owner": {
+                    "id": "usr_01J8Y_OWNER_ALICE00000000001",
+                    "issuer": "https://accounts.google.com",
+                    "subject": "subject_owner_alice",
+                    "email_at_write": "owner-alice@example.com"
+                }
+            },
+            {
+                "token": OWNER_BOB_TOKEN, "name": "shared-agent", "enabled": true,
+                "owner": {
+                    "id": "usr_01J8Y_OWNER_BOB00000000002",
+                    "issuer": "https://accounts.google.com",
+                    "subject": "subject_owner_bob",
+                    "email_at_write": "owner-bob@example.com"
+                }
+            },
             {
                 "token": SCOPED_ALPHA_TOKEN, "name": "scoped_alpha", "enabled": true,
                 "scopes": [{
@@ -7447,6 +7613,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_route_scopes_same_operation_id_to_authenticated_owner() {
+        let harness = make_harness().await;
+        let operation_id = "op-two-owner-route-isolation";
+        let shared_agent = "same-client-agent";
+
+        // Both callers deliberately use the same raw operation_id, agent label, and wing. The
+        // only identity that distinguishes their receipts is the owner established by auth.
+        let alice_payload = json!({
+            "wing": "wing_route_isolation",
+            "room": "receipt-boundary",
+            "content": "owner alice's independently committed drawer",
+            "added_by": shared_agent,
+            "drawer_id": "route-isolation-owner-alice",
+            "operation_id": operation_id,
+        });
+        let bob_payload = json!({
+            "wing": "wing_route_isolation",
+            "room": "receipt-boundary",
+            // Keep the two mutations deliberately unrelated so the real duplicate-content
+            // guard does not reject Bob before the owner-scoped receipt boundary is exercised.
+            // The deterministic test embedder uses keyword buckets; keep Bob in a
+            // different bucket so this request reaches the owner-scoped receipt path
+            // instead of the unrelated duplicate-content guard.
+            "content": "session-only route isolation fixture: q7m-violet-orbit-4319",
+            "added_by": shared_agent,
+            "drawer_id": "route-isolation-owner-bob",
+            "operation_id": operation_id,
+        });
+
+        let alice_first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                OWNER_ALICE_TOKEN,
+                alice_payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(alice_first.status(), StatusCode::OK);
+        let alice_response = body_json(alice_first).await;
+        assert_eq!(alice_response["drawer_id"], "route-isolation-owner-alice");
+
+        let bob_first = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                OWNER_BOB_TOKEN,
+                bob_payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bob_first.status(), StatusCode::OK);
+        let bob_response = body_json(bob_first).await;
+        assert_eq!(bob_response["drawer_id"], "route-isolation-owner-bob");
+        assert_ne!(alice_response["drawer_id"], bob_response["drawer_id"]);
+
+        // A same-owner retry replays the original response and does not append another drawer.
+        let alice_retry = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                OWNER_ALICE_TOKEN,
+                alice_payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(alice_retry.status(), StatusCode::OK);
+        assert_eq!(body_json(alice_retry).await, alice_response);
+
+        // Reusing the raw operation_id at the other owner's route boundary with Alice's request
+        // is a conflict against Bob's own receipt; it cannot replay Alice's response or target.
+        let bob_attempted_alice = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                OWNER_BOB_TOKEN,
+                alice_payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bob_attempted_alice.status(), StatusCode::CONFLICT);
+        let bob_conflict = body_json(bob_attempted_alice).await;
+        assert_eq!(bob_conflict["code"], "operation_id_conflict");
+        assert!(bob_conflict.get("drawer_id").is_none());
+
+        // The inverse attempt is independently rejected by Alice's owner-scoped receipt.
+        let alice_attempted_bob = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                OWNER_ALICE_TOKEN,
+                bob_payload,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(alice_attempted_bob.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(alice_attempted_bob).await["code"], "operation_id_conflict");
+
+        let alice_identity = harness.state.tokens.authenticate(OWNER_ALICE_TOKEN).unwrap();
+        let bob_identity = harness.state.tokens.authenticate(OWNER_BOB_TOKEN).unwrap();
+        let alice_key = alice_identity.owner_scoped_key(operation_id).unwrap();
+        let bob_key = bob_identity.owner_scoped_key(operation_id).unwrap();
+        let alice_receipt = harness
+            .state
+            .storage
+            .receipt_store()
+            .get_receipt(&alice_key)
+            .unwrap()
+            .expect("Alice receipt exists");
+        let bob_receipt = harness
+            .state
+            .storage
+            .receipt_store()
+            .get_receipt(&bob_key)
+            .unwrap()
+            .expect("Bob receipt exists");
+        assert_eq!(alice_receipt.status, agentpalace_storage::ReceiptState::Completed);
+        assert_eq!(bob_receipt.status, agentpalace_storage::ReceiptState::Completed);
+        assert_eq!(alice_receipt.operation_key.owner_id(), alice_identity.owner_id());
+        assert_eq!(bob_receipt.operation_key.owner_id(), bob_identity.owner_id());
+        assert_ne!(alice_receipt.operation_key, bob_receipt.operation_key);
+        assert_eq!(alice_receipt.target_id, "route-isolation-owner-alice");
+        assert_eq!(bob_receipt.target_id, "route-isolation-owner-bob");
+        assert_eq!(alice_receipt.response, Some(alice_response.clone()));
+        assert_eq!(bob_receipt.response, Some(bob_response.clone()));
+
+        // The authenticated read route returns each committed target with its authenticated
+        // owner attribution. Shared read visibility is separate from receipt/write ownership.
+        for (token, drawer_id, owner_id) in [
+            (
+                OWNER_ALICE_TOKEN,
+                "route-isolation-owner-alice",
+                "usr_01J8Y_OWNER_ALICE00000000001",
+            ),
+            (
+                OWNER_BOB_TOKEN,
+                "route-isolation-owner-bob",
+                "usr_01J8Y_OWNER_BOB00000000002",
+            ),
+        ] {
+            let response = harness
+                .router
+                .clone()
+                .oneshot(authed_get(&format!("/v1/drawers/{drawer_id}"), token))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            assert_eq!(body["id"], drawer_id);
+            assert_eq!(body["provenance"]["creator"]["id"], owner_id);
+            assert_eq!(body["provenance"]["authenticated_submitter"]["id"], owner_id);
+        }
+
+        let drawers = harness
+            .state
+            .storage
+            .drawer_store()
+            .list_drawers(&agentpalace_storage::DrawerFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            drawers
+                .iter()
+                .filter(|drawer| {
+                    matches!(
+                        drawer.id.as_str(),
+                        "route-isolation-owner-alice" | "route-isolation-owner-bob"
+                    )
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn add_with_supplied_drawer_id_preserves_it() {
         let harness = make_harness().await;
 
@@ -7660,10 +8011,11 @@ mod tests {
         let request_hash = mutation_request_hash(&[("drawer_id", json!(drawer_id))]);
         match receipts
             .begin_receipt(&NewReceipt {
-                operation_id: op.to_owned(),
+                operation_key: OwnerScopedKey::new(None, op).unwrap(),
                 operation_kind: RECEIPT_KIND_DRAWER_DELETE.to_owned(),
                 request_hash,
                 target_id: drawer_id.clone(),
+                provenance: None,
             })
             .unwrap()
         {
@@ -7813,10 +8165,11 @@ mod tests {
         assert!(matches!(
             receipts
                 .begin_receipt(&NewReceipt {
-                    operation_id: op.to_owned(),
+                    operation_key: OwnerScopedKey::new(None, op).unwrap(),
                     operation_kind: RECEIPT_KIND_DRAWER_DELETE.to_owned(),
                     request_hash,
                     target_id: drawer_id.to_owned(),
+                    provenance: None,
                 })
                 .unwrap(),
             ReceiptOutcome::Fresh(_)
@@ -8302,10 +8655,11 @@ mod tests {
         assert!(matches!(
             receipts
                 .begin_receipt(&NewReceipt {
-                    operation_id: op.to_owned(),
+                    operation_key: OwnerScopedKey::new(None, op).unwrap(),
                     operation_kind: RECEIPT_KIND_KG_INVALIDATE.to_owned(),
                     request_hash,
                     target_id: canonical_kg_triple("PinnedDate", "owns", "Item"),
+                    provenance: None,
                 })
                 .unwrap(),
             ReceiptOutcome::Fresh(_)
@@ -8388,7 +8742,7 @@ mod tests {
         assert!(matches!(
             receipts
                 .begin_receipt(&NewReceipt {
-                    operation_id: op.to_owned(),
+                    operation_key: OwnerScopedKey::new(None, op).unwrap(),
                     operation_kind: RECEIPT_KIND_KG_INVALIDATE.to_owned(),
                     request_hash: mutation_request_hash(&[
                         ("subject", json!("PreEffect")),
@@ -8397,6 +8751,7 @@ mod tests {
                         ("ended", json!(Some(ended_text.clone()))),
                     ]),
                     target_id: canonical_kg_triple("PreEffect", "owns", "Item"),
+                    provenance: None,
                 })
                 .unwrap(),
             ReceiptOutcome::Fresh(_)
@@ -8581,10 +8936,11 @@ mod tests {
         let receipts = harness.state.storage.receipt_store();
         let outcome = receipts
             .begin_receipt(&agentpalace_storage::NewReceipt {
-                operation_id: op.to_owned(),
+                    operation_key: OwnerScopedKey::new(None, op).unwrap(),
                 operation_kind: agentpalace_storage::RECEIPT_KIND_DRAWER_ADD.to_owned(),
                 request_hash: hash,
                 target_id: drawer_id.to_owned(),
+                provenance: None,
             })
             .unwrap();
         assert!(matches!(outcome, agentpalace_storage::ReceiptOutcome::Fresh(_)));
@@ -10334,13 +10690,14 @@ mod tests {
             let receipts = harness.state.storage.receipt_store();
             receipts
                 .begin_receipt(&NewReceipt {
-                    operation_id: "crash-record".to_owned(),
+                    operation_key: OwnerScopedKey::new(None, "crash-record").unwrap(),
                     operation_kind: "ingest_file".to_owned(),
                     request_hash: mutation_request_hash(&[
                         ("request", json!(&request)),
                         ("identity", json!("alice")),
                     ]),
                     target_id: hash_text("wing_checkout:repo:a.rs"),
+                    provenance: None,
                 })
                 .unwrap();
             receipts.set_receipt_details("crash-record", &json!({
@@ -10828,13 +11185,14 @@ mod tests {
                 .storage
                 .receipt_store()
                 .begin_receipt(&NewReceipt {
-                    operation_id: "record1".into(),
+                    operation_key: OwnerScopedKey::new(None, "record1").unwrap(),
                     operation_kind: "ingest_file".into(),
                     request_hash: mutation_request_hash(&[
                         ("request", json!(&request)),
                         ("identity", json!("alice")),
                     ]),
                     target_id: hash_text("wing_recover:repo:a.rs"),
+                    provenance: None,
                 })
                 .unwrap();
             let response = harness

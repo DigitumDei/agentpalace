@@ -6310,6 +6310,7 @@ mod tests {
                             embedding,
                             locator: None,
                             view_metadata: None,
+                            provenance: None,
                         }
                     })
                     .collect();
@@ -6418,6 +6419,7 @@ mod tests {
                     embedding,
                     locator: None,
                     view_metadata: None,
+                    provenance: None,
                 };
                 engine
                     .drawer_store()
