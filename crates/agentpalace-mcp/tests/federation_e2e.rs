@@ -121,6 +121,7 @@ async fn mcp_server_with_hub(
             name: "hub".to_owned(),
             url: hub_url.to_owned(),
             token: Some(TEST_TOKEN.to_owned()),
+            oauth: None,
             timeout: Duration::from_secs(5),
         },
     );
@@ -223,6 +224,7 @@ async fn mcp_server_with_hub_multi_default(
                 name: (*name).to_owned(),
                 url: (*url).to_owned(),
                 token: Some(TEST_TOKEN.to_owned()),
+                oauth: None,
                 timeout: Duration::from_secs(5),
             },
         );
@@ -774,6 +776,7 @@ async fn different_embedding_profiles_per_side() {
             name: "hub".to_owned(),
             url: hub_url.clone(),
             token: Some(TEST_TOKEN.to_owned()),
+            oauth: None,
             timeout: Duration::from_secs(5),
         },
     );
@@ -913,6 +916,7 @@ async fn remote_down_degrades_reads() {
             name: "hub".to_owned(),
             url: dead_url.clone(),
             token: Some(TEST_TOKEN.to_owned()),
+            oauth: None,
             timeout: Duration::from_millis(500),
         },
     );
@@ -1375,6 +1379,7 @@ async fn wake_up_with_down_remote_marks_unreachable_and_succeeds() {
             name: "hub".to_owned(),
             url: dead_url.clone(),
             token: Some(TEST_TOKEN.to_owned()),
+            oauth: None,
             // Short timeout so the test does not block.
             timeout: Duration::from_millis(500),
         },
@@ -1933,6 +1938,7 @@ async fn add_drawer_both_replication_fails_with_remote_rejection() {
             name: "hub".to_owned(),
             url: hub_url,
             token: Some(bad_token.to_owned()),
+            oauth: None,
             timeout: Duration::from_secs(5),
         },
     );
@@ -2161,6 +2167,7 @@ async fn add_drawer_both_near_duplicate_same_wing_room_rejected() {
             name: "hub".to_owned(),
             url: dead_url,
             token: Some(TEST_TOKEN.to_owned()),
+            oauth: None,
             timeout: Duration::from_millis(500),
         },
     );
@@ -2293,6 +2300,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
             name: "hub".to_owned(),
             url: hub_url.clone(),
             token: Some(TEST_TOKEN.to_owned()),
+            oauth: None,
             timeout: Duration::from_millis(500),
         },
     );
@@ -2389,6 +2397,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
             name: "hub".to_owned(),
             url: hub_url.clone(),
             token: Some(TEST_TOKEN.to_owned()),
+            oauth: None,
             timeout: Duration::from_secs(5),
         },
     );
@@ -2553,6 +2562,7 @@ async fn delete_both_retry_after_local_delete_replays_same_operation() {
             name: "hub".to_owned(),
             url: dead_url,
             token: Some(TEST_TOKEN.to_owned()),
+            oauth: None,
             timeout: Duration::from_millis(500),
         },
     );
@@ -2672,9 +2682,10 @@ async fn delete_both_retry_after_restart_replays_same_operation() {
             "hub".to_owned(),
             ResolvedRemote {
                 name: "hub".to_owned(),
-                url: dead_url.clone(),
-                token: Some(TEST_TOKEN.to_owned()),
-                timeout: Duration::from_millis(500),
+               url: dead_url.clone(),
+               token: Some(TEST_TOKEN.to_owned()),
+                oauth: None,
+               timeout: Duration::from_millis(500),
             },
         )]),
         default_mode: RouteMode::Local,
@@ -2796,6 +2807,7 @@ async fn add_drawer_both_replication_fails_with_down_remote() {
             name: "hub".to_owned(),
             url: dead_url,
             token: Some(TEST_TOKEN.to_owned()),
+            oauth: None,
             timeout: Duration::from_millis(500),
         },
     );
@@ -2963,6 +2975,7 @@ async fn kg_add_both_replication_fails_with_down_remote() {
             name: "hub".to_owned(),
             url: dead_url,
             token: Some(TEST_TOKEN.to_owned()),
+            oauth: None,
             timeout: Duration::from_millis(500),
         },
     );
@@ -3177,6 +3190,7 @@ async fn kg_invalidate_both_replication_fails_with_down_remote() {
             name: "hub".to_owned(),
             url: dead_url,
             token: Some(TEST_TOKEN.to_owned()),
+            oauth: None,
             timeout: Duration::from_millis(500),
         },
     );
@@ -3472,9 +3486,10 @@ async fn kg_add_both_replication_fails_with_remote_rejection() {
         "hub".to_owned(),
         ResolvedRemote {
             name: "hub".to_owned(),
-            url: hub_url,
+           url: hub_url,
             token: Some(bad_token.to_owned()),
-            timeout: Duration::from_secs(5),
+            oauth: None,
+           timeout: Duration::from_secs(5),
         },
     );
 

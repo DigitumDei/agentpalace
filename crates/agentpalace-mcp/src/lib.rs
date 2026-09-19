@@ -7288,6 +7288,7 @@ mod tests {
                         name: name.clone(),
                         url: "https://test.example".to_owned(),
                         token: None,
+                        oauth: None,
                         timeout: std::time::Duration::from_secs(5),
                     },
                 );
@@ -7350,8 +7351,9 @@ mod tests {
                 ResolvedRemote {
                     name: name.clone(),
                     url: "https://test.example".to_owned(),
-                    token: None,
-                    timeout: std::time::Duration::from_secs(5),
+                       token: None,
+                        oauth: None,
+                        timeout: std::time::Duration::from_secs(5),
                 },
             );
         }
@@ -7414,8 +7416,9 @@ mod tests {
                 ResolvedRemote {
                     name: name.clone(),
                     url: "https://test.example".to_owned(),
-                    token: None,
-                    timeout: std::time::Duration::from_secs(5),
+                       token: None,
+                        oauth: None,
+                        timeout: std::time::Duration::from_secs(5),
                 },
             );
         }
@@ -7618,8 +7621,9 @@ mod tests {
                 ResolvedRemote {
                     name: name.clone(),
                     url: "https://test.example".to_owned(),
-                    token: None,
-                    timeout: std::time::Duration::from_secs(5),
+                       token: None,
+                        oauth: None,
+                        timeout: std::time::Duration::from_secs(5),
                 },
             );
         }
@@ -13063,8 +13067,9 @@ mod tests {
                 ResolvedRemote {
                     name: name.clone(),
                     url: "https://test.example".to_owned(),
-                    token: None,
-                    timeout: std::time::Duration::from_secs(5),
+                       token: None,
+                        oauth: None,
+                        timeout: std::time::Duration::from_secs(5),
                 },
             );
         }
@@ -13562,8 +13567,9 @@ mod tests {
                 ResolvedRemote {
                     name: name.clone(),
                     url: "https://mock.example".to_owned(),
-                    token: None,
-                    timeout: std::time::Duration::from_secs(5),
+                       token: None,
+                        oauth: None,
+                        timeout: std::time::Duration::from_secs(5),
                 },
             );
         }
@@ -14497,7 +14503,8 @@ mod tests {
                 name: "alpha".to_owned(),
                 url: "http://127.0.0.1:9999".to_owned(),
                 token: Some("test".to_owned()),
-                timeout: std::time::Duration::from_secs(5),
+                oauth: None,
+               timeout: std::time::Duration::from_secs(5),
             },
         );
         let federation = FederationRuntimeConfig {
@@ -14616,8 +14623,9 @@ mod tests {
             ResolvedRemote {
                 name: "alpha".to_owned(),
                 url: "http://127.0.0.1:9999".to_owned(),
-                token: Some("test".to_owned()),
-                timeout: std::time::Duration::from_secs(5),
+               token: Some("test".to_owned()),
+                oauth: None,
+               timeout: std::time::Duration::from_secs(5),
             },
         );
         let federation = FederationRuntimeConfig {
@@ -14717,8 +14725,9 @@ mod tests {
             ResolvedRemote {
                 name: "alpha".to_owned(),
                 url: "http://127.0.0.1:9999".to_owned(),
-                token: Some("test".to_owned()),
-                timeout: std::time::Duration::from_secs(5),
+               token: Some("test".to_owned()),
+                oauth: None,
+               timeout: std::time::Duration::from_secs(5),
             },
         );
         let federation = FederationRuntimeConfig {
