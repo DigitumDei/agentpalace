@@ -3421,6 +3421,21 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             table_info(&upgraded_path, "coordination_events"),
             "a fresh palace and an upgraded palace must agree on coordination_events"
         );
+        assert_eq!(
+            table_info(&fresh_path, "coordination_messages"),
+            table_info(&upgraded_path, "coordination_messages"),
+            "a fresh palace and an upgraded palace must agree on coordination_messages"
+        );
+        assert_eq!(
+            table_info(&fresh_path, "coordination_artifacts"),
+            table_info(&upgraded_path, "coordination_artifacts"),
+            "a fresh palace and an upgraded palace must agree on coordination_artifacts"
+        );
+        assert_eq!(
+            table_info(&fresh_path, "coordination_results"),
+            table_info(&upgraded_path, "coordination_results"),
+            "a fresh palace and an upgraded palace must agree on coordination_results"
+        );
         // Columns matching is not enough — an index present on only one path is invisible to
         // `table_info` but still a real divergence (e.g. a full scan on one side, an index seek
         // on the other).
