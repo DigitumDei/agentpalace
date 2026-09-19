@@ -3408,8 +3408,61 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         {
             let conn = Connection::open(&upgraded_path).expect("open");
             conn.execute_batch(LEGACY_SCHEMA_SQL).expect("legacy schema");
+            conn.execute(
+                "INSERT INTO coordination_tasks(task_id,title,description,state,revision,created_by,dependencies_json,idempotency_key,created_at,updated_at) \
+                 VALUES ('legacy-coordination-task','legacy title','legacy description','pending',0,'legacy-owner','[]','legacy-task-key','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("legacy task row");
+            conn.execute(
+                "INSERT INTO coordination_messages(message_id,task_id,sender,recipient,kind,payload_json,envelope_version,idempotency_key,created_at) \
+                 VALUES ('legacy-message','legacy-coordination-task','legacy-sender','legacy-recipient','request','{}',1,'legacy-message-key','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("legacy message row");
+            conn.execute(
+                "INSERT INTO coordination_artifacts(artifact_id,task_id,created_by,role,media_type,content,content_hash,idempotency_key,created_at) \
+                 VALUES ('legacy-artifact','legacy-coordination-task','legacy-owner','evidence','text/plain','legacy content','legacy-hash','legacy-artifact-key','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("legacy artifact row");
+            conn.execute(
+                "INSERT INTO coordination_results(result_id,task_id,created_by,payload_json,idempotency_key,created_at) \
+                 VALUES ('legacy-result','legacy-coordination-task','legacy-owner','{}','legacy-result-key','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("legacy result row");
         }
-        CoordinationStore::new(&upgraded_path).ensure_schema().expect("upgrade schema");
+        let upgraded = CoordinationStore::new(&upgraded_path);
+        upgraded.ensure_schema().expect("upgrade schema");
+
+        assert!(
+            upgraded
+                .get_message("legacy-message")
+                .expect("legacy message")
+                .expect("legacy message row")
+                .provenance
+                .is_none(),
+            "legacy messages without provenance remain compatible"
+        );
+        assert!(
+            upgraded
+                .get_artifact("legacy-artifact")
+                .expect("legacy artifact")
+                .expect("legacy artifact row")
+                .provenance
+                .is_none(),
+            "legacy artifacts without provenance remain compatible"
+        );
+        assert!(
+            upgraded
+                .get_result("legacy-result")
+                .expect("legacy result")
+                .expect("legacy result row")
+                .provenance
+                .is_none(),
+            "legacy results without provenance remain compatible"
+        );
 
         assert_eq!(
             table_info(&fresh_path, "coordination_tasks"),
