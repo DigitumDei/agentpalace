@@ -202,7 +202,7 @@ dependencies = [
  "async-trait",
  "axum",
  "reqwest",
- "rand 0.9.2",
+ "rand 0.9.4",
  "serde",
  "serde_json",
  "sha2",
