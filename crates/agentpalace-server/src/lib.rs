@@ -7633,7 +7633,10 @@ mod tests {
             "room": "receipt-boundary",
             // Keep the two mutations deliberately unrelated so the real duplicate-content
             // guard does not reject Bob before the owner-scoped receipt boundary is exercised.
-            "content": "bob's route isolation fixture: q7m-violet-orbit-4319",
+            // The deterministic test embedder uses keyword buckets; keep Bob in a
+            // different bucket so this request reaches the owner-scoped receipt path
+            // instead of the unrelated duplicate-content guard.
+            "content": "session-only route isolation fixture: q7m-violet-orbit-4319",
             "added_by": shared_agent,
             "drawer_id": "route-isolation-owner-bob",
             "operation_id": operation_id,
