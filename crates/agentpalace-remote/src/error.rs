@@ -21,7 +21,7 @@ pub enum RemoteError {
         /// Name of the remote palace.
         remote: String,
         /// Preserved RFC 9728 resource-metadata challenge, when supplied by the server.
-        pub resource_metadata: Option<String>,
+        resource_metadata: Option<String>,
     },
     /// Interactive OAuth is required; background calls must not launch a browser themselves.
     #[error("remote `{remote}` requires authentication: {action}")]
@@ -31,7 +31,7 @@ pub enum RemoteError {
         /// Safe, actionable instruction with no credential material.
         action: String,
         /// RFC 9728 metadata URL from the challenge, if present.
-        pub resource_metadata: Option<String>,
+        resource_metadata: Option<String>,
     },
     /// The remote speaks an incompatible federation API version.
     #[error("remote `{remote}` speaks federation api v{theirs}, this client speaks v{ours}")]
