@@ -2447,6 +2447,10 @@ impl FederatedOriginalProvenance {
 /// Provider issuer and subject are intentionally absent.  They remain in
 /// [`PersistedProvenance`] for audit and owner scoping, but ordinary readers
 /// receive only the stable owner ID and the email snapshot captured at write.
+/// The authenticated owner, claimed agent, original source attribution, and
+/// storage origin are separate dimensions. Evidence status and execution
+/// authority are domain- and policy-level concerns, not claims made by this
+/// attribution response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceResponse {
@@ -2460,17 +2464,23 @@ pub struct ProvenanceResponse {
     /// Original source author and references.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_author: Option<SourceAuthor>,
+    /// References to the original source, kept separate from the authenticated
+    /// owner and from the storage origin.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_refs: Vec<SourceReference>,
     /// Local/federated storage origin and original record ID, if any.
     pub storage_origin: StorageOrigin,
+    /// Provenance attributed to the record before it was federated or imported,
+    /// if this copy came from another palace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub federated_original: Option<FederatedOriginalSummary>,
     /// Later public attribution events, also redacted to owner ID/email.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<ProvenanceResponseEvent>,
+    /// The authenticated owner and agent recorded for a deletion, if one occurred.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_by: Option<ProvenanceResponseEvent>,
+    /// The authenticated owner and agent recorded for an invalidation, if one occurred.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalidated_by: Option<ProvenanceResponseEvent>,
 }
@@ -2509,7 +2519,10 @@ impl OwnerSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnerSummaryStatus {
+    /// The response includes the stable owner ID and email captured at write time.
     Authenticated,
+    /// The record predates authenticated ownership or otherwise has no known owner.
+    /// This status is explicit and is never inferred from an agent or source author.
     Unknown,
 }
 
@@ -2517,10 +2530,14 @@ pub enum OwnerSummaryStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceResponseEvent {
+    /// Kind of durable attribution event represented by this entry.
     pub action: ProvenanceAction,
+    /// Authenticated owner at event time, or explicit legacy/unknown ownership.
     pub owner: OwnerSummary,
+    /// Caller-asserted agent or harness, if supplied; this is not the owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentAttribution>,
+    /// Server-assigned UTC time at which the event was recorded.
     pub recorded_at: RecordingTime,
 }
 
@@ -2539,12 +2556,18 @@ impl From<&ProvenanceHistoryEntry> for ProvenanceResponseEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FederatedOriginalSummary {
+    /// Remote or local origin that created the original record.
     pub origin: StorageOrigin,
+    /// Original record identifier at that origin, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_id: Option<String>,
+    /// Original creator, summarized without provider issuer or subject.
     pub creator: OwnerSummary,
+    /// Author of the original source, distinct from both the creator and the
+    /// authenticated owner that submitted this copy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_author: Option<SourceAuthor>,
+    /// References to the original source, separate from the storage origin.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_refs: Vec<SourceReference>,
 }
