@@ -10,7 +10,10 @@ use crate::types::{
     RetryableRun, RevisionedWrite, SelfObservationRecord, SelfObservationScope,
     SelfObservationStatus, ToolStateEntry,
 };
-use agentpalace_core::{DIARY_SUMMARY_MAX_CHARS, DrawerId, PersistedProvenance};
+use agentpalace_core::{
+    DIARY_SUMMARY_MAX_CHARS, DrawerId, OwnerIdentity, PersistedProvenance, ProvenanceAction,
+    ProvenanceHistoryEntry,
+};
 use time::Date;
 
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -1608,6 +1611,35 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
                     existing.invalidated_by = incoming.invalidated_by;
                     Some(serde_json::to_string(&existing)?)
                 }
+                (None, Some(incoming)) => {
+                    // Legacy facts have no creator record to merge into. Preserve that
+                    // absence explicitly as Unknown while retaining the authenticated
+                    // invalidator from the incoming provenance.
+                    let incoming: PersistedProvenance = serde_json::from_str(incoming)?;
+                    let invalidated_by = incoming.invalidated_by.clone();
+                    let recorded_at = invalidated_by
+                        .as_ref()
+                        .map(|entry| entry.recorded_at.clone())
+                        .ok_or_else(|| StorageError::Invariant(
+                            "invalidation provenance is missing invalidated_by".to_owned(),
+                        ))?;
+                    let legacy = PersistedProvenance::new(
+                        ProvenanceHistoryEntry::new(
+                            ProvenanceAction::Created,
+                            OwnerIdentity::Unknown,
+                            recorded_at,
+                        ),
+                        OwnerIdentity::Unknown,
+                        None,
+                        Vec::new(),
+                        incoming.storage_origin,
+                        None,
+                        Vec::new(),
+                        None,
+                        invalidated_by,
+                    )?;
+                    Some(serde_json::to_string(&legacy)?)
+                }
                 (other, _) => other,
             };
             changed += connection.execute(
@@ -2778,7 +2810,10 @@ mod tests {
         KnowledgeGraphFact, LineageMigrationRecord, RevisionedWrite, SelfObservationRecord,
         SelfObservationScope, SelfObservationStatus, ToolStateEntry,
     };
-    use agentpalace_core::{DIARY_SUMMARY_MAX_CHARS, DrawerId};
+    use agentpalace_core::{
+        AuthenticatedOwner, DIARY_SUMMARY_MAX_CHARS, DrawerId, OwnerIdentity, PersistedProvenance,
+        ProvenanceAction, ProvenanceHistoryEntry, RecordingTime, StorageOrigin,
+    };
     use serde_json::json;
     use time::macros::date;
     use time::{Duration, OffsetDateTime};
@@ -3549,6 +3584,72 @@ mod tests {
         assert_eq!(
             store.get_fact("fact-1").unwrap().unwrap().valid_to,
             Some(date!(2026 - 04 - 04))
+        );
+    }
+
+    #[test]
+    fn legacy_fact_invalidation_keeps_unknown_creator_and_known_invalidator() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+        store
+            .upsert_fact(&KnowledgeGraphFact {
+                fact_id: "legacy-fact".to_owned(),
+                subject_entity_id: "subject".to_owned(),
+                predicate: "relates_to".to_owned(),
+                object_entity_id: "object".to_owned(),
+                valid_from: None,
+                valid_to: None,
+                confidence: 1.0,
+                source_drawer_id: None,
+                source_file: None,
+                created_at: datetime!(2026-04-03 09:00:00 UTC),
+                updated_at: datetime!(2026-04-03 09:00:00 UTC),
+                provenance: None,
+            })
+            .unwrap();
+
+        let owner = AuthenticatedOwner::parse(
+            "usr_invalidator",
+            "https://accounts.example",
+            "subject-invalidator",
+            "invalidator@example.com",
+        )
+        .unwrap();
+        let identity = OwnerIdentity::Authenticated(owner);
+        let recorded_at = RecordingTime::from_rfc3339("2026-04-04T00:00:00Z").unwrap();
+        let provenance = PersistedProvenance::new(
+            ProvenanceHistoryEntry::new(ProvenanceAction::Created, identity.clone(), recorded_at.clone()),
+            identity.clone(),
+            None,
+            Vec::new(),
+            StorageOrigin::local_default(),
+            None,
+            Vec::new(),
+            None,
+            Some(ProvenanceHistoryEntry::new(ProvenanceAction::Invalidated, identity, recorded_at)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store
+                .invalidate_active_fact_with_provenance(
+                    "subject",
+                    "relates_to",
+                    "object",
+                    date!(2026 - 04 - 04),
+                    datetime!(2026-04-04 00:00:00 UTC),
+                    Some(&provenance),
+                )
+                .unwrap(),
+            1
+        );
+        let stored = store.get_fact("legacy-fact").unwrap().unwrap();
+        let stored_provenance = stored.provenance.unwrap();
+        assert!(stored_provenance.creator.owner.is_unknown());
+        assert_eq!(
+            stored_provenance.invalidated_by.unwrap().owner.owner_id().map(|id| id.as_str()),
+            Some("usr_invalidator")
         );
     }
 

@@ -222,13 +222,13 @@ explicit `legacy` scope and remain owner-unknown; they are never assigned to
 an authenticated owner. Pending and completed rows retain the immutable
 provenance envelope supplied with the mutation intent.
 The change log has a separate compatibility boundary: pre-owner-scope rows may
-contain only the raw operation suffix in their details. Recovery first checks
-the owner-scoped key, then falls back to that raw suffix only for rows explicitly
-marked as legacy. The fallback is deduplicated by canonical change identity
-(event type, entity, and raw suffix), so repeated recovery cannot append duplicate
-events; it never lets a legacy suffix match an authenticated owner's scoped receipt
-or cross an owner boundary. New rows always write the full owner-scoped key and do
-not participate in the raw-suffix fallback.
+contain only the raw operation suffix. Recovery first checks the owner-scoped key,
+then performs a plain raw-suffix fallback for any matching `change_log` row; the
+table has no legacy marker, and this fallback is not owner-isolated. The actual
+deduplication key in that branch is `(event_type, operation_id-or-raw-suffix)`;
+`entity_id` is not part of the predicate. New rows always write the full
+owner-scoped key, but a reused raw key can still collide with a pre-migration row
+for the same event type, so operators must account for that compatibility boundary.
 When a crash lands between the storage commit and the change-event append, a
 recovered drawer add or delete also restores the missing `drawer_added`/
 `drawer_deleted` event exactly once — via an atomic append-if-absent — before

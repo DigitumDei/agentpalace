@@ -472,7 +472,7 @@ CREATE TABLE IF NOT EXISTS coordination_tasks (
  revision INTEGER NOT NULL, created_by TEXT NOT NULL, owner TEXT, parent_id TEXT,
  dependencies_json TEXT NOT NULL, budget_json TEXT, lease_expires_at TEXT, expires_at TEXT,
  idempotency_key TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
- wing TEXT NOT NULL DEFAULT 'wing_unscoped', provenance_json TEXT,
+ wing TEXT NOT NULL DEFAULT 'wing_unscoped', executor_affinity TEXT, provenance_json TEXT,
  UNIQUE(created_by, idempotency_key), FOREIGN KEY(parent_id) REFERENCES coordination_tasks(task_id));
 CREATE TABLE IF NOT EXISTS coordination_messages (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE NOT NULL, task_id TEXT NOT NULL,
@@ -1091,7 +1091,7 @@ END;
         }
         let conn = self.connection()?;
         let requested = limit.clamp(1, 500);
-        let mut sql = "SELECT m.message_id,m.sequence,m.task_id,m.sender,m.recipient,m.kind,m.payload_json,m.envelope_version,m.acknowledged_at,m.acknowledged_by,m.created_at FROM coordination_messages m".to_owned();
+        let mut sql = "SELECT m.message_id,m.sequence,m.task_id,m.sender,m.recipient,m.kind,m.payload_json,m.envelope_version,m.acknowledged_at,m.acknowledged_by,m.created_at,m.provenance_json FROM coordination_messages m".to_owned();
         let mut predicates = vec!["m.recipient=?1".to_owned(), "m.sequence>?2".to_owned()];
         let mut bindings: Vec<Box<dyn rusqlite::ToSql>> =
             vec![Box::new(recipient.to_owned()), Box::new(cursor.map_or(0, |c| c.0))];
