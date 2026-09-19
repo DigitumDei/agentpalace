@@ -10,6 +10,8 @@ pub enum StorageError {
     Core(#[from] agentpalace_core::AgentPalaceError),
     #[error("invalid id: {0}")]
     InvalidId(#[from] agentpalace_core::IdError),
+    #[error("invalid provenance: {0}")]
+    Provenance(#[from] agentpalace_core::ProvenanceError),
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("lancedb error: {0}")]
