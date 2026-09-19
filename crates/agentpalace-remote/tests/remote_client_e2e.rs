@@ -101,6 +101,7 @@ fn client_for(addr: SocketAddr, token: Option<&str>) -> RemoteClient {
         name: "test".into(),
         base_url: format!("http://{addr}"),
         token: token.map(str::to_owned),
+        oauth: None,
         timeout: Duration::from_secs(5),
     })
     .unwrap()

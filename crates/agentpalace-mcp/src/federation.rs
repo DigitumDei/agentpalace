@@ -43,6 +43,7 @@ impl FederationRouter {
                 name: remote.name.clone(),
                 base_url: remote.url.clone(),
                 token: remote.token.clone(),
+                oauth: None,
                 timeout: remote.timeout,
             };
             match RemoteClient::new(endpoint) {
@@ -2587,6 +2588,7 @@ fn remote_error_classification(error: &RemoteError) -> &'static str {
     match error {
         RemoteError::Unreachable { .. } => "unreachable",
         RemoteError::Unauthorized { .. } => "unauthorized",
+        RemoteError::AuthenticationRequired { .. } => "authentication_required",
         RemoteError::VersionSkew { .. } => "version_skew",
         RemoteError::RemoteRejected { .. } => "rejected",
         RemoteError::InvalidResponse { .. } => "invalid_response",
@@ -3647,7 +3649,7 @@ mod tests {
                     status: 404,
                     body: "not found".to_owned(),
                 },
-                Self::Unauthorized => RemoteError::Unauthorized { remote: "mock".to_owned() },
+                Self::Unauthorized => RemoteError::Unauthorized { remote: "mock".to_owned(), resource_metadata: None },
                 Self::VersionSkew => {
                     RemoteError::VersionSkew { remote: "mock".to_owned(), ours: 1, theirs: 2 }
                 }

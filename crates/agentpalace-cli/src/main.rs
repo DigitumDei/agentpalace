@@ -1803,6 +1803,7 @@ fn execute_remote_mine(
         name: remote_name.to_owned(),
         base_url: remote_url.clone(),
         token: resolved_remote.token.clone(),
+        oauth: None,
         timeout: resolved_remote.timeout,
     };
     let client = match RemoteClient::new(endpoint) {

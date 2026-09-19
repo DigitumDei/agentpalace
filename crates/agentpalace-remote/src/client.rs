@@ -57,7 +57,10 @@ pub struct RemoteClient {
     /// Base URL, normalised to end with `'/'` so [`reqwest::Url::join`] works correctly.
     base_url: reqwest::Url,
     /// Optional bearer token sent on every authenticated request.
-    token: Option<String>,
+    token: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
+    oauth: Option<crate::OAuthConfig>,
+    oauth_session: std::sync::Arc<tokio::sync::Mutex<Option<crate::OAuthSession>>>,
+    login_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// Shared reqwest HTTP client (connection-pool aware).
     http: reqwest::Client,
     /// Cached result of the initial `GET /v1/info` handshake.
@@ -106,7 +109,10 @@ impl RemoteClient {
         Ok(Self {
             name: endpoint.name,
             base_url,
-            token: endpoint.token,
+            token: std::sync::Arc::new(tokio::sync::Mutex::new(endpoint.token)),
+            oauth: endpoint.oauth,
+            oauth_session: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            login_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             http,
             info: tokio::sync::OnceCell::new(),
         })
@@ -181,8 +187,9 @@ impl RemoteClient {
         &self,
         rb: reqwest::RequestBuilder,
         kind: CallKind,
-    ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
-        let rb = match &self.token {
+    ) -> Result<(reqwest::StatusCode, Vec<u8>, Option<String>)> {
+        let token = self.token.lock().await.clone();
+        let rb = match token {
             Some(tok) => rb.bearer_auth(tok),
             None => rb,
         };
@@ -202,7 +209,12 @@ impl RemoteClient {
                 break;
             }
         }
-        Ok((status, bytes))
+        let challenge = response
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::oauth::resource_metadata_from_challenge);
+        Ok((status, bytes, challenge))
     }
 
     /// Map a [`reqwest::Error`] from [`reqwest::RequestBuilder::send`] into a
@@ -258,7 +270,7 @@ impl RemoteClient {
         match kind {
             CallKind::Read => RemoteError::Unreachable { remote, message },
             CallKind::Mutation if status == reqwest::StatusCode::UNAUTHORIZED => {
-                RemoteError::Unauthorized { remote }
+                RemoteError::Unauthorized { remote, resource_metadata: None }
             }
             CallKind::Mutation if !status.is_success() => RemoteError::RemoteRejected {
                 remote,
@@ -322,10 +334,17 @@ impl RemoteClient {
         rb: reqwest::RequestBuilder,
         kind: CallKind,
     ) -> Result<T> {
-        let (status, bytes) = self.send_and_read(rb, kind).await?;
+        let (status, bytes, challenge) = self.send_and_read(rb, kind).await?;
 
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(RemoteError::Unauthorized { remote: self.name.clone() });
+            if self.oauth.is_some() {
+                return Err(RemoteError::AuthenticationRequired {
+                    remote: self.name.clone(),
+                    action: "run the explicit remote OAuth login command".to_owned(),
+                    resource_metadata: challenge,
+                });
+            }
+            return Err(RemoteError::Unauthorized { remote: self.name.clone(), resource_metadata: challenge });
         }
 
         if !status.is_success() {
@@ -351,10 +370,17 @@ impl RemoteClient {
         &self,
         rb: reqwest::RequestBuilder,
     ) -> Result<RemoteRevisionedWrite<T>> {
-        let (status, bytes) = self.send_and_read(rb, CallKind::Mutation).await?;
+        let (status, bytes, challenge) = self.send_and_read(rb, CallKind::Mutation).await?;
 
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(RemoteError::Unauthorized { remote: self.name.clone() });
+            if self.oauth.is_some() {
+                return Err(RemoteError::AuthenticationRequired {
+                    remote: self.name.clone(),
+                    action: "run the explicit remote OAuth login command".to_owned(),
+                    resource_metadata: challenge,
+                });
+            }
+            return Err(RemoteError::Unauthorized { remote: self.name.clone(), resource_metadata: challenge });
         }
 
         if status == reqwest::StatusCode::CONFLICT {
@@ -397,6 +423,38 @@ impl RemoteClient {
                 capability: COORDINATION_CAPABILITY.to_owned(),
             })
         }
+    }
+
+    /// Complete one explicit browser login for an OAuth-configured endpoint. The lock makes
+    /// simultaneous callers share one in-flight grant instead of opening multiple browsers.
+    pub async fn login(&self, metadata: &crate::AuthorizationServerMetadata, resource: &str) -> Result<()> {
+        let config = self.oauth.as_ref().ok_or_else(|| RemoteError::InvalidConfig { remote: self.name.clone(), message: "OAuth login requested for a bearer-token remote".to_owned() })?;
+        let _guard = self.login_lock.lock().await;
+        let session = crate::browser_login(&self.http, metadata, config, resource).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
+        *self.token.lock().await = Some(session.access_token.clone());
+        *self.oauth_session.lock().await = Some(session);
+        Ok(())
+    }
+
+    /// Refresh the current grant once, replacing the access and rotating refresh token together.
+    pub async fn refresh(&self, metadata: &crate::AuthorizationServerMetadata) -> Result<()> {
+        let _guard = self.login_lock.lock().await;
+        let current = self.oauth_session.lock().await.clone().ok_or_else(|| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: "run the explicit remote OAuth login command".to_owned(), resource_metadata: None })?;
+        let session = crate::refresh(&self.http, metadata, &current).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
+        *self.token.lock().await = Some(session.access_token.clone());
+        *self.oauth_session.lock().await = Some(session);
+        Ok(())
+    }
+
+    /// Revoke and forget the current grant. Local credentials are cleared even when revocation
+    /// is unsupported or the issuer is unavailable.
+    pub async fn logout(&self, metadata: Option<&crate::AuthorizationServerMetadata>) -> Result<()> {
+        let current = self.oauth_session.lock().await.take();
+        *self.token.lock().await = None;
+        if let (Some(metadata), Some(session)) = (metadata, current) {
+            crate::revoke(&self.http, metadata, &session).await.map_err(|message| RemoteError::RemoteRejected { remote: self.name.clone(), status: 401, body: message })?;
+        }
+        Ok(())
     }
 }
 
@@ -797,6 +855,7 @@ mod tests {
             name: "test-remote".to_owned(),
             base_url: base_url.to_owned(),
             token: None,
+            oauth: None,
             timeout: DEFAULT_TIMEOUT,
         }
     }
@@ -845,7 +904,7 @@ mod tests {
         assert!(
             RemoteError::Unreachable { remote: mk_name(), message: "x".to_owned() }.is_degradable()
         );
-        assert!(!RemoteError::Unauthorized { remote: mk_name() }.is_degradable());
+        assert!(!RemoteError::Unauthorized { remote: mk_name(), resource_metadata: None }.is_degradable());
         assert!(
             !RemoteError::VersionSkew { remote: mk_name(), ours: 1, theirs: 2 }.is_degradable()
         );
@@ -908,7 +967,7 @@ mod tests {
 
         // Authoritative / config errors are terminal and never retryable.
         for err in [
-            RemoteError::Unauthorized { remote: mk_name() },
+            RemoteError::Unauthorized { remote: mk_name(), resource_metadata: None },
             RemoteError::VersionSkew { remote: mk_name(), ours: 1, theirs: 2 },
             RemoteError::InvalidResponse { remote: mk_name(), message: "x".to_owned() },
             RemoteError::InvalidConfig { remote: mk_name(), message: "x".to_owned() },
@@ -951,6 +1010,7 @@ mod tests {
             name: "test-remote".to_owned(),
             base_url: format!("http://{addr}"),
             token: None,
+            oauth: None,
             timeout,
         })
         .unwrap()
