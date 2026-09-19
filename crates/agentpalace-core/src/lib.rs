@@ -26,6 +26,7 @@ pub use provenance::{
     OwnerSummary, OwnerSummaryStatus, PersistedProvenance, ProvenanceAction, ProvenanceEnvelope,
     ProvenanceError, ProvenanceHistoryEntry, ProvenanceResponse, ProvenanceResponseEvent,
     RecordingTime, SourceAuthor, SourceReference, StorageOrigin, Subject, SubjectBinding,
+    MAX_PROVENANCE_HISTORY,
     reject_payload_owner_claim,
 };
 pub use search::{

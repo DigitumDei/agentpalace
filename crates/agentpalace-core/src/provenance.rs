@@ -71,6 +71,10 @@ pub const MAX_RFC3339_CHARS: usize = 64;
 /// Maximum number of source references attached to a single provenance envelope.
 pub const MAX_SOURCE_REFS: usize = 128;
 
+/// Maximum number of modifier or additional-submission events retained in a
+/// [`PersistedProvenance`] history.
+pub const MAX_PROVENANCE_HISTORY: usize = 128;
+
 /// Error returned when validating or parsing provenance fields.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ProvenanceError {
@@ -123,6 +127,15 @@ pub enum ProvenanceError {
         /// Actual count encountered.
         count: usize,
         /// Maximum permitted count.
+        max: usize,
+    },
+
+    /// Too many modifier or additional-submission events in persisted provenance history.
+    #[error("provenance history count ({count}) exceeds maximum allowed ({max})")]
+    TooManyHistoryEntries {
+        /// Actual number of history entries encountered.
+        count: usize,
+        /// Maximum permitted number of history entries.
         max: usize,
     },
 
@@ -2170,7 +2183,9 @@ pub struct PersistedProvenance {
     /// Original federated provenance, if this record was copied from elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub federated_original: Option<FederatedOriginalProvenance>,
-    /// Later modifiers and additional submissions, in append order.
+    /// Later modifiers and additional submissions, in append order. This is
+    /// independently bounded by [`MAX_PROVENANCE_HISTORY`]; source references
+    /// use the separate [`MAX_SOURCE_REFS`] bound.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<ProvenanceHistoryEntry>,
     /// Attributed deletion event, if the record was deleted.
@@ -2202,26 +2217,81 @@ struct PersistedProvenanceWire {
 }
 
 impl TryFrom<PersistedProvenanceWire> for PersistedProvenance {
-    type Error = String;
+    type Error = ProvenanceError;
 
     fn try_from(wire: PersistedProvenanceWire) -> Result<Self, Self::Error> {
-        let value = Self {
-            creator: wire.creator,
-            authenticated_submitter: wire.authenticated_submitter,
-            source_author: wire.source_author,
-            source_refs: wire.source_refs,
-            storage_origin: wire.storage_origin,
-            federated_original: wire.federated_original,
-            history: wire.history,
-            deleted_by: wire.deleted_by,
-            invalidated_by: wire.invalidated_by,
-        };
-        value.validate().map_err(|error| error.to_string())?;
-        Ok(value)
+        Self::new(
+            wire.creator,
+            wire.authenticated_submitter,
+            wire.source_author,
+            wire.source_refs,
+            wire.storage_origin,
+            wire.federated_original,
+            wire.history,
+            wire.deleted_by,
+            wire.invalidated_by,
+        )
     }
 }
 
 impl PersistedProvenance {
+    /// Construct and validate durable provenance, including all collection
+    /// bounds. Legacy records may pass an empty `history` collection.
+    pub fn new(
+        creator: ProvenanceHistoryEntry,
+        authenticated_submitter: OwnerIdentity,
+        source_author: Option<SourceAuthor>,
+        source_refs: Vec<SourceReference>,
+        storage_origin: StorageOrigin,
+        federated_original: Option<FederatedOriginalProvenance>,
+        history: Vec<ProvenanceHistoryEntry>,
+        deleted_by: Option<ProvenanceHistoryEntry>,
+        invalidated_by: Option<ProvenanceHistoryEntry>,
+    ) -> Result<Self, ProvenanceError> {
+        let value = Self {
+            creator,
+            authenticated_submitter,
+            source_author,
+            source_refs,
+            storage_origin,
+            federated_original,
+            history,
+            deleted_by,
+            invalidated_by,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Append one validated modifier or additional-submission event.
+    ///
+    /// History is retained in full up to [`MAX_PROVENANCE_HISTORY`]. Once the
+    /// bound is reached, the append is rejected and the existing history is
+    /// left unchanged; entries are never silently discarded.
+    pub fn append_history(
+        &mut self,
+        entry: ProvenanceHistoryEntry,
+    ) -> Result<(), ProvenanceError> {
+        if self.history.len() >= MAX_PROVENANCE_HISTORY {
+            return Err(ProvenanceError::TooManyHistoryEntries {
+                count: self.history.len() + 1,
+                max: MAX_PROVENANCE_HISTORY,
+            });
+        }
+        entry.validate()?;
+        if !matches!(
+            entry.action,
+            ProvenanceAction::Modified | ProvenanceAction::AdditionalSubmission
+        ) {
+            return Err(ProvenanceError::InvalidProvenance(format!(
+                "history entries must use action Modified or AdditionalSubmission, got {:?}",
+                entry.action
+            )));
+        }
+        self.history.push(entry);
+        Ok(())
+    }
+
     /// Validate nested values and the bounded history/reference collections.
     pub fn validate(&self) -> Result<(), ProvenanceError> {
         self.creator.validate()?;
@@ -2242,6 +2312,12 @@ impl PersistedProvenance {
         self.storage_origin.validate()?;
         if let Some(original) = &self.federated_original {
             original.validate()?;
+        }
+        if self.history.len() > MAX_PROVENANCE_HISTORY {
+            return Err(ProvenanceError::TooManyHistoryEntries {
+                count: self.history.len(),
+                max: MAX_PROVENANCE_HISTORY,
+            });
         }
         for entry in &self.history {
             entry.validate()?;
@@ -4068,6 +4144,97 @@ mod tests {
             "recorded_at": "2026-09-18T12:00:00Z"
         });
         assert!(serde_json::from_value::<PersistedProvenance>(invalidated).is_err());
+    }
+
+    #[test]
+    fn persisted_provenance_history_is_bounded_without_truncation() {
+        let owner = OwnerIdentity::Unknown;
+        let recorded_at = RecordingTime::from_rfc3339("2026-09-18T12:00:00Z").unwrap();
+        let mut persisted = PersistedProvenance {
+            creator: ProvenanceHistoryEntry::new(
+                ProvenanceAction::Created,
+                owner.clone(),
+                recorded_at,
+            ),
+            authenticated_submitter: owner.clone(),
+            source_author: None,
+            source_refs: Vec::new(),
+            storage_origin: StorageOrigin::local_default(),
+            federated_original: None,
+            history: Vec::new(),
+            deleted_by: None,
+            invalidated_by: None,
+        };
+
+        for _ in 0..MAX_PROVENANCE_HISTORY {
+            persisted
+                .append_history(ProvenanceHistoryEntry::new(
+                    ProvenanceAction::Modified,
+                    owner.clone(),
+                    recorded_at,
+                ))
+                .unwrap();
+        }
+        assert_eq!(persisted.history.len(), MAX_PROVENANCE_HISTORY);
+        let error = persisted
+            .append_history(ProvenanceHistoryEntry::new(
+                ProvenanceAction::AdditionalSubmission,
+                owner.clone(),
+                recorded_at,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ProvenanceError::TooManyHistoryEntries {
+                count: MAX_PROVENANCE_HISTORY + 1,
+                max: MAX_PROVENANCE_HISTORY,
+            }
+        );
+        assert_eq!(persisted.history.len(), MAX_PROVENANCE_HISTORY);
+
+        // The history and source-reference bounds are independent collections.
+        persisted.source_refs = (0..MAX_SOURCE_REFS)
+            .map(|_| SourceReference::new("git:commit:abc123").unwrap())
+            .collect();
+        persisted.validate().unwrap();
+
+        let mut over_limit = serde_json::to_value(&persisted).unwrap();
+        over_limit["history"] = serde_json::json!(
+            (0..=MAX_PROVENANCE_HISTORY)
+                .map(|_| serde_json::json!({
+                    "action": "modified",
+                    "owner": {"status": "unknown"},
+                    "recorded_at": "2026-09-18T12:00:00Z"
+                }))
+                .collect::<Vec<_>>()
+        );
+        let error = serde_json::from_value::<PersistedProvenance>(over_limit).unwrap_err();
+        assert!(error.to_string().contains("provenance history count"));
+    }
+
+    #[test]
+    fn persisted_provenance_legacy_history_field_is_optional() {
+        let owner = OwnerIdentity::Unknown;
+        let recorded_at = RecordingTime::from_rfc3339("2026-09-18T12:00:00Z").unwrap();
+        let persisted = PersistedProvenance {
+            creator: ProvenanceHistoryEntry::new(
+                ProvenanceAction::Created,
+                owner.clone(),
+                recorded_at,
+            ),
+            authenticated_submitter: owner,
+            source_author: None,
+            source_refs: Vec::new(),
+            storage_origin: StorageOrigin::local_default(),
+            federated_original: None,
+            history: Vec::new(),
+            deleted_by: None,
+            invalidated_by: None,
+        };
+        let mut legacy = serde_json::to_value(&persisted).unwrap();
+        legacy.as_object_mut().unwrap().remove("history");
+        let restored = serde_json::from_value::<PersistedProvenance>(legacy).unwrap();
+        assert!(restored.history.is_empty());
     }
 
     #[test]
