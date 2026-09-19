@@ -2165,7 +2165,6 @@ fn require_provenance_action(
 /// from `authenticated_submitter`, so importing a remote record never makes
 /// the local submitter appear to be its original creator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 #[serde(try_from = "PersistedProvenanceWire")]
 pub struct PersistedProvenance {
     /// Immutable creator attribution from the first durable submission.
@@ -2363,7 +2362,6 @@ impl PersistedProvenance {
 ///
 /// It is intentionally not folded into the local authenticated submitter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 #[serde(try_from = "FederatedOriginalProvenanceWire")]
 pub struct FederatedOriginalProvenance {
     /// Origin node or remote palace identifier.
@@ -4120,6 +4118,10 @@ mod tests {
         creator["creator"]["action"] = serde_json::json!("modified");
         assert!(serde_json::from_value::<PersistedProvenance>(creator).is_err());
 
+        let mut unknown = serde_json::to_value(&valid).unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<PersistedProvenance>(unknown).is_err());
+
         let history_entry = serde_json::json!({
             "action": "created",
             "owner": serde_json::to_value(&identity).unwrap(),
@@ -4254,6 +4256,10 @@ mod tests {
             "origin_id": "local"
         });
         assert!(serde_json::from_value::<FederatedOriginalProvenance>(local_origin).is_err());
+
+        let mut unknown = serde_json::to_value(&valid).unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<FederatedOriginalProvenance>(unknown).is_err());
 
         let mut mismatched_record_id = serde_json::to_value(&valid).unwrap();
         mismatched_record_id["record_id"] = serde_json::json!("drawer-8");
