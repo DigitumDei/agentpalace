@@ -2679,6 +2679,12 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
             .collect::<rusqlite::Result<Vec<_>>>()
             .expect("collect pragma rows")
     }
+    fn assert_column_position(path: &Path, table: &str, column: &str, expected: usize) {
+        let actual = table_info(path, table)
+            .iter()
+            .position(|(name, ..)| name == column);
+        assert_eq!(actual, Some(expected), "{table}.{column} column position");
+    }
     /// `(name, unique)` for every index on `table`, sorted — enough to catch an index that
     /// exists on only one of a fresh and an upgraded schema. `table_info` alone would miss
     /// that: columns can match while an index is silently absent on one side.
@@ -3436,31 +3442,52 @@ CREATE INDEX IF NOT EXISTS idx_coordination_events_task ON coordination_events(t
         let upgraded = CoordinationStore::new(&upgraded_path);
         upgraded.ensure_schema().expect("upgrade schema");
 
+        // The migration appends each nullable column to the legacy table. Keep the physical
+        // order explicit: the normal decoders project provenance_json into the final selected
+        // slot (11, 8, and 5 respectively), even though its post-upgrade table positions are
+        // 12, 9, and 6. This catches a migration that merely adds the column while changing
+        // the ordered schema contract covered by the fresh path.
+        assert_column_position(&upgraded_path, "coordination_messages", "provenance_json", 12);
+        assert_column_position(&upgraded_path, "coordination_artifacts", "provenance_json", 9);
+        assert_column_position(&upgraded_path, "coordination_results", "provenance_json", 6);
+
+        let message = upgraded
+            .get_message("legacy-message")
+            .expect("legacy message")
+            .expect("legacy message row");
+        assert_eq!(message.task_id, "legacy-coordination-task");
+        assert_eq!(message.sender, "legacy-sender");
+        assert_eq!(message.recipient, "legacy-recipient");
+        assert_eq!(message.kind, "request");
+        assert_eq!(message.payload, serde_json::json!({}));
         assert!(
-            upgraded
-                .get_message("legacy-message")
-                .expect("legacy message")
-                .expect("legacy message row")
-                .provenance
-                .is_none(),
+            message.provenance.is_none(),
             "legacy messages without provenance remain compatible"
         );
+
+        let artifact = upgraded
+            .get_artifact("legacy-artifact")
+            .expect("legacy artifact")
+            .expect("legacy artifact row");
+        assert_eq!(artifact.task_id, "legacy-coordination-task");
+        assert_eq!(artifact.created_by, "legacy-owner");
+        assert_eq!(artifact.role, "evidence");
+        assert_eq!(artifact.media_type, "text/plain");
+        assert_eq!(artifact.content, "legacy content");
         assert!(
-            upgraded
-                .get_artifact("legacy-artifact")
-                .expect("legacy artifact")
-                .expect("legacy artifact row")
-                .provenance
-                .is_none(),
+            artifact.provenance.is_none(),
             "legacy artifacts without provenance remain compatible"
         );
+
+        let result = upgraded
+            .get_result("legacy-result")
+            .expect("legacy result")
+            .expect("legacy result row");
+        assert_eq!(result.task_id, "legacy-coordination-task");
+        assert_eq!(result.created_by, "legacy-owner");
+        assert_eq!(result.payload, serde_json::json!({}));
         assert!(
-            upgraded
-                .get_result("legacy-result")
-                .expect("legacy result")
-                .expect("legacy result row")
-                .provenance
-                .is_none(),
+            result.provenance.is_none(),
             "legacy results without provenance remain compatible"
         );
 
