@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
 
 use crate::error::Result;
-use agentpalace_core::{DrawerId, DrawerRecord, RoomId, WingId};
+use agentpalace_core::{DrawerId, DrawerRecord, PersistedProvenance, RoomId, WingId};
 
 time::serde::format_description!(date_only, Date, "[year]-[month]-[day]");
 
@@ -177,6 +177,9 @@ pub struct KnowledgeGraphFact {
     pub source_file: Option<String>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
+    /// Durable attribution; absent on facts stored before provenance support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<PersistedProvenance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

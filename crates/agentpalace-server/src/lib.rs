@@ -38,8 +38,9 @@ use axum::{Json, Router};
 use blake3::Hasher;
 use agentpalace_config::AgentPalaceConfig;
 use agentpalace_core::{
-    BUILD_VERSION, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, RoomId,
-    RecordingTime, SHARED_AGENT_DIARY_WING, SearchQuery, SourceLocator, StorageOrigin,
+    BUILD_VERSION, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, PersistedProvenance,
+    ProvenanceAction, ProvenanceHistoryEntry, RoomId, RecordingTime, SHARED_AGENT_DIARY_WING,
+    SearchQuery, SourceLocator, StorageOrigin,
     WING_PREFIX, WingId, hash_bytes, mined_drawer_id, resolve_records,
 };
 pub use agentpalace_core::{
@@ -2313,6 +2314,27 @@ fn receipt_provenance(
     .with_operation_key(operation_key.clone())?)
 }
 
+/// Build the durable domain attribution for a newly created remote record.
+/// Caller-asserted agent/source fields remain separate and are intentionally not
+/// inferred from the authenticated owner.
+fn domain_provenance(auth: &AuthIdentity) -> Result<PersistedProvenance, ServerError> {
+    let owner = auth.owner_identity();
+    let now = RecordingTime::now_utc()?;
+    let creator = ProvenanceHistoryEntry::new(ProvenanceAction::Created, owner.clone(), now.clone());
+    PersistedProvenance::new(
+        creator,
+        owner,
+        None,
+        Vec::new(),
+        StorageOrigin::local_default(),
+        None,
+        Vec::new(),
+        None,
+        None,
+    )
+    .map_err(|error| ServerError::InvalidParams(format!("invalid provenance: {error}")))
+}
+
 /// Compare the durable incarnation marker captured before a keyed delete with the
 /// currently visible row. Receipts written before incarnation markers existed only
 /// contain wing/room and remain compatible; new receipts carry both fields below.
@@ -4189,6 +4211,7 @@ fn task_to_dto(task: CoordinationTask) -> Result<CoordinationTaskDto, ServerErro
         expires_at: task.expires_at.map(format_rfc3339).transpose()?,
         created_at: format_rfc3339(task.created_at)?,
         updated_at: format_rfc3339(task.updated_at)?,
+        provenance: task.provenance.map(|value| serde_json::to_value(value.response())).transpose()?,
     })
 }
 
@@ -4205,6 +4228,7 @@ fn message_to_dto(message: CoordinationMessage) -> Result<CoordinationMessageDto
         acknowledged_at: message.acknowledged_at.map(format_rfc3339).transpose()?,
         acknowledged_by: message.acknowledged_by,
         created_at: format_rfc3339(message.created_at)?,
+        provenance: message.provenance.map(|value| serde_json::to_value(value.response())).transpose()?,
     })
 }
 
@@ -4218,6 +4242,7 @@ fn artifact_to_dto(artifact: CoordinationArtifact) -> Result<CoordinationArtifac
         content: artifact.content,
         content_hash: artifact.content_hash,
         created_at: format_rfc3339(artifact.created_at)?,
+        provenance: artifact.provenance.map(|value| serde_json::to_value(value.response())).transpose()?,
     })
 }
 
@@ -4228,6 +4253,7 @@ fn result_to_dto(result: CoordinationTaskResult) -> Result<CoordinationTaskResul
         created_by: result.created_by,
         payload: result.payload,
         created_at: format_rfc3339(result.created_at)?,
+        provenance: result.provenance.map(|value| serde_json::to_value(value.response())).transpose()?,
     })
 }
 
@@ -4322,7 +4348,11 @@ where
         budget: body.budget,
         expires_at,
     };
-    let task = state.coordination.create_task(&input).map_err(coordination_storage_error)?;
+    let provenance = domain_provenance(&auth.0)?;
+    let task = state
+        .coordination
+        .create_task_with_provenance(&input, Some(&provenance))
+        .map_err(coordination_storage_error)?;
     // An idempotency-key replay returns whatever task storage originally
     // created for `(created_by, idempotency_key)`, regardless of the wing
     // this request named — re-authorize the wing storage actually used.
@@ -4489,7 +4519,11 @@ where
         idempotency_key: body.idempotency_key,
         envelope_version: body.envelope_version,
     };
-    let message = state.coordination.send_message(&input).map_err(coordination_storage_error)?;
+    let provenance = domain_provenance(&auth.0)?;
+    let message = state
+        .coordination
+        .send_message_with_provenance(&input, Some(&provenance))
+        .map_err(coordination_storage_error)?;
     // An idempotency-key replay returns whatever message storage originally
     // created for `(sender, idempotency_key)`, on whatever task that was —
     // possibly not `body.task_id`. Re-authorize the wing storage actually
@@ -4651,7 +4685,11 @@ where
         content: body.content,
         idempotency_key: body.idempotency_key,
     };
-    let artifact = state.coordination.put_artifact(&input).map_err(coordination_storage_error)?;
+    let provenance = domain_provenance(&auth.0)?;
+    let artifact = state
+        .coordination
+        .put_artifact_with_provenance(&input, Some(&provenance))
+        .map_err(coordination_storage_error)?;
     // See the identical note in `route_coordination_message_send`: a replay
     // can return an artifact belonging to a different, unauthorized wing.
     authorize_replay_wing(&auth.0, &owning_task_wing(&state.coordination, &artifact.task_id)?)?;
@@ -4704,7 +4742,11 @@ where
         payload: body.payload,
         idempotency_key: body.idempotency_key,
     };
-    let result = state.coordination.put_result(&input).map_err(coordination_storage_error)?;
+    let provenance = domain_provenance(&auth.0)?;
+    let result = state
+        .coordination
+        .put_result_with_provenance(&input, Some(&provenance))
+        .map_err(coordination_storage_error)?;
     // See the identical note in `route_coordination_message_send`: a replay
     // can return a result belonging to a different, unauthorized wing.
     authorize_replay_wing(&auth.0, &owning_task_wing(&state.coordination, &result.task_id)?)?;

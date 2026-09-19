@@ -1015,6 +1015,7 @@ where
             source_file: request.source_file,
             created_at: now,
             updated_at: now,
+            provenance: None,
         })?;
 
         Ok(fact_id)

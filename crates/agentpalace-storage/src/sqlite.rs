@@ -263,6 +263,12 @@ CREATE INDEX IF NOT EXISTS idx_change_log_operation_event
 ON change_log(operation_id, event_type);
         "#,
     ),
+    (
+        "0011_provenance_columns",
+        r#"
+ALTER TABLE knowledge_graph_facts ADD COLUMN provenance_json TEXT;
+        "#,
+    ),
 ];
 
 pub trait IngestManifestStore {
@@ -547,6 +553,7 @@ impl SqliteOperationalStore {
             "0008_maintenance_leases",
             "0009_agent_lineages",
             "0010_change_log_operation_identity",
+            "0011_provenance_columns",
         ]
     }
 
@@ -1406,9 +1413,9 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
         connection.execute(
             "INSERT INTO knowledge_graph_facts (
                  fact_id, subject_entity_id, predicate, object_entity_id, valid_from, valid_to,
-                 confidence, source_drawer_id, source_file, created_at, updated_at
+                 confidence, source_drawer_id, source_file, created_at, updated_at, provenance_json
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(fact_id) DO UPDATE SET
                  subject_entity_id = excluded.subject_entity_id,
                  predicate = excluded.predicate,
@@ -1418,7 +1425,8 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
                  confidence = excluded.confidence,
                  source_drawer_id = excluded.source_drawer_id,
                  source_file = excluded.source_file,
-                 updated_at = excluded.updated_at",
+                 updated_at = excluded.updated_at,
+                 provenance_json = excluded.provenance_json",
             params![
                 fact.fact_id,
                 fact.subject_entity_id,
@@ -1431,6 +1439,7 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
                 fact.source_file,
                 encode_time(fact.created_at),
                 encode_time(fact.updated_at),
+                fact.provenance.as_ref().map(serde_json::to_string).transpose()?,
             ],
         )?;
         Ok(())
@@ -1441,7 +1450,7 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
         connection
             .query_row(
                 "SELECT fact_id, subject_entity_id, predicate, object_entity_id, valid_from,
-                        valid_to, confidence, source_drawer_id, source_file, created_at, updated_at
+                        valid_to, confidence, source_drawer_id, source_file, created_at, updated_at, provenance_json
                  FROM knowledge_graph_facts
                  WHERE fact_id = ?1",
                 [fact_id],
@@ -1454,7 +1463,7 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
     fn list_facts(&self) -> Result<Vec<KnowledgeGraphFact>> {
         self.list_facts_matching(
             "SELECT fact_id, subject_entity_id, predicate, object_entity_id, valid_from,
-                    valid_to, confidence, source_drawer_id, source_file, created_at, updated_at
+                    valid_to, confidence, source_drawer_id, source_file, created_at, updated_at, provenance_json
              FROM knowledge_graph_facts
              ORDER BY COALESCE(valid_from, '9999-12-31') ASC, predicate ASC, fact_id ASC",
             [],
@@ -1464,7 +1473,7 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
     fn list_facts_limited(&self, limit: usize) -> Result<Vec<KnowledgeGraphFact>> {
         self.list_facts_matching(
             "SELECT fact_id, subject_entity_id, predicate, object_entity_id, valid_from,
-                    valid_to, confidence, source_drawer_id, source_file, created_at, updated_at
+                    valid_to, confidence, source_drawer_id, source_file, created_at, updated_at, provenance_json
              FROM knowledge_graph_facts
              ORDER BY COALESCE(valid_from, '9999-12-31') ASC, predicate ASC, fact_id ASC
              LIMIT ?1",
@@ -1475,7 +1484,7 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
     fn list_facts_for_entity(&self, entity_id: &str) -> Result<Vec<KnowledgeGraphFact>> {
         self.list_facts_matching(
             "SELECT fact_id, subject_entity_id, predicate, object_entity_id, valid_from,
-                    valid_to, confidence, source_drawer_id, source_file, created_at, updated_at
+                    valid_to, confidence, source_drawer_id, source_file, created_at, updated_at, provenance_json
              FROM knowledge_graph_facts
              WHERE subject_entity_id = ?1 OR object_entity_id = ?1
              ORDER BY COALESCE(valid_from, '9999-12-31') ASC, predicate ASC, fact_id ASC",
@@ -1493,7 +1502,7 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
         connection
             .query_row(
                 "SELECT fact_id, subject_entity_id, predicate, object_entity_id, valid_from,
-                        valid_to, confidence, source_drawer_id, source_file, created_at, updated_at
+                 valid_to, confidence, source_drawer_id, source_file, created_at, updated_at, provenance_json
                  FROM knowledge_graph_facts
                  WHERE subject_entity_id = ?1
                    AND predicate = ?2
@@ -2524,6 +2533,7 @@ fn decode_fact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeGraphFa
                 Box::new(err),
             )
         })?,
+        provenance: row.get::<_, Option<String>>(11)?.map(|value| serde_json::from_str(&value).map_err(sql_conv)).transpose()?,
     })
 }
 
@@ -3423,6 +3433,7 @@ mod tests {
             source_file: Some("docs/plan.md".to_owned()),
             created_at: datetime!(2026-04-03 09:00:00 UTC),
             updated_at: datetime!(2026-04-03 09:00:00 UTC),
+            provenance: None,
         };
 
         store.upsert_fact(&fact).unwrap();
@@ -3475,6 +3486,7 @@ mod tests {
                 source_file: None,
                 created_at: datetime!(2026-04-03 09:00:00 UTC),
                 updated_at: datetime!(2026-04-03 09:00:00 UTC),
+                provenance: None,
             })
             .unwrap();
 
