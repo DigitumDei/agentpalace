@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use aho_corasick::AhoCorasick;
-use agentpalace_core::{DrawerId, DrawerRecord};
+use agentpalace_core::{DrawerId, DrawerRecord, PersistedProvenance};
 use agentpalace_storage::{
     DrawerFilter, DrawerStore, EntityRecord, EntityRegistryStore, GraphDocument, GraphStore,
     KnowledgeGraphFact, KnowledgeGraphStore, ToolStateStore, core::AgentPalaceError,
@@ -987,6 +987,15 @@ where
     }
 
     pub fn add_fact(&self, request: AddFactRequest, now: OffsetDateTime) -> Result<String> {
+        self.add_fact_with_provenance(request, now, None)
+    }
+
+    pub fn add_fact_with_provenance(
+        &self,
+        request: AddFactRequest,
+        now: OffsetDateTime,
+        provenance: Option<PersistedProvenance>,
+    ) -> Result<String> {
         let subject_id = self.ensure_entity(&request.subject, request.subject_type.clone(), now)?;
         let object_id = self.ensure_entity(&request.object, request.object_type.clone(), now)?;
         let predicate = canonicalize_label(&request.predicate);
@@ -1015,7 +1024,7 @@ where
             source_file: request.source_file,
             created_at: now,
             updated_at: now,
-            provenance: None,
+            provenance,
         })?;
 
         Ok(fact_id)
@@ -1029,15 +1038,28 @@ where
         ended_at: Date,
         now: OffsetDateTime,
     ) -> Result<usize> {
+        self.invalidate_with_provenance(subject, predicate, object, ended_at, now, None)
+    }
+
+    pub fn invalidate_with_provenance(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        ended_at: Date,
+        now: OffsetDateTime,
+        provenance: Option<&PersistedProvenance>,
+    ) -> Result<usize> {
         let subject_id = self.resolve_entity_id(subject)?;
         let object_id = self.resolve_entity_id(object)?;
         self.store
-            .invalidate_active_fact(
+            .invalidate_active_fact_with_provenance(
                 &subject_id,
                 &canonicalize_label(predicate),
                 &object_id,
                 ended_at,
                 now,
+                provenance,
             )
             .map_err(GraphError::from)
     }

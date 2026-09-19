@@ -2337,6 +2337,23 @@ fn domain_provenance(auth: &AuthIdentity) -> Result<PersistedProvenance, ServerE
     .map_err(|error| ServerError::InvalidParams(format!("invalid provenance: {error}")))
 }
 
+/// Build durable provenance for a KG invalidation while retaining the original
+/// creator fields separately from the authenticated actor performing the change.
+fn invalidation_provenance(auth: &AuthIdentity) -> Result<PersistedProvenance, ServerError> {
+    let mut provenance = domain_provenance(auth)?;
+    let owner = auth.owner_identity();
+    let occurred_at = RecordingTime::now_utc()?;
+    provenance.invalidated_by = Some(ProvenanceHistoryEntry::new(
+        ProvenanceAction::Invalidated,
+        owner,
+        occurred_at,
+    ));
+    provenance
+        .validate()
+        .map_err(|error| ServerError::InvalidParams(format!("invalid provenance: {error}")))?;
+    Ok(provenance)
+}
+
 /// Compare the durable incarnation marker captured before a keyed delete with the
 /// currently visible row. Receipts written before incarnation markers existed only
 /// contain wing/room and remain compatible; new receipts carry both fields below.
@@ -2530,6 +2547,7 @@ where
     let valid_from = body.valid_from.as_deref().map(parse_date).transpose()?;
     let runtime = KnowledgeGraphRuntime::new(state.storage.operational_store());
     let now = OffsetDateTime::now_utc();
+    let provenance = domain_provenance(&auth.0)?;
 
     let operation = validated_operation(body.operation_id.clone(), &auth.0)?;
     let receipts = state.storage.receipt_store();
@@ -2568,7 +2586,7 @@ where
                 // A prior attempt started but never completed (crash). Re-applying the add is
                 // idempotent over the triple; the event below is restored for this operation even
                 // when the graph effect was already present.
-                let triple_id = runtime.add_fact(
+                let triple_id = runtime.add_fact_with_provenance(
                     AddFactRequest {
                         subject: body.subject.clone(),
                         subject_type: infer_entity_kind(&body.subject),
@@ -2582,6 +2600,7 @@ where
                         source_file: None,
                     },
                     now,
+                    Some(provenance.clone()),
                 )?;
                 // Whether or not the graph effect was already present, the event is part of the
                 // same operation's durable outcome. Restore it atomically before completing the
@@ -2614,7 +2633,7 @@ where
     }
 
     // Apply path: fresh intent, or a recovered intent whose effect was not yet present.
-    let triple_id = runtime.add_fact(
+    let triple_id = runtime.add_fact_with_provenance(
         AddFactRequest {
             subject: body.subject.clone(),
             subject_type: infer_entity_kind(&body.subject),
@@ -2628,6 +2647,7 @@ where
             source_file: None,
         },
         now,
+        Some(provenance),
     )?;
 
     let event = ChangeEvent {
@@ -2679,6 +2699,7 @@ where
         .unwrap_or_else(|| OffsetDateTime::now_utc().date());
     let now = OffsetDateTime::now_utc();
     let runtime = KnowledgeGraphRuntime::new(state.storage.operational_store());
+    let provenance = invalidation_provenance(&auth.0)?;
 
     let operation = validated_operation(body.operation_id.clone(), &auth.0)?;
     // A graph invalidation and its post-effect receipt marker cannot share one SQLite
@@ -2743,7 +2764,14 @@ where
     // invalidated (or absent) fact returns 0, which is a converged end state for an operation-aware
     // replay. An unknown entity is likewise a converged absence rather than a hard error.
     let invalidated =
-        match runtime.invalidate(&body.subject, &body.predicate, &body.object, ended, now) {
+        match runtime.invalidate_with_provenance(
+            &body.subject,
+            &body.predicate,
+            &body.object,
+            ended,
+            now,
+            Some(&provenance),
+        ) {
             Ok(count) => count,
             Err(agentpalace_graph::GraphError::UnknownEntity { .. }) if operation.is_some() => 0,
             Err(error) => return Err(error.into()),
@@ -3282,6 +3310,7 @@ where
         resolve_root_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
 
     let now = OffsetDateTime::now_utc();
+    let provenance = domain_provenance(&auth.0)?;
 
     // Build repository-view metadata for federated batch.
     let view_metadata = agentpalace_core::RepositoryViewMetadata {
@@ -3654,7 +3683,7 @@ where
                 embedding,
                 locator,
                 view_metadata: Some(view_metadata.clone()),
-                provenance: None,
+                provenance: Some(provenance.clone()),
             });
         }
 

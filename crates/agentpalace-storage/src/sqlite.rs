@@ -10,7 +10,7 @@ use crate::types::{
     RetryableRun, RevisionedWrite, SelfObservationRecord, SelfObservationScope,
     SelfObservationStatus, ToolStateEntry,
 };
-use agentpalace_core::{DIARY_SUMMARY_MAX_CHARS, DrawerId};
+use agentpalace_core::{DIARY_SUMMARY_MAX_CHARS, DrawerId, PersistedProvenance};
 use time::Date;
 
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -342,6 +342,28 @@ pub trait KnowledgeGraphStore {
         ended_at: Date,
         updated_at: OffsetDateTime,
     ) -> Result<usize>;
+
+    /// Invalidate an active fact while retaining its original provenance and, when present,
+    /// the authenticated invalidation attribution. The default preserves compatibility for
+    /// storage adapters that do not yet persist provenance columns.
+    fn invalidate_active_fact_with_provenance(
+        &self,
+        subject_entity_id: &str,
+        predicate: &str,
+        object_entity_id: &str,
+        ended_at: Date,
+        updated_at: OffsetDateTime,
+        provenance: Option<&PersistedProvenance>,
+    ) -> Result<usize> {
+        let _ = provenance;
+        self.invalidate_active_fact(
+            subject_entity_id,
+            predicate,
+            object_entity_id,
+            ended_at,
+            updated_at,
+        )
+    }
 }
 
 pub trait ToolStateStore {
@@ -1542,6 +1564,58 @@ impl KnowledgeGraphStore for SqliteOperationalStore {
                 encode_time(updated_at)
             ],
         )?;
+        Ok(changed)
+    }
+
+    fn invalidate_active_fact_with_provenance(
+        &self,
+        subject_entity_id: &str,
+        predicate: &str,
+        object_entity_id: &str,
+        ended_at: Date,
+        updated_at: OffsetDateTime,
+        provenance: Option<&PersistedProvenance>,
+    ) -> Result<usize> {
+        let connection = self.open_connection()?;
+        let rows = {
+            let mut statement = connection.prepare(
+                "SELECT fact_id, provenance_json FROM knowledge_graph_facts
+                 WHERE subject_entity_id = ?1 AND predicate = ?2 AND object_entity_id = ?3
+                   AND valid_to IS NULL AND (valid_from IS NULL OR valid_from <= ?4)",
+            )?;
+            statement
+                .query_map(
+                    params![subject_entity_id, predicate, object_entity_id, encode_date(ended_at)],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let invalidation_json = provenance
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(StorageError::from)?;
+        let mut changed = 0;
+        for (fact_id, existing_json) in rows {
+            let merged = match (existing_json, invalidation_json.as_deref()) {
+                (Some(raw), Some(incoming)) => {
+                    let mut existing: PersistedProvenance = serde_json::from_str(&raw)?;
+                    let incoming: PersistedProvenance = serde_json::from_str(incoming)?;
+                    existing.invalidated_by = incoming.invalidated_by;
+                    Some(serde_json::to_string(&existing)?)
+                }
+                (other, _) => other,
+            };
+            changed += connection.execute(
+                "UPDATE knowledge_graph_facts SET valid_to = ?2, updated_at = ?3, provenance_json = ?4
+                 WHERE fact_id = ?1 AND valid_to IS NULL",
+                params![fact_id, encode_date(ended_at), encode_time(updated_at), merged],
+            )?;
+        }
         Ok(changed)
     }
 }
