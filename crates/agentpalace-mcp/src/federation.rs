@@ -13,7 +13,7 @@ use agentpalace_federation::{
     NewTaskResultRequest, RemoteDrawerResult, TaskLeaseRequest, TransitionTaskRequest,
 };
 use agentpalace_remote::{
-    RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, RemoteRevisionedWrite,
+    OAuthConfig, RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, RemoteRevisionedWrite,
 };
 use agentpalace_storage::UNSCOPED_WING;
 use serde_json::{Value, json};
@@ -43,7 +43,14 @@ impl FederationRouter {
                 name: remote.name.clone(),
                 base_url: remote.url.clone(),
                 token: remote.token.clone(),
-                oauth: None,
+                oauth: remote.oauth.as_ref().map(|oauth| OAuthConfig {
+                    client_id: oauth.client_id.clone(),
+                    account: oauth.account.clone(),
+                    allow_in_memory: oauth.allow_in_memory,
+                    allow_loopback_demo: oauth.allow_loopback_demo,
+                    token_store: None,
+                    login_timeout_seconds: oauth.login_timeout_seconds,
+                }),
                 timeout: remote.timeout,
             };
             match RemoteClient::new(endpoint) {

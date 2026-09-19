@@ -24,7 +24,7 @@ it all locally for dev testing.
 
 - **Remote** — a named AgentPalace server reachable over HTTP, defined in
   `federation.remotes`. Each remote has a `name`, `url`, optional bearer token,
-  and timeout.
+  optional non-secret OAuth public-client settings, and timeout.
 - **Route** — per wing (and for the knowledge graph), one of three modes:
   - `local` — served only from the local palace (the default).
   - `remote` — served only from the named remote.
@@ -73,8 +73,9 @@ it all locally for dev testing.
 
 ### OAuth remote authentication
 
-Bearer-token remotes remain unchanged. Library callers may instead construct a remote with
-`RemoteEndpoint::with_oauth` and an `OAuthConfig { client_id, account, allow_in_memory, allow_loopback_demo, .. }`. The client
+Bearer-token remotes remain unchanged. Configured OAuth remotes can be authorized with
+`agentpalace auth login --remote NAME --resource-metadata URL`; library callers may instead construct
+a remote with `RemoteEndpoint::with_oauth` and an `OAuthConfig { client_id, account, allow_in_memory, allow_loopback_demo, .. }`. The client
 preserves a server's `401` Bearer `resource_metadata` challenge and exposes it to the caller;
 background/MCP requests return `authentication-required` guidance and never open a browser.
 Interactive login is an explicit caller action. Discovery accepts RFC 9728 protected-resource

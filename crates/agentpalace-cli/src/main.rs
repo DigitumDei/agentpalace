@@ -25,7 +25,7 @@ use agentpalace_ingest::{
     prepare_project_batch_with_config, project_branch_source_prefix,
     project_canonical_source_prefix, project_root_relative, wing_kind_source_prefix,
 };
-use agentpalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
+use agentpalace_remote::{OAuthConfig, RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
 use agentpalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
 use agentpalace_server::{TokenRegistry, build_router};
 use agentpalace_storage::{
@@ -177,6 +177,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Authorize or forget a configured remote OAuth session.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
     /// Detect rooms from your project's safe source directories.
     Init {
         dir: PathBuf,
@@ -378,6 +383,23 @@ enum Commands {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum AuthCommands {
+    /// Discover metadata from an RFC 9728 resource_metadata URL and open the browser.
+    Login {
+        #[arg(long)]
+        remote: String,
+        #[arg(long, value_name = "URL")]
+        resource_metadata: String,
+    },
+    /// Clear the locally stored grant. Revocation is issuer-specific and is performed by the
+    /// library when metadata is supplied by an embedding application.
+    Logout {
+        #[arg(long)]
+        remote: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum CliMode {
     Projects,
@@ -544,6 +566,7 @@ where
         return Ok(CliOutput::success(render_help()));
     };
     match command {
+        Commands::Auth { command } => execute_auth(command, cli.palace.as_deref(), context),
         Commands::Init { dir, yes, repo_config, project_id } => execute_init(
             &dir,
             yes,
@@ -660,6 +683,50 @@ where
             }
         }
     }
+}
+
+fn execute_auth(
+    command: AuthCommands,
+    palace_override: Option<&Path>,
+    context: &CliContext,
+) -> Result<CliOutput, clap::Error> {
+    let config = load_runtime_config(palace_override, context).map_err(config_error)?;
+    let (remote_name, operation) = match command {
+        AuthCommands::Login { remote, resource_metadata } => (remote, Some(resource_metadata)),
+        AuthCommands::Logout { remote } => (remote, None),
+    };
+    let remote = config.federation.remotes.get(&remote_name).ok_or_else(|| {
+        clap::Error::raw(clap::error::ErrorKind::InvalidValue, format!("unknown remote `{remote_name}`"))
+    })?;
+    let oauth = remote.oauth.as_ref().ok_or_else(|| {
+        clap::Error::raw(clap::error::ErrorKind::InvalidValue, format!("remote `{remote_name}` has no OAuth configuration"))
+    })?;
+    let client = RemoteClient::new(RemoteEndpoint {
+        name: remote.name.clone(),
+        base_url: remote.url.clone(),
+        token: remote.token.clone(),
+        oauth: Some(OAuthConfig {
+            client_id: oauth.client_id.clone(),
+            account: oauth.account.clone(),
+            allow_in_memory: oauth.allow_in_memory,
+            allow_loopback_demo: oauth.allow_loopback_demo,
+            token_store: None,
+            login_timeout_seconds: oauth.login_timeout_seconds,
+        }),
+        timeout: remote.timeout,
+    }).map_err(|error| clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string()))?;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()
+        .map_err(|error| clap::Error::raw(clap::error::ErrorKind::Io, error.to_string()))?;
+    let result = runtime.block_on(async {
+        match operation {
+            Some(resource_metadata) => client.login_from_challenge(&resource_metadata).await.map(|_| "OAuth login completed; credentials were stored by the configured token store.\n".to_owned()),
+            None => client.logout(None).await.map(|_| "OAuth session cleared.\n".to_owned()),
+        }
+    });
+    Ok(match result {
+        Ok(text) => CliOutput::success(text),
+        Err(error) => CliOutput::failure(1, format!("{error}\n")),
+    })
 }
 
 fn execute_init<F, P>(
@@ -1803,7 +1870,14 @@ fn execute_remote_mine(
         name: remote_name.to_owned(),
         base_url: remote_url.clone(),
         token: resolved_remote.token.clone(),
-        oauth: None,
+        oauth: resolved_remote.oauth.as_ref().map(|oauth| OAuthConfig {
+            client_id: oauth.client_id.clone(),
+            account: oauth.account.clone(),
+            allow_in_memory: oauth.allow_in_memory,
+            allow_loopback_demo: oauth.allow_loopback_demo,
+            token_store: None,
+            login_timeout_seconds: oauth.login_timeout_seconds,
+        }),
         timeout: resolved_remote.timeout,
     };
     let client = match RemoteClient::new(endpoint) {

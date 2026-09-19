@@ -439,6 +439,16 @@ impl RemoteClient {
     pub async fn login(&self, metadata: &crate::AuthorizationServerMetadata, resource: &str) -> Result<()> {
         let config = self.oauth.as_ref().ok_or_else(|| RemoteError::InvalidConfig { remote: self.name.clone(), message: "OAuth login requested for a bearer-token remote".to_owned() })?;
         let _guard = self.login_lock.lock().await;
+        // A second foreground caller arriving while the first grant completed
+        // shares the committed session instead of opening another browser.
+        if self.oauth_session.lock().await.as_ref().is_some_and(|session| {
+            session.resource == resource
+                && session.issuer == metadata.issuer
+                && session.client_id == config.client_id
+                && session.account.as_deref() == config.account.as_deref()
+        }) {
+            return Ok(());
+        }
         let session = crate::browser_login(&self.http, metadata, config, resource).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
         self.token_store.save(session.clone()).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
         *self.token.lock().await = Some(session.access_token.clone());

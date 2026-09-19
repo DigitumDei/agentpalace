@@ -9,6 +9,17 @@ This is the frozen command surface for `agentpalace` v1.
 
 ## Commands
 
+### `auth login|logout`
+
+OAuth is opt-in per configured remote. `auth login --remote <NAME>
+--resource-metadata <URL>` performs protected-resource and authorization-server
+discovery, opens one native-client browser flow with PKCE, and stores the grant
+through the configured secure token store (or only in memory when
+`allow_in_memory` is explicitly enabled). Background and MCP requests never
+open a browser; they return an actionable authentication-required result.
+`auth logout --remote <NAME>` clears the locally stored grant. Credentials and
+tokens are never command-line arguments or config values.
+
 ### `migrate`
 
 Offline MemPalace upgrade, also invoked by both installers. Requires

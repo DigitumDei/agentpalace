@@ -578,15 +578,16 @@ The optional `federation` section of `~/.agentpalace/config.json` controls routi
     that isn't local dev.
   - `token`: inline bearer token string (optional)
   - `token_env`: name of an environment variable holding the bearer token (optional, preferred over `token` — keeps secrets out of config.json)
+  - `oauth`: optional provider-neutral public-client settings: `client_id`, optional `account`, `allow_in_memory`, `allow_loopback_demo`, and `login_timeout_seconds`. This contains no credential material. `allow_in_memory` is required when the host has no injected secure `TokenStore`.
   - Token resolution: the environment variable value wins if both are set; if `token_env` is set but the variable is not present in the environment, the config loader warns and falls back to the inline `token` (or proceeds unauthenticated if neither is set)
 - `timeout_ms`: HTTP request timeout in milliseconds. Default: `5000`
 
-OAuth is not represented by a token or secret field in `config.json`. Library callers select
-provider-neutral public-client mode with `RemoteEndpoint::with_oauth`; its `client_id` and optional
-`account` label are not secrets. The interactive login operation is explicit, while unattended calls
-return an authentication-required result. Credential persistence is supplied by a secure
-`TokenStore` passed in the OAuth configuration, or an explicitly enabled volatile session for
-tests/offline use. `allow_loopback_demo` is required for an exact loopback issuer; other discovered
+OAuth is represented by the non-secret `oauth` settings above. Run
+`agentpalace auth login --remote NAME --resource-metadata URL` for an explicit browser login;
+unattended calls return an authentication-required result instead of opening a browser. Library
+callers may inject a secure `TokenStore`; `allow_in_memory` is the explicit volatile/test mode and
+otherwise unavailable secure storage is reported. `agentpalace auth logout --remote NAME` clears
+the local grant. `allow_loopback_demo` is required for an exact loopback issuer; other discovered
 metadata and endpoints must use HTTPS.
 
 Validation:

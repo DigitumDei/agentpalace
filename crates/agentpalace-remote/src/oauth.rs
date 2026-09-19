@@ -280,12 +280,18 @@ pub async fn browser_login(
     Ok(result)
 }
 
-/// RFC 8414 §3.1 discovery URL. The suffix is inserted after the authority while preserving
-/// a path-based issuer identifier (for example `/tenant/.well-known/...`).
+/// RFC 8414 §3.1 discovery URL. For a path-based issuer, the well-known
+/// component is inserted immediately after the authority and the issuer path
+/// follows it (for example `/tenant` becomes `/.well-known/oauth-authorization-server/tenant`).
 pub fn well_known_url(issuer: &reqwest::Url) -> Result<reqwest::Url, String> {
     let mut url = issuer.clone();
-    let path = url.path().trim_end_matches('/');
-    url.set_path(&format!("{path}/.well-known/oauth-authorization-server"));
+    let path = issuer.path().trim_matches('/');
+    let suffix = if path.is_empty() {
+        "/.well-known/oauth-authorization-server".to_owned()
+    } else {
+        format!("/.well-known/oauth-authorization-server/{path}")
+    };
+    url.set_path(&suffix);
     Ok(url)
 }
 
@@ -361,7 +367,7 @@ mod tests {
     #[test]
     fn well_known_preserves_path_based_issuer() {
         let issuer = reqwest::Url::parse("https://issuer.example/tenant-a").expect("test URL");
-        assert_eq!(well_known_url(&issuer).expect("well-known URL").as_str(), "https://issuer.example/tenant-a/.well-known/oauth-authorization-server");
+        assert_eq!(well_known_url(&issuer).expect("well-known URL").as_str(), "https://issuer.example/.well-known/oauth-authorization-server/tenant-a");
     }
     #[test]
     fn loopback_demo_requires_explicit_opt_in() {
