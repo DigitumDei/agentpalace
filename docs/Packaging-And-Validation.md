@@ -171,11 +171,15 @@ tracking-comment summary; it is not granted unrestricted shell or `gh api` acces
 
 After uploading sanitized diagnostics, a trusted workflow step reads PR comments
 and runs `scripts/validate-claude-review.py`. Success requires a successful
-captured SDK result and a Claude-authored final summary carrying the completion
-marker for this workflow run, attempt, and PR head SHA. A progress checklist,
-an earlier review, or another author's comment cannot satisfy the check.
-A successful SDK exit without that summary now fails the job. Recovered tool
-denials remain diagnostic warnings when a final review was completed.
+captured SDK result and a Claude-authored final summary. The exact completion
+marker for this workflow run, attempt, and PR head SHA is the primary signal.
+When the comment tool drops that hidden HTML token, the validator accepts the
+action-generated `Claude finished` wrapper only when the sanitized diagnostics
+show that the comment-update tool ran, the wrapper links the exact Actions run,
+the summary names the full head SHA, contains a final review heading, and has no
+unfinished checklist items. A progress checklist, an earlier run or head, or
+another author's comment cannot satisfy the check. Recovered tool denials remain
+diagnostic warnings when a final review was completed.
 
 Only the sanitized diagnostic summary is uploaded, with seven-day retention.
 The comment response used by validation stays in runner temporary storage.

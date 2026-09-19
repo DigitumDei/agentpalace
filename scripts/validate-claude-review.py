@@ -7,13 +7,48 @@ import re
 from pathlib import Path
 
 MAX_INPUT_BYTES = 64 * 1024 * 1024
-MARKER_PATTERN = r"<!-- agentpalace-claude-review:[0-9]+:[0-9]+:[a-f0-9]{40}:completed -->"
+MARKER_PATTERN = (
+    r"<!-- agentpalace-claude-review:(?P<run_id>[0-9]+):"
+    r"(?P<attempt>[0-9]+):(?P<head>[a-f0-9]{40}):completed -->"
+)
 REVIEW_AUTHORS = frozenset({"claude", "claude[bot]"})
+FINISHED_COMMENT_PATTERN = re.compile(
+    r"\A\*\*Claude finished [^\r\n]+\*\*[^\r\n]*"
+    r"\[View job\]\(https://github\.com/[^/\s)]+/[^/\s)]+/actions/runs/"
+    r"(?P<run_id>[0-9]+)(?:[/?#][^\s)]*)?\)\r?\n\r?\n---\r?\n"
+)
+FINAL_HEADING_PATTERN = re.compile(
+    r"^#{1,6}\s+(?:summary|findings|review|result|conclusion)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+UNCHECKED_ITEM_PATTERN = re.compile(r"^\s*[-*]\s+\[\s\]", re.MULTILINE)
+
+
+def generated_final_summary(report, body, marker_match):
+    """Return whether the action published a complete summary without the prompt marker."""
+    tool_calls = report.get("tool_calls")
+    if not isinstance(tool_calls, dict):
+        return False
+    update_count = tool_calls.get("mcp__github_comment__update_claude_comment")
+    if type(update_count) is not int or update_count < 1:
+        return False
+
+    finished = FINISHED_COMMENT_PATTERN.match(body)
+    if finished is None or finished.group("run_id") != marker_match.group("run_id"):
+        return False
+    summary = body[finished.end():].strip()
+    if len(summary) < 120 or UNCHECKED_ITEM_PATTERN.search(summary):
+        return False
+    head = marker_match.group("head")
+    if re.search(rf"(?<![a-f0-9]){re.escape(head)}(?![a-f0-9])", summary) is None:
+        return False
+    return FINAL_HEADING_PATTERN.search(summary) is not None
 
 
 def completion_error(report, comments, marker):
     """Return a fixed error message, or None when a completed review was posted."""
-    if not isinstance(marker, str) or re.fullmatch(MARKER_PATTERN, marker) is None:
+    marker_match = re.fullmatch(MARKER_PATTERN, marker) if isinstance(marker, str) else None
+    if marker_match is None:
         return "Invalid review completion marker."
     if not isinstance(report, dict) or report.get("capture_status") != "captured":
         return "Review execution diagnostics are unavailable."
@@ -35,6 +70,8 @@ def completion_error(report, comments, marker):
             if not isinstance(login, str) or login not in REVIEW_AUTHORS:
                 continue
             if marker in body and body.replace(marker, "").strip():
+                return None
+            if generated_final_summary(report, body, marker_match):
                 return None
     return "Claude did not publish a final review summary for this run and commit."
 
