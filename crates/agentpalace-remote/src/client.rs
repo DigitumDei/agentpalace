@@ -73,6 +73,9 @@ pub struct RemoteClient {
 }
 
 impl RemoteClient {
+    /// Return the normalized resource key used for OAuth session storage.
+    pub fn base_url(&self) -> &str { self.base_url.as_str() }
+
     /// Construct a new client from a [`RemoteEndpoint`] descriptor.
     ///
     /// Returns [`RemoteError::InvalidConfig`] when the URL is unparseable or the
@@ -473,13 +476,19 @@ impl RemoteClient {
             .await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: Some(resource_metadata.to_owned()) })?;
         match crate::select_login_mode(mode.unwrap_or(config.login_mode), crate::browser_callback_usable()) {
             agentpalace_config::OAuthLoginMode::Browser => self.login(&metadata, &protected.resource).await,
-            agentpalace_config::OAuthLoginMode::Device => Err(RemoteError::AuthenticationRequired {
-                remote: self.name.clone(),
-                action: "device authorization login is selected but not available in this client slice".to_owned(),
-                resource_metadata: Some(resource_metadata.to_owned()),
-            }),
+            agentpalace_config::OAuthLoginMode::Device => self.login_device(&metadata, &protected.resource).await,
             agentpalace_config::OAuthLoginMode::Auto => unreachable!("automatic OAuth login mode is resolved before dispatch"),
         }
+    }
+
+    async fn login_device(&self, metadata: &crate::AuthorizationServerMetadata, resource: &str) -> Result<()> {
+        let config = self.oauth.as_ref().ok_or_else(|| RemoteError::InvalidConfig { remote: self.name.clone(), message: "OAuth login requested for a bearer-token remote".to_owned() })?;
+        let _guard = self.login_lock.lock().await;
+        let session = crate::device_login(&self.http, metadata, config, resource).await
+            .map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
+        *self.token.lock().await = Some(session.access_token.clone());
+        *self.oauth_session.lock().await = Some(session.clone());
+        self.token_store.save(session).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })
     }
 
     /// Load a previously authorized grant for the exact resource/issuer/client/account tuple.
@@ -500,6 +509,8 @@ impl RemoteClient {
             Ok(session) => session,
             Err(message) => {
                 self.token_store.clear(&current.resource, &current.issuer, &current.client_id, current.account.as_deref()).await;
+                *self.token.lock().await = None;
+                *self.oauth_session.lock().await = None;
                 return Err(RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None });
             }
         };

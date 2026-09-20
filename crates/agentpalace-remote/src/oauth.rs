@@ -63,6 +63,26 @@ pub struct AuthorizationServerMetadata {
     pub device_authorization_endpoint: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DeviceAuthorizationResponse {
+    device_code: String,
+    user_code: String,
+    #[serde(alias = "verification_url")]
+    verification_uri: String,
+    #[serde(default)]
+    #[serde(rename = "verification_uri_complete")]
+    _verification_uri_complete: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+    #[serde(default)]
+    interval: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthErrorResponse {
+    error: String,
+}
+
 /// Extract the resource-metadata URL from a Bearer challenge without treating arbitrary
 /// authentication parameters as URLs. The value is returned opaque and is validated only by
 /// the discovery caller.
@@ -179,6 +199,7 @@ pub fn validate_metadata(resource: &ProtectedResourceMetadata, server: &Authoriz
     let _ = validate_oauth_url(&server.authorization_endpoint, configured_origin, allow_loopback_demo)?;
     let _ = validate_oauth_url(&server.token_endpoint, configured_origin, allow_loopback_demo)?;
     if let Some(endpoint) = &server.revocation_endpoint { let _ = validate_oauth_url(endpoint, configured_origin, allow_loopback_demo)?; }
+    if let Some(endpoint) = &server.device_authorization_endpoint { let _ = validate_oauth_url(endpoint, configured_origin, allow_loopback_demo)?; }
     Ok(())
 }
 
@@ -319,6 +340,68 @@ pub async fn browser_login(
     Ok(result)
 }
 
+/// Run RFC 8628 device authorization without exposing the private device code.
+pub async fn device_login(
+    http: &reqwest::Client,
+    metadata: &AuthorizationServerMetadata,
+    config: &OAuthConfig,
+    resource: &str,
+) -> Result<OAuthSession, String> {
+    let endpoint = metadata.device_authorization_endpoint.as_deref()
+        .ok_or_else(|| "the authorization server does not advertise device authorization".to_owned())?;
+    let endpoint = validate_oauth_url(endpoint, &reqwest::Url::parse(resource).map_err(|_| "invalid resource URL".to_owned())?, config.allow_loopback_demo)?;
+    let response = http.post(endpoint).form(&[
+        ("client_id", config.client_id.as_str()), ("resource", resource),
+    ]).send().await.map_err(|_| "device authorization endpoint is unreachable".to_owned())?;
+    let status = response.status();
+    let bytes = response.bytes().await.map_err(|_| "device authorization response could not be read".to_owned())?;
+    if !status.is_success() {
+        let error = serde_json::from_slice::<OAuthErrorResponse>(&bytes).map(|body| body.error).unwrap_or_else(|_| "device authorization was rejected".to_owned());
+        return Err(format!("device authorization failed: {error}"));
+    }
+    let grant: DeviceAuthorizationResponse = serde_json::from_slice(&bytes).map_err(|_| "device authorization response was malformed".to_owned())?;
+    // These are the only values suitable for a user-facing device prompt. The device_code is
+    // intentionally never formatted, logged, or returned by this function.
+    eprintln!("Open {} and enter code {}.", grant.verification_uri, grant.user_code);
+    let deadline = tokio::time::Instant::now() + login_timeout(config).min(Duration::from_secs(grant.expires_in.unwrap_or(900)));
+    let mut interval = Duration::from_secs(grant.interval.unwrap_or(5).clamp(1, 60));
+    loop {
+        tokio::time::sleep(interval).await;
+        if tokio::time::Instant::now() >= deadline { return Err("device authorization expired".to_owned()); }
+        let response = http.post(&metadata.token_endpoint).form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", grant.device_code.as_str()), ("client_id", config.client_id.as_str()),
+            ("resource", resource),
+        ]).send().await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                interval = (interval * 2).min(Duration::from_secs(8)).min(remaining);
+                continue;
+            }
+        };
+        let status = response.status();
+        let bytes = response.bytes().await.map_err(|_| "device token response could not be read".to_owned())?;
+        if status.is_success() {
+            let body: TokenResponse = serde_json::from_slice(&bytes).map_err(|_| "device token response was malformed".to_owned())?;
+            return Ok(OAuthSession { access_token: body.access_token, refresh_token: body.refresh_token, expires_at: body.expires_in.map(|seconds| now_seconds().saturating_add(seconds)), resource: resource.to_owned(), issuer: metadata.issuer.clone(), client_id: config.client_id.clone(), account: config.account.clone() });
+        }
+        let error = serde_json::from_slice::<OAuthErrorResponse>(&bytes).map(|body| body.error).unwrap_or_default();
+        match error.as_str() {
+            "authorization_pending" => {}
+            "slow_down" => interval = (interval + Duration::from_secs(5)).min(Duration::from_secs(60)),
+            "expired_token" => return Err("device authorization expired".to_owned()),
+            "access_denied" | "authorization_denied" => return Err("device authorization was denied".to_owned()),
+            "invalid_grant" | "invalid_request" => return Err("device authorization code was rejected or already used".to_owned()),
+            _ if status.is_client_error() => return Err("device authorization was rejected".to_owned()),
+            _ => {
+                interval = (interval * 2).min(Duration::from_secs(8));
+            }
+        }
+    }
+}
+
 /// RFC 8414 §3.1 discovery URL. For a path-based issuer, the well-known
 /// component is inserted immediately after the authority and the issuer path
 /// follows it (for example `/tenant` becomes `/.well-known/oauth-authorization-server/tenant`).
@@ -410,6 +493,20 @@ mod tests {
         let protected = ProtectedResourceMetadata { resource: "https://other.example".to_owned(), authorization_servers: vec!["https://issuer.example".to_owned()] };
         let server = AuthorizationServerMetadata { issuer: "https://issuer.example".to_owned(), authorization_endpoint: "https://issuer.example/authorize".to_owned(), token_endpoint: "https://issuer.example/token".to_owned(), revocation_endpoint: None, device_authorization_endpoint: None };
         assert!(validate_metadata(&protected, &server, &resource, &origin, false).is_err());
+    }
+
+    #[test]
+    fn device_endpoint_is_checked_like_other_oauth_endpoints() {
+        let resource = reqwest::Url::parse("https://hub.example").expect("test URL");
+        let protected = ProtectedResourceMetadata { resource: resource.to_string(), authorization_servers: vec!["https://issuer.example".to_owned()] };
+        let server = AuthorizationServerMetadata {
+            issuer: "https://issuer.example".to_owned(),
+            authorization_endpoint: "https://issuer.example/authorize".to_owned(),
+            token_endpoint: "https://issuer.example/token".to_owned(),
+            revocation_endpoint: None,
+            device_authorization_endpoint: Some("http://issuer.example/device".to_owned()),
+        };
+        assert!(validate_metadata(&protected, &server, &resource, &resource, false).is_err());
     }
     #[test]
     fn non_loopback_http_is_rejected() {

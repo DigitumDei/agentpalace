@@ -746,7 +746,7 @@ fn execute_auth(
         match operation {
             AuthOperation::Login(resource_metadata, mode) => client.login_from_challenge_with_mode(&resource_metadata, mode).await.map(|_| "OAuth login completed; credentials were stored by the configured token store.\n".to_owned()),
             AuthOperation::Logout(issuer) => {
-                let resource = remote.url.clone();
+                let resource = client.base_url().to_owned();
                 let loaded = client.load_stored_session(&resource, &issuer).await;
                 client.logout(None).await.map(|_| if loaded { "OAuth session cleared.\n".to_owned() } else { "No matching OAuth session was available; nothing was cleared.\n".to_owned() })
             }

@@ -590,7 +590,7 @@ override is supplied. `auto` selects browser/callback only when usable,
 otherwise selecting device authorization;
 unattended calls return an authentication-required result instead of opening a browser. Library
 callers may inject a secure `TokenStore`; `allow_in_memory` is the explicit volatile/test mode and
-otherwise unavailable secure storage is reported. `agentpalace auth logout --remote NAME` clears
+otherwise unavailable secure storage is reported. `agentpalace auth logout --remote NAME --issuer ISSUER` clears
 the local grant. `allow_loopback_demo` is required for an exact loopback issuer; other discovered
 metadata and endpoints must use HTTPS.
 
