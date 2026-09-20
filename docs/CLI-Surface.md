@@ -383,7 +383,10 @@ Purpose:
 
 Flags:
 - `--stdio`: serve newline-delimited MCP on stdin/stdout, without opening an HTTP port
-  or reading a token file. Conflicts with `--bind` and `--token-file`.
+  or reading a token file. Conflicts with `--bind` and `--token-file`. Requests may run concurrently; complete response lines are serialized and
+  can arrive out of order, so match responses by JSON-RPC `id`. EOF drains admitted
+  requests before closing stdout. Lease maintenance can overtake a slow memory call;
+  see [Low-CPU operation](Operator-Low-CPU.md) for admission and worker limits.
 - `--bind <ADDR>`
   Socket address to listen on, e.g. `127.0.0.1:8765`. Default: `server.bind` from
   `config.json`, falling back to `127.0.0.1:8765`.

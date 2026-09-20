@@ -210,6 +210,8 @@ pub enum McpError {
     A2a(#[from] agentpalace_a2a::A2aError),
     #[error(transparent)]
     McpTasks(#[from] agentpalace_mcp_tasks::McpTasksError),
+    #[error("memory execution failed: {0}")]
+    Execution(String),
     #[error("time formatting error: {0}")]
     TimeFormat(String),
     #[error("federation error: {0}")]
@@ -1222,29 +1224,111 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut lines = reader.lines();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
+    let mut pending = tokio::task::JoinSet::new();
+    // One extra slot lets an overloaded request reach admission and receive its error,
+    // rather than hiding later lease traffic behind a full memory queue.
+    let limit = server
+        .queue_limit
+        .available_permits()
+        .saturating_add(server.lease_queue_limit.available_permits())
+        .saturating_add(1);
+    let mut eof = false;
+    while !eof || !pending.is_empty() {
+        tokio::select! {
+            biased;
+            completed = pending.join_next(), if !pending.is_empty() => {
+                let response: Value = completed.expect("nonempty request set")?;
+                if !response.is_null() {
+                    let response = serde_json::to_vec(&response)?;
+                    // Only this loop writes: concurrent requests cannot interleave JSON lines.
+                    writer.write_all(&response).await?;
+                    writer.write_all(b"\n").await?;
+                    writer.flush().await?;
+                }
+            }
+            line = lines.next_line(), if !eof && pending.len() < limit => {
+                match line? {
+                    Some(line) if !line.trim().is_empty() => {
+                        let server = server.clone();
+                        pending.spawn(async move { server.handle_line(&line).await });
+                    }
+                    Some(_) => {},
+                    None => eof = true,
+                }
+            }
         }
-
-        let response = server.handle_line(&line).await;
-        if response.is_null() {
-            continue;
-        }
-
-        let response = serde_json::to_string(&response)?;
-        writer.write_all(response.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
     }
 
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct McpServer<P> {
     runtime: Arc<Mutex<McpRuntime<P>>>,
+    memory_executor: MemoryExecutor,
+    leases: Arc<LeaseRuntime>,
+    lease_queue_limit: Arc<Semaphore>,
     queue_limit: Arc<Semaphore>,
+}
+
+impl<P> Clone for McpServer<P> {
+    fn clone(&self) -> Self {
+        Self {
+            runtime: self.runtime.clone(),
+            memory_executor: self.memory_executor.clone(),
+            leases: self.leases.clone(),
+            lease_queue_limit: self.lease_queue_limit.clone(),
+            queue_limit: self.queue_limit.clone(),
+        }
+    }
+}
+
+/// One execution thread per server, shared by clones. Memory methods mix synchronous
+/// embedding/SQLite work with async I/O. Poll them away from Tokio's async workers,
+/// without occupying its blocking pool (which may itself contain only one thread).
+#[derive(Debug, Clone)]
+struct MemoryExecutor {
+    sender: std::sync::mpsc::SyncSender<Box<dyn FnOnce() + Send>>,
+}
+
+impl MemoryExecutor {
+    fn new() -> Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Box<dyn FnOnce() + Send>>(1);
+        std::thread::Builder::new()
+            .name("mcp-memory".into())
+            .spawn(move || {
+                // Dropping the final server closes the channel and ends this thread.
+                while let Ok(job) = receiver.recv() {
+                    job();
+                }
+            })
+            .map_err(|error| McpError::Execution(error.to_string()))?;
+        Ok(Self { sender })
+    }
+
+    async fn run(
+        &self,
+        job: impl FnOnce() -> ToolResult<Value> + Send + 'static,
+    ) -> ToolResult<Value> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender
+            .try_send(Box::new(move || {
+                if !reply.is_closed() {
+                    // Isolate each request just as Tokio's per-request tasks do. Unwinding
+                    // drops its runtime guard and admission permit, but must not kill the
+                    // shared worker. Do not expose arbitrary panic payloads to clients.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+                        .unwrap_or_else(|_| Err(ToolError::Internal(McpError::Execution(
+                            "memory request panicked".to_owned(),
+                        ))));
+                    let _ = reply.send(result);
+                }
+            }))
+            .map_err(|error| ToolError::Internal(McpError::Execution(error.to_string())))?;
+        response
+            .await
+            .map_err(|error| ToolError::Internal(McpError::Execution(error.to_string())))?
+    }
 }
 
 impl McpServer<FastembedProvider> {
@@ -1304,12 +1388,19 @@ where
             (!router.remotes.is_empty())
                 .then(|| (runtime.outbox.clone(), router.remotes.clone(), runtime.metrics.clone()))
         });
+        let leases = Arc::new(LeaseRuntime::from_runtime(&runtime));
         let runtime = Arc::new(Mutex::new(runtime));
         if let Some((outbox, remotes, metrics)) = federation_worker {
             tokio::spawn(run_replication_worker(outbox, remotes, metrics));
             tokio::spawn(run_staged_reconciliation(runtime.clone()));
         }
-        Ok(Self { runtime, queue_limit: Arc::new(Semaphore::new(queue_limit)) })
+        Ok(Self {
+            memory_executor: MemoryExecutor::new()?,
+            runtime,
+            leases,
+            lease_queue_limit: Arc::new(Semaphore::new(queue_limit)),
+            queue_limit: Arc::new(Semaphore::new(queue_limit)),
+        })
     }
 
     pub async fn handle_json_value(&self, request: Value) -> Value {
@@ -1379,7 +1470,12 @@ where
             );
         };
 
-        let _permit = match self.queue_limit.clone().try_acquire_owned() {
+        // Lease maintenance must remain available while memory work holds the runtime lock
+        // or fills its queue. Keep a separately bounded admission lane for these calls.
+        let lease_call =
+            matches!(tool, ToolName::TaskGet | ToolName::TaskClaim | ToolName::TaskRenew);
+        let queue = if lease_call { &self.lease_queue_limit } else { &self.queue_limit };
+        let _permit = match queue.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(TryAcquireError::NoPermits) => {
                 return jsonrpc_error(
@@ -1397,141 +1493,172 @@ where
             }
         };
 
-        let mut runtime = self.runtime.lock().await;
+        let result = if lease_call {
+            match tool {
+                ToolName::TaskGet => self.leases.tool_task_get(&call.arguments).await,
+                ToolName::TaskClaim => self.leases.tool_task_claim(&call.arguments).await,
+                ToolName::TaskRenew => self.leases.tool_task_renew(&call.arguments).await,
+                _ => unreachable!(),
+            }
+        } else {
+            let mut runtime = self.runtime.clone().lock_owned().await;
+            let handle = tokio::runtime::Handle::current();
+            let arguments = call.arguments;
+            self.memory_executor
+                .run(move || {
+                    handle.block_on(async move {
+            // Cancellation of the caller must not release capacity while work still runs.
+            let _permit = _permit;
 
-        // `tool.routing()` is not just documentation here: which of the four inner `match`
-        // blocks below runs is decided by it, and each inner match only covers the `ToolName`
-        // variants that category is supposed to contain. A tool miscategorized by `routing()`
-        // (e.g. a coordination tool accidentally left `LocalOnly`) reaches the wrong inner
-        // match, which has no arm for it, and panics via the catch-all below instead of
-        // silently behaving as if it were still correctly routed — the same guarantee
-        // `routing_categories_are_consistent_with_semantics_doc` checks statically, backstopped
-        // here at dispatch time.
-        let result = match tool.routing() {
-            ToolRoutingCategory::LocalOnly => match tool {
-                ToolName::WakeUp => runtime.tool_wake_up(&call.arguments).await,
-                ToolName::GetAaaKSpec => runtime.tool_get_aaak_spec().await,
-                ToolName::DiaryWrite => runtime.tool_diary_write(&call.arguments).await,
-                ToolName::DiaryRead => runtime.tool_diary_read(&call.arguments).await,
-                ToolName::GetChangesSince => runtime.tool_get_changes_since(&call.arguments).await,
-                ToolName::Traverse => runtime.tool_traverse(&call.arguments).await,
-                ToolName::FindTunnels => runtime.tool_find_tunnels(&call.arguments).await,
-                ToolName::GraphStats => runtime.tool_graph_stats().await,
-                ToolName::IdentityRead => runtime.tool_identity_read().await,
-                ToolName::IdentityUpdate => runtime.tool_identity_update(&call.arguments).await,
-                ToolName::LineageSet => runtime.tool_lineage_set(&call.arguments).await,
-                ToolName::SelfObservationPropose => {
-                    runtime.tool_self_observation_propose(&call.arguments).await
-                }
-                ToolName::SelfObservationReview => {
-                    runtime.tool_self_observation_review(&call.arguments).await
-                }
-                ToolName::IdentityPacket => runtime.tool_identity_packet(&call.arguments).await,
-                ToolName::MigrationRecord => runtime.tool_migration_record(&call.arguments).await,
-                // Not federated in this phase (skills/delegation), or has no wire counterpart
-                // at all (a single coordination event has no `GET .../events/{id}` route — only
-                // the paginated feed does; see `tool_coordination_event_get`'s doc comment).
-                ToolName::CoordinationEventGet => {
-                    runtime.tool_coordination_event_get(&call.arguments).await
-                }
-                ToolName::CoordinationWings => runtime.tool_coordination_wings().await,
-                ToolName::SkillPropose => runtime.tool_skill_propose(&call.arguments).await,
-                ToolName::SkillGet => runtime.tool_skill_get(&call.arguments).await,
-                ToolName::SkillVersions => runtime.tool_skill_versions(&call.arguments).await,
-                ToolName::SkillList => runtime.tool_skill_list(&call.arguments).await,
-                ToolName::SkillRecordOutcome => {
-                    runtime.tool_skill_record_outcome(&call.arguments).await
-                }
-                ToolName::SkillPromote => runtime.tool_skill_promote(&call.arguments).await,
-                ToolName::SkillRetire => runtime.tool_skill_retire(&call.arguments).await,
-                ToolName::SkillReviews => runtime.tool_skill_reviews(&call.arguments).await,
-                ToolName::DelegationSpanStart => {
-                    runtime.tool_delegation_span_start(&call.arguments).await
-                }
-                ToolName::DelegationSpanGet => {
-                    runtime.tool_delegation_span_get(&call.arguments).await
-                }
-                ToolName::DelegationSpanClose => {
-                    runtime.tool_delegation_span_close(&call.arguments).await
-                }
-                ToolName::DelegationSpansForTask => {
-                    runtime.tool_delegation_spans_for_task(&call.arguments).await
-                }
-                ToolName::DelegationCheckpointAppend => {
-                    runtime.tool_delegation_checkpoint_append(&call.arguments).await
-                }
-                ToolName::DelegationCheckpointGet => {
-                    runtime.tool_delegation_checkpoint_get(&call.arguments).await
-                }
-                ToolName::DelegationTrace => runtime.tool_delegation_trace(&call.arguments).await,
-                ToolName::A2aAgentCard => runtime.tool_a2a_agent_card(&call.arguments).await,
-                ToolName::A2aTaskImport => runtime.tool_a2a_task_import(&call.arguments).await,
-                ToolName::A2aTaskExport => runtime.tool_a2a_task_export(&call.arguments).await,
-                ToolName::A2aMessageImport => {
-                    runtime.tool_a2a_message_import(&call.arguments).await
-                }
-                ToolName::A2aArtifactImport => {
-                    runtime.tool_a2a_artifact_import(&call.arguments).await
-                }
-                ToolName::McpTasksGet => runtime.tool_mcp_tasks_get(&call.arguments).await,
-                ToolName::McpTasksUpdate => runtime.tool_mcp_tasks_update(&call.arguments).await,
-                ToolName::McpTasksCancel => runtime.tool_mcp_tasks_cancel(&call.arguments).await,
-                ToolName::McpTasksImport => runtime.tool_mcp_tasks_import(&call.arguments).await,
-                other => unreachable!(
-                    "ToolName::routing() classified {other:?} as LocalOnly, \
+            // `tool.routing()` is not just documentation here: which of the four inner `match`
+            // blocks below runs is decided by it, and each inner match only covers the `ToolName`
+            // variants that category is supposed to contain. A tool miscategorized by `routing()`
+            // (e.g. a coordination tool accidentally left `LocalOnly`) reaches the wrong inner
+            // match, which has no arm for it, and panics via the catch-all below instead of
+            // silently behaving as if it were still correctly routed — the same guarantee
+            // `routing_categories_are_consistent_with_semantics_doc` checks statically, backstopped
+            // here at dispatch time.
+            match tool.routing() {
+                ToolRoutingCategory::LocalOnly => match tool {
+                    ToolName::WakeUp => runtime.tool_wake_up(&arguments).await,
+                    ToolName::GetAaaKSpec => runtime.tool_get_aaak_spec().await,
+                    ToolName::DiaryWrite => runtime.tool_diary_write(&arguments).await,
+                    ToolName::DiaryRead => runtime.tool_diary_read(&arguments).await,
+                    ToolName::GetChangesSince => {
+                        runtime.tool_get_changes_since(&arguments).await
+                    }
+                    ToolName::Traverse => runtime.tool_traverse(&arguments).await,
+                    ToolName::FindTunnels => runtime.tool_find_tunnels(&arguments).await,
+                    ToolName::GraphStats => runtime.tool_graph_stats().await,
+                    ToolName::IdentityRead => runtime.tool_identity_read().await,
+                    ToolName::IdentityUpdate => runtime.tool_identity_update(&arguments).await,
+                    ToolName::LineageSet => runtime.tool_lineage_set(&arguments).await,
+                    ToolName::SelfObservationPropose => {
+                        runtime.tool_self_observation_propose(&arguments).await
+                    }
+                    ToolName::SelfObservationReview => {
+                        runtime.tool_self_observation_review(&arguments).await
+                    }
+                    ToolName::IdentityPacket => runtime.tool_identity_packet(&arguments).await,
+                    ToolName::MigrationRecord => {
+                        runtime.tool_migration_record(&arguments).await
+                    }
+                    // Not federated in this phase (skills/delegation), or has no wire counterpart
+                    // at all (a single coordination event has no `GET .../events/{id}` route — only
+                    // the paginated feed does; see `tool_coordination_event_get`'s doc comment).
+                    ToolName::CoordinationEventGet => {
+                        runtime.tool_coordination_event_get(&arguments).await
+                    }
+                    ToolName::CoordinationWings => runtime.tool_coordination_wings().await,
+                    ToolName::SkillPropose => runtime.tool_skill_propose(&arguments).await,
+                    ToolName::SkillGet => runtime.tool_skill_get(&arguments).await,
+                    ToolName::SkillVersions => runtime.tool_skill_versions(&arguments).await,
+                    ToolName::SkillList => runtime.tool_skill_list(&arguments).await,
+                    ToolName::SkillRecordOutcome => {
+                        runtime.tool_skill_record_outcome(&arguments).await
+                    }
+                    ToolName::SkillPromote => runtime.tool_skill_promote(&arguments).await,
+                    ToolName::SkillRetire => runtime.tool_skill_retire(&arguments).await,
+                    ToolName::SkillReviews => runtime.tool_skill_reviews(&arguments).await,
+                    ToolName::DelegationSpanStart => {
+                        runtime.tool_delegation_span_start(&arguments).await
+                    }
+                    ToolName::DelegationSpanGet => {
+                        runtime.tool_delegation_span_get(&arguments).await
+                    }
+                    ToolName::DelegationSpanClose => {
+                        runtime.tool_delegation_span_close(&arguments).await
+                    }
+                    ToolName::DelegationSpansForTask => {
+                        runtime.tool_delegation_spans_for_task(&arguments).await
+                    }
+                    ToolName::DelegationCheckpointAppend => {
+                        runtime.tool_delegation_checkpoint_append(&arguments).await
+                    }
+                    ToolName::DelegationCheckpointGet => {
+                        runtime.tool_delegation_checkpoint_get(&arguments).await
+                    }
+                    ToolName::DelegationTrace => {
+                        runtime.tool_delegation_trace(&arguments).await
+                    }
+                    ToolName::A2aAgentCard => runtime.tool_a2a_agent_card(&arguments).await,
+                    ToolName::A2aTaskImport => runtime.tool_a2a_task_import(&arguments).await,
+                    ToolName::A2aTaskExport => runtime.tool_a2a_task_export(&arguments).await,
+                    ToolName::A2aMessageImport => {
+                        runtime.tool_a2a_message_import(&arguments).await
+                    }
+                    ToolName::A2aArtifactImport => {
+                        runtime.tool_a2a_artifact_import(&arguments).await
+                    }
+                    ToolName::McpTasksGet => runtime.tool_mcp_tasks_get(&arguments).await,
+                    ToolName::McpTasksUpdate => {
+                        runtime.tool_mcp_tasks_update(&arguments).await
+                    }
+                    ToolName::McpTasksCancel => {
+                        runtime.tool_mcp_tasks_cancel(&arguments).await
+                    }
+                    ToolName::McpTasksImport => {
+                        runtime.tool_mcp_tasks_import(&arguments).await
+                    }
+                    other => unreachable!(
+                        "ToolName::routing() classified {other:?} as LocalOnly, \
                      but dispatch_tool's LocalOnly arm does not handle it"
                 ),
             },
             ToolRoutingCategory::RoutableDrawer => match tool {
-                ToolName::Search => runtime.tool_search(&call.arguments).await,
+                ToolName::Search => runtime.tool_search(&arguments).await,
                 ToolName::ListWings => runtime.tool_list_wings().await,
-                ToolName::ListRooms => runtime.tool_list_rooms(&call.arguments).await,
+                ToolName::ListRooms => runtime.tool_list_rooms(&arguments).await,
                 ToolName::GetTaxonomy => runtime.tool_get_taxonomy().await,
                 ToolName::Status => runtime.tool_status().await,
-                ToolName::CheckDuplicate => runtime.tool_check_duplicate(&call.arguments).await,
-                ToolName::AddDrawer => runtime.tool_add_drawer(&call.arguments).await,
-                ToolName::DeleteDrawer => runtime.tool_delete_drawer(&call.arguments).await,
+                ToolName::CheckDuplicate => runtime.tool_check_duplicate(&arguments).await,
+                ToolName::AddDrawer => runtime.tool_add_drawer(&arguments).await,
+                ToolName::DeleteDrawer => runtime.tool_delete_drawer(&arguments).await,
                 other => unreachable!(
                     "ToolName::routing() classified {other:?} as RoutableDrawer, \
                      but dispatch_tool's RoutableDrawer arm does not handle it"
                 ),
             },
             ToolRoutingCategory::RoutableKg => match tool {
-                ToolName::KgQuery => runtime.tool_kg_query(&call.arguments).await,
-                ToolName::KgAdd => runtime.tool_kg_add(&call.arguments).await,
-                ToolName::KgInvalidate => runtime.tool_kg_invalidate(&call.arguments).await,
-                ToolName::KgTimeline => runtime.tool_kg_timeline(&call.arguments).await,
+                ToolName::KgQuery => runtime.tool_kg_query(&arguments).await,
+                ToolName::KgAdd => runtime.tool_kg_add(&arguments).await,
+                ToolName::KgInvalidate => runtime.tool_kg_invalidate(&arguments).await,
+                ToolName::KgTimeline => runtime.tool_kg_timeline(&arguments).await,
                 ToolName::KgStats => runtime.tool_kg_stats().await,
                 other => unreachable!(
                     "ToolName::routing() classified {other:?} as RoutableKg, \
                      but dispatch_tool's RoutableKg arm does not handle it"
-                ),
-            },
-            ToolRoutingCategory::RoutableCoordination => match tool {
-                ToolName::TaskCreate => runtime.tool_task_create(&call.arguments).await,
-                ToolName::TaskList => runtime.tool_task_list(&call.arguments).await,
-                ToolName::TaskGet => runtime.tool_task_get(&call.arguments).await,
-                ToolName::TaskClaim => runtime.tool_task_claim(&call.arguments).await,
-                ToolName::TaskRenew => runtime.tool_task_renew(&call.arguments).await,
-                ToolName::TaskTransition => runtime.tool_task_transition(&call.arguments).await,
-                ToolName::MessageSend => runtime.tool_message_send(&call.arguments).await,
-                ToolName::MessageGet => runtime.tool_message_get(&call.arguments).await,
-                ToolName::MessageAcknowledge => {
-                    runtime.tool_message_acknowledge(&call.arguments).await
-                }
-                ToolName::InboxRead => runtime.tool_inbox_read(&call.arguments).await,
-                ToolName::ArtifactPut => runtime.tool_artifact_put(&call.arguments).await,
-                ToolName::ArtifactGet => runtime.tool_artifact_get(&call.arguments).await,
-                ToolName::ResultPut => runtime.tool_result_put(&call.arguments).await,
-                ToolName::ResultGet => runtime.tool_result_get(&call.arguments).await,
-                ToolName::CoordinationEvents => {
-                    runtime.tool_coordination_events(&call.arguments).await
-                }
-                other => unreachable!(
-                    "ToolName::routing() classified {other:?} as RoutableCoordination, \
+                    ),
+                },
+                ToolRoutingCategory::RoutableCoordination => match tool {
+                    ToolName::TaskCreate => runtime.tool_task_create(&arguments).await,
+                    ToolName::TaskList => runtime.tool_task_list(&arguments).await,
+                    ToolName::TaskGet => unreachable!("handled by lease lane"),
+                    ToolName::TaskClaim => unreachable!("handled by lease lane"),
+                    ToolName::TaskRenew => unreachable!("handled by lease lane"),
+                    ToolName::TaskTransition => runtime.tool_task_transition(&arguments).await,
+                    ToolName::MessageSend => runtime.tool_message_send(&arguments).await,
+                    ToolName::MessageGet => runtime.tool_message_get(&arguments).await,
+                    ToolName::MessageAcknowledge => {
+                        runtime.tool_message_acknowledge(&arguments).await
+                    }
+                    ToolName::InboxRead => runtime.tool_inbox_read(&arguments).await,
+                    ToolName::ArtifactPut => runtime.tool_artifact_put(&arguments).await,
+                    ToolName::ArtifactGet => runtime.tool_artifact_get(&arguments).await,
+                    ToolName::ResultPut => runtime.tool_result_put(&arguments).await,
+                    ToolName::ResultGet => runtime.tool_result_get(&arguments).await,
+                    ToolName::CoordinationEvents => {
+                        runtime.tool_coordination_events(&arguments).await
+                    }
+                    other => unreachable!(
+                        "ToolName::routing() classified {other:?} as RoutableCoordination, \
                      but dispatch_tool's RoutableCoordination arm does not handle it"
-                ),
-            },
+                    ),
+                },
+            }
+            })
+                })
+                .await
         };
 
         match result {
@@ -1546,6 +1673,100 @@ where
             Err(ToolError::Internal(error)) => {
                 jsonrpc_error(call.id, ErrorCode::InternalError, error.to_string())
             }
+        }
+    }
+}
+
+/// Lease operations retain existing compare-and-swap and federation semantics without
+/// waiting for memory/search/reconciliation to release the shared runtime lock.
+#[derive(Debug)]
+struct LeaseRuntime {
+    coordination: CoordinationStore,
+    federation: Option<FederationRouter>,
+}
+impl LeaseRuntime {
+    fn from_runtime<P>(runtime: &McpRuntime<P>) -> Self {
+        Self { coordination: runtime.coordination.clone(), federation: runtime.federation.clone() }
+    }
+    /// Get a task by exact ID. Local first; on a local miss, falls back to each configured
+    /// remote in name order (no wing is known for an ID-keyed lookup — see the federation
+    /// module comment).
+    async fn tool_task_get(&self, arguments: &Value) -> ToolResult<Value> {
+        let id = required_string(arguments, "task_id")?;
+        if let Some(task) = self.coordination.get_task(&id).map_tool_internal()? {
+            return Ok(json!({"found": true, "value": task}));
+        }
+        if let Some(router) = &self.federation {
+            if let Some(value) = router.coordination_task_get_fallback(&id).await? {
+                return Ok(json!({"found": true, "value": value}));
+            }
+        }
+        Ok(json!({"found": false}))
+    }
+    /// Claim a task, or reclaim an expired lease. Local first; a local "task not found" falls
+    /// back to each configured remote in name order, sending the claim to whichever one
+    /// actually owns the task. A revision conflict — local or remote — surfaces via
+    /// `revision_conflict_payload` either way; AgentPalace never retries on the caller's behalf.
+    async fn tool_task_claim(&self, arguments: &Value) -> ToolResult<Value> {
+        let expected_revision = required_i64(arguments, "expected_revision")?;
+        let task_id = required_string(arguments, "task_id")?;
+        let worker = required_string(arguments, "worker")?;
+        let lease_seconds = required_positive_i64(arguments, "lease_seconds")?;
+        match self.coordination.claim_task(
+            &task_id,
+            &worker,
+            expected_revision,
+            Duration::seconds(lease_seconds),
+        ) {
+            Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
+            Ok(RevisionedWrite::Conflict { actual_revision }) => {
+                Ok(revision_conflict_payload(expected_revision, actual_revision))
+            }
+            Err(err) if is_local_record_missing(&err) => {
+                if let Some(router) = &self.federation {
+                    let req =
+                        TaskLeaseRequest { expected_revision, lease_seconds, worker: Some(worker) };
+                    if let Some(value) =
+                        router.coordination_task_claim_fallback(&task_id, req).await?
+                    {
+                        return Ok(value);
+                    }
+                }
+                Err(err).map_tool_internal()
+            }
+            Err(err) => Err(err).map_tool_internal(),
+        }
+    }
+    /// Renew a live lease. See [`Self::tool_task_claim`] for the local-first/fallback and
+    /// conflict-shape notes — identical here.
+    async fn tool_task_renew(&self, arguments: &Value) -> ToolResult<Value> {
+        let expected_revision = required_i64(arguments, "expected_revision")?;
+        let task_id = required_string(arguments, "task_id")?;
+        let worker = required_string(arguments, "worker")?;
+        let lease_seconds = required_positive_i64(arguments, "lease_seconds")?;
+        match self.coordination.renew_lease(
+            &task_id,
+            &worker,
+            expected_revision,
+            Duration::seconds(lease_seconds),
+        ) {
+            Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
+            Ok(RevisionedWrite::Conflict { actual_revision }) => {
+                Ok(revision_conflict_payload(expected_revision, actual_revision))
+            }
+            Err(err) if is_local_record_missing(&err) => {
+                if let Some(router) = &self.federation {
+                    let req =
+                        TaskLeaseRequest { expected_revision, lease_seconds, worker: Some(worker) };
+                    if let Some(value) =
+                        router.coordination_task_renew_fallback(&task_id, req).await?
+                    {
+                        return Ok(value);
+                    }
+                }
+                Err(err).map_tool_internal()
+            }
+            Err(err) => Err(err).map_tool_internal(),
         }
     }
 }
@@ -4572,88 +4793,7 @@ where
         }
         Ok(json!(self.coordination.create_task(&input).map_tool_internal()?))
     }
-    /// Get a task by exact ID. Local first; on a local miss, falls back to each configured
-    /// remote in name order (no wing is known for an ID-keyed lookup — see the federation
-    /// module comment).
-    async fn tool_task_get(&mut self, arguments: &Value) -> ToolResult<Value> {
-        let id = required_string(arguments, "task_id")?;
-        if let Some(task) = self.coordination.get_task(&id).map_tool_internal()? {
-            return Ok(json!({"found": true, "value": task}));
-        }
-        if let Some(router) = &self.federation {
-            if let Some(value) = router.coordination_task_get_fallback(&id).await? {
-                return Ok(json!({"found": true, "value": value}));
-            }
-        }
-        Ok(json!({"found": false}))
-    }
-    /// Claim a task, or reclaim an expired lease. Local first; a local "task not found" falls
-    /// back to each configured remote in name order, sending the claim to whichever one
-    /// actually owns the task. A revision conflict — local or remote — surfaces via
-    /// `revision_conflict_payload` either way; AgentPalace never retries on the caller's behalf.
-    async fn tool_task_claim(&mut self, arguments: &Value) -> ToolResult<Value> {
-        let expected_revision = required_i64(arguments, "expected_revision")?;
-        let task_id = required_string(arguments, "task_id")?;
-        let worker = required_string(arguments, "worker")?;
-        let lease_seconds = required_positive_i64(arguments, "lease_seconds")?;
-        match self.coordination.claim_task(
-            &task_id,
-            &worker,
-            expected_revision,
-            Duration::seconds(lease_seconds),
-        ) {
-            Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
-            Ok(RevisionedWrite::Conflict { actual_revision }) => {
-                Ok(revision_conflict_payload(expected_revision, actual_revision))
-            }
-            Err(err) if is_local_record_missing(&err) => {
-                if let Some(router) = &self.federation {
-                    let req =
-                        TaskLeaseRequest { expected_revision, lease_seconds, worker: Some(worker) };
-                    if let Some(value) =
-                        router.coordination_task_claim_fallback(&task_id, req).await?
-                    {
-                        return Ok(value);
-                    }
-                }
-                Err(err).map_tool_internal()
-            }
-            Err(err) => Err(err).map_tool_internal(),
-        }
-    }
-    /// Renew a live lease. See [`Self::tool_task_claim`] for the local-first/fallback and
-    /// conflict-shape notes — identical here.
-    async fn tool_task_renew(&mut self, arguments: &Value) -> ToolResult<Value> {
-        let expected_revision = required_i64(arguments, "expected_revision")?;
-        let task_id = required_string(arguments, "task_id")?;
-        let worker = required_string(arguments, "worker")?;
-        let lease_seconds = required_positive_i64(arguments, "lease_seconds")?;
-        match self.coordination.renew_lease(
-            &task_id,
-            &worker,
-            expected_revision,
-            Duration::seconds(lease_seconds),
-        ) {
-            Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
-            Ok(RevisionedWrite::Conflict { actual_revision }) => {
-                Ok(revision_conflict_payload(expected_revision, actual_revision))
-            }
-            Err(err) if is_local_record_missing(&err) => {
-                if let Some(router) = &self.federation {
-                    let req =
-                        TaskLeaseRequest { expected_revision, lease_seconds, worker: Some(worker) };
-                    if let Some(value) =
-                        router.coordination_task_renew_fallback(&task_id, req).await?
-                    {
-                        return Ok(value);
-                    }
-                }
-                Err(err).map_tool_internal()
-            }
-            Err(err) => Err(err).map_tool_internal(),
-        }
-    }
-    /// Transition a task's lifecycle state. See [`Self::tool_task_claim`] for the
+    /// Transition a task's lifecycle state. See [`LeaseRuntime::tool_task_claim`] for the
     /// local-first/fallback and conflict-shape notes — identical here.
     async fn tool_task_transition(&mut self, arguments: &Value) -> ToolResult<Value> {
         let state: TaskState = serde_json::from_value(json!(required_string(arguments, "state")?))
@@ -5337,7 +5477,7 @@ where
 
     /// Transition a task's lifecycle state using an inbound MCP Tasks extension status, under the
     /// same compare-and-swap revision semantics as `agentpalace_task_transition`. See
-    /// [`Self::tool_task_claim`] for the conflict-shape notes — identical here. Local-only: no
+    /// [`LeaseRuntime::tool_task_claim`] for the conflict-shape notes — identical here. Local-only: no
     /// MCP Tasks transport of its own to fall back to. A blank or unknown `task_id` is
     /// `ToolError::InvalidParams`, matching `tool_mcp_tasks_get` and JSON-RPC `-32602`.
     async fn tool_mcp_tasks_update(&mut self, arguments: &Value) -> ToolResult<Value> {
@@ -7859,6 +7999,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lease_maintenance_survives_blocked_memory_and_full_memory_queue() {
+        let mut harness = test_harness().await;
+        harness.server.queue_limit = Arc::new(Semaphore::new(1));
+        harness.server.lease_queue_limit = Arc::new(Semaphore::new(1));
+        let created = harness.server.handle_request(tool_call(1, "agentpalace_task_create",
+            json!({"title":"Lease isolation", "description":"Regression", "created_by":"manager",
+                   "wing":"alpha", "idempotency_key":"lease-isolation"}))).await;
+        let task = decode_tool_payload(&created).unwrap();
+        // Hold the exact lock a slow wake-up/search holds and exhaust its admission queue.
+        let _memory = harness.server.runtime.lock().await;
+        let _queue = harness.server.queue_limit.clone().acquire_many_owned(
+            harness.server.queue_limit.available_permits() as u32).await.unwrap();
+        let exercise = async {
+            let claimed = harness.server.handle_request(tool_call(2, "agentpalace_task_claim",
+                json!({"task_id":task["task_id"], "expected_revision":task["revision"],
+                       "worker":"worker", "lease_seconds":60}))).await;
+            let claimed = decode_tool_payload(&claimed).unwrap();
+            assert_eq!(claimed["success"], true);
+            let task = &claimed["task"];
+            let renewed = harness.server.handle_request(tool_call(3, "agentpalace_task_renew",
+                json!({"task_id":task["task_id"], "expected_revision":task["revision"],
+                       "worker":"worker", "lease_seconds":120}))).await;
+            let renewed = decode_tool_payload(&renewed).unwrap();
+            assert_eq!(renewed["success"], true);
+            assert!(renewed["task"]["revision"].as_i64().unwrap() > task["revision"].as_i64().unwrap());
+            let stale = harness.server.handle_request(tool_call(4, "agentpalace_task_renew",
+                json!({"task_id":task["task_id"], "expected_revision":task["revision"],
+                       "worker":"worker", "lease_seconds":120}))).await;
+            assert_eq!(decode_tool_payload(&stale).unwrap()["success"], false);
+            let wrong_owner = harness.server.handle_request(tool_call(6, "agentpalace_task_renew",
+                json!({"task_id":task["task_id"], "expected_revision":renewed["task"]["revision"],
+                       "worker":"another-worker", "lease_seconds":120}))).await;
+            assert!(wrong_owner.get("error").is_some(), "lease ownership must still be enforced");
+            let fetched = harness.server.handle_request(tool_call(5, "agentpalace_task_get",
+                json!({"task_id":task["task_id"]}))).await;
+            assert_eq!(decode_tool_payload(&fetched).unwrap()["value"], renewed["task"]);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), exercise).await
+            .expect("lease maintenance must not wait for memory work");
+    }
+
+    #[tokio::test]
+    async fn lease_lane_rejects_overload_without_consuming_memory_capacity() {
+        let mut harness = test_harness().await;
+        harness.server.queue_limit = Arc::new(Semaphore::new(1));
+        harness.server.lease_queue_limit = Arc::new(Semaphore::new(1));
+        let memory_capacity = harness.server.queue_limit.available_permits();
+        let _leases = harness.server.lease_queue_limit.clone().acquire_many_owned(
+            harness.server.lease_queue_limit.available_permits() as u32).await.unwrap();
+        let response = harness.server.handle_request(tool_call(1, "agentpalace_task_get",
+            json!({"task_id":"missing"}))).await;
+        assert!(response["error"]["message"].as_str().unwrap().contains("server busy"));
+        assert_eq!(harness.server.queue_limit.available_permits(), memory_capacity);
+    }
+
+    #[tokio::test]
     async fn task_list_mcp_discovery_to_claim_and_independent_local_cursor() {
         let harness = test_harness().await;
         for i in 0..3 {
@@ -10195,6 +10391,159 @@ mod tests {
         assert!(rooms_payload["rooms"].as_object().unwrap().is_empty());
     }
 
+    #[derive(Debug)]
+    struct PanicOnceProvider {
+        inner: DeterministicStubProvider,
+        panic_next: bool,
+    }
+
+    impl EmbeddingProvider for PanicOnceProvider {
+        fn profile(&self) -> &'static agentpalace_core::EmbeddingProfileMetadata {
+            self.inner.profile()
+        }
+
+        fn startup_validation(&self) -> agentpalace_embeddings::Result<StartupValidation> {
+            self.inner.startup_validation()
+        }
+
+        fn embed(&mut self, request: &EmbeddingRequest)
+            -> agentpalace_embeddings::Result<agentpalace_embeddings::EmbeddingResponse> {
+            assert!(!std::mem::take(&mut self.panic_next), "synthetic private panic payload");
+            self.inner.embed(request)
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_request_panic_releases_capacity_and_worker_serves_next_request() {
+        let tempdir = TempDir::new().unwrap();
+        let mut config = make_base_config(&tempdir.path().join("palace"), &tempdir);
+        config.low_cpu.enabled = true;
+        config.low_cpu.queue_limit = 1;
+        let server = McpServer::from_parts(config, PanicOnceProvider {
+            inner: DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+            panic_next: true,
+        }).await.unwrap();
+        let first = server.handle_request(tool_call(1, "agentpalace_search",
+            json!({"query":"trigger embedding panic", "limit":1}))).await;
+        assert_eq!(first["error"]["code"], -32000);
+        assert_eq!(first["error"]["message"], "memory execution failed: memory request panicked");
+        assert!(!first.to_string().contains("synthetic private panic payload"));
+        assert_eq!(server.queue_limit.available_permits(), 1);
+        assert!(server.runtime.try_lock().is_ok(), "panicking request must release runtime lock");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2),
+            server.handle_request(tool_call(2, "agentpalace_search",
+                json!({"query":"worker remains usable", "limit":1})))).await.unwrap();
+        assert!(decode_tool_payload(&second).is_some(), "next memory request failed: {second}");
+        let lease = server.handle_request(tool_call(3, "agentpalace_task_get",
+            json!({"task_id":"missing"}))).await;
+        assert_eq!(decode_tool_payload(&lease).unwrap()["found"], false);
+    }
+
+    // A separate watchdog releases the deliberately synchronous embed if a regression
+    // stalls the sole Tokio worker. Elapsed-time checks still fail instead of hanging CI.
+    fn exercise_lease_during_blocking_embedding(stdio: bool) {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let watchdog_release = release_tx.clone();
+        let watchdog = std::thread::spawn(move || {
+            if stop_rx.recv_timeout(std::time::Duration::from_secs(6)).is_err() {
+                let _ = watchdog_release.send(());
+            }
+        });
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = executor.block_on(async move {
+            // Run the controller on the sole worker too; block_on's caller thread must
+            // not accidentally provide the extra execution capacity under test.
+            tokio::spawn(async move {
+                let tempdir = TempDir::new().unwrap();
+                let mut config = make_base_config(&tempdir.path().join("palace"), &tempdir);
+                config.maintenance.background_enabled = false;
+                config.low_cpu.enabled = true;
+                config.low_cpu.queue_limit = 1;
+                let server = McpServer::from_parts(config, BlockingProvider {
+                    started_tx: Arc::new(std::sync::Mutex::new(Some(started_tx))),
+                    release_rx: Arc::new(std::sync::Mutex::new(release_rx)),
+                }).await.unwrap();
+                let created = server.handle_request(tool_call(1, "agentpalace_task_create",
+                    json!({"title":"Embedding isolation", "description":"regression",
+                           "wing":"alpha", "created_by":"manager", "idempotency_key":"embedding-isolation"}))).await;
+                let task = decode_tool_payload(&created).unwrap();
+                let claimed = server.handle_request(tool_call(2, "agentpalace_task_claim",
+                    json!({"task_id":task["task_id"], "expected_revision":task["revision"],
+                           "worker":"worker", "lease_seconds":60}))).await;
+                let task = decode_tool_payload(&claimed).unwrap()["task"].clone();
+                let (client, transport) = tokio::io::duplex(8192);
+                let (read, write) = tokio::io::split(transport);
+                let transport_server = server.clone();
+                let transport_task = tokio::spawn(async move {
+                    serve_transport(&transport_server, BufReader::new(read), write).await.unwrap();
+                });
+                let (read, mut write) = tokio::io::split(client);
+                let mut responses = BufReader::new(read).lines();
+                let search = json!({"jsonrpc":"2.0", "id":10, "method":"tools/call",
+                    "params":{"name":"agentpalace_search", "arguments":{"query":"blocked embedding", "limit":1}}});
+                let start = std::time::Instant::now();
+                let search_task = if stdio {
+                    write.write_all(format!("{search}\n").as_bytes()).await.unwrap();
+                    None
+                } else {
+                    let server = server.clone();
+                    Some(tokio::spawn(async move { server.handle_json_value(search).await }))
+                };
+                tokio::task::spawn_blocking(move || started_rx.recv_timeout(std::time::Duration::from_secs(2)))
+                    .await.unwrap().expect("embedding must start");
+                let renewed_request = json!({"jsonrpc":"2.0", "id":11, "method":"tools/call",
+                    "params":{"name":"agentpalace_task_renew", "arguments":{
+                        "task_id":task["task_id"], "expected_revision":task["revision"],
+                        "worker":"worker", "lease_seconds":120}}});
+                let response = if stdio {
+                    // Also exercise blank lines and notifications while a request is blocked.
+                    write.write_all(b"\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n").await.unwrap();
+                    write.write_all(format!("{renewed_request}\n").as_bytes()).await.unwrap();
+                    let line = tokio::time::timeout(std::time::Duration::from_secs(2), responses.next_line())
+                        .await.expect("stdio lease response must overtake blocked search").unwrap().unwrap();
+                    serde_json::from_str::<Value>(&line).unwrap()
+                } else {
+                    server.handle_json_value(renewed_request).await
+                };
+                assert_eq!(response["id"], 11);
+                assert_eq!(decode_tool_payload(&response).unwrap()["success"], true);
+                assert!(start.elapsed() < std::time::Duration::from_secs(2),
+                    "lease waited for the embedding watchdog: {:?}", start.elapsed());
+                release_tx.send(()).unwrap();
+                if let Some(search_task) = search_task {
+                    assert!(search_task.await.unwrap().get("result").is_some());
+                }
+                write.shutdown().await.unwrap();
+                if stdio {
+                    let line = responses.next_line().await.unwrap().unwrap();
+                    assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], 10);
+                }
+                assert!(responses.next_line().await.unwrap().is_none());
+                transport_task.await.unwrap();
+            }).await
+        });
+        let _ = stop_tx.send(());
+        watchdog.join().unwrap();
+        outcome.unwrap();
+    }
+
+    #[test]
+    fn stdio_lease_overtakes_blocking_embedding_on_one_worker() {
+        exercise_lease_during_blocking_embedding(true);
+    }
+
+    #[test]
+    fn dispatch_lease_survives_blocking_embedding_on_one_worker() {
+        exercise_lease_during_blocking_embedding(false);
+    }
+
     #[tokio::test]
     async fn serve_transport_processes_tool_calls_and_ignores_notifications() {
         let harness = test_harness().await;
@@ -10219,12 +10568,13 @@ mod tests {
         client_reader.read_to_string(&mut output).await.unwrap();
         task.await.unwrap();
 
-        let lines = output.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 2);
-        let initialize: Value = serde_json::from_str(lines[0]).unwrap();
-        let status: Value = serde_json::from_str(lines[1]).unwrap();
+        let responses = output.lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()).collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        let initialize = responses.iter().find(|response| response["id"] == 1).unwrap();
+        let status = responses.iter().find(|response| response["id"] == 2).unwrap();
         assert_eq!(initialize["result"]["protocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(decode_tool_payload(&status).unwrap()["total_drawers"], 2);
+        assert_eq!(decode_tool_payload(status).unwrap()["total_drawers"], 2);
     }
 
     // Observe completed real storage passes without adding a production test hook.
@@ -13098,6 +13448,9 @@ mod tests {
         // Replace federation with the mock router (only if it has remotes).
         runtime.federation = if router.has_remotes() { Some(router) } else { None };
         let server = McpServer {
+            memory_executor: MemoryExecutor::new().unwrap(),
+            leases: Arc::new(LeaseRuntime::from_runtime(&runtime)),
+            lease_queue_limit: Arc::new(Semaphore::new(8)),
             runtime: Arc::new(Mutex::new(runtime)),
             queue_limit: Arc::new(Semaphore::new(8)),
         };
