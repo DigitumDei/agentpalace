@@ -4,11 +4,11 @@ use std::io::{BufRead, BufReader as StdBufReader, Write};
 use std::process::{Command, Stdio};
 
 use agentpalace_config::{
-    FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig, AgentPalaceConfig,
+    AgentPalaceConfig, FederationRuntimeConfig, LowCpuRuntimeConfig, MaintenanceRuntimeConfig,
     ServerRuntimeConfig,
 };
 use agentpalace_core::EmbeddingProfile;
-use agentpalace_mcp::{DeterministicStubProvider, McpServer, serve_transport};
+use agentpalace_mcp::{serve_transport, DeterministicStubProvider, McpServer};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -55,18 +55,17 @@ async fn server_handles_initialize_and_tools_list_over_transport() {
     client_reader.read_to_string(&mut output).await.unwrap();
     task.await.unwrap();
 
-    let lines = output.lines().collect::<Vec<_>>();
-    let initialize: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    let tools: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let responses: Vec<serde_json::Value> =
+        output.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    let initialize = responses.iter().find(|response| response["id"] == 1).unwrap();
+    let tools = responses.iter().find(|response| response["id"] == 2).unwrap();
 
     assert_eq!(initialize["result"]["protocolVersion"], "2024-11-05");
-    assert!(
-        tools["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tool| tool["name"] == "agentpalace_status")
-    );
+    assert!(tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "agentpalace_status"));
 }
 
 #[tokio::test]
@@ -108,12 +107,19 @@ async fn server_handles_embedding_backed_tool_calls_over_transport() {
         serve_transport(&server, BufReader::new(reader_half), writer_half).await.unwrap();
     });
 
-    let (mut client_reader, mut client_writer) = tokio::io::split(client);
-    client_writer.write_all(input.as_bytes()).await.unwrap();
-    client_writer.shutdown().await.unwrap();
-
+    let (client_reader, mut client_writer) = tokio::io::split(client);
+    let mut client_reader = BufReader::new(client_reader);
     let mut output = String::new();
-    client_reader.read_to_string(&mut output).await.unwrap();
+    for request in input.lines() {
+        client_writer.write_all(format!("{request}\n").as_bytes()).await.unwrap();
+        let mut response = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut client_reader, &mut response).await.unwrap();
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let request: serde_json::Value = serde_json::from_str(request).unwrap();
+        assert_eq!(value["id"], request["id"]);
+        output.push_str(&response);
+    }
+    client_writer.shutdown().await.unwrap();
     task.await.unwrap();
 
     let lines = output.lines().collect::<Vec<_>>();
@@ -177,10 +183,14 @@ fn compiled_binary_serves_stdio_with_stub_embeddings() {
     reader.read_line(&mut initialize).unwrap();
     reader.read_line(&mut status).unwrap();
 
-    let initialize: serde_json::Value = serde_json::from_str(initialize.trim()).unwrap();
-    let status: serde_json::Value = serde_json::from_str(status.trim()).unwrap();
+    let responses: [serde_json::Value; 2] = [
+        serde_json::from_str(initialize.trim()).unwrap(),
+        serde_json::from_str(status.trim()).unwrap(),
+    ];
+    let initialize = responses.iter().find(|response| response["id"] == 1).unwrap();
+    let status = responses.iter().find(|response| response["id"] == 2).unwrap();
     assert_eq!(initialize["result"]["protocolVersion"], "2024-11-05");
-    assert_eq!(agentpalace_mcp::decode_tool_payload(&status).unwrap()["total_drawers"], 0);
+    assert_eq!(agentpalace_mcp::decode_tool_payload(status).unwrap()["total_drawers"], 0);
 
     let exit = child.wait().unwrap();
     assert!(exit.success());
@@ -203,6 +213,9 @@ fn compiled_binary_falls_back_for_missing_bound_lineage_and_explains_creation() 
         .spawn()
         .unwrap();
 
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = StdBufReader::new(stdout);
+    let mut created = String::new();
     {
         let mut stdin = child.stdin.take().unwrap();
         writeln!(
@@ -210,6 +223,14 @@ fn compiled_binary_falls_back_for_missing_bound_lineage_and_explains_creation() 
             "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"agentpalace_lineage_set\",\"arguments\":{{\"lineage_id\":\"default-lineage\",\"display_name\":\"Default lineage\",\"description\":\"The palace default for fallback testing.\",\"expected_revision\":0,\"set_default\":true,\"actor\":\"stdio-test\"}}}}}}"
         )
         .unwrap();
+        // The identity read depends on this mutation, so await its acknowledgement.
+        reader.read_line(&mut created).unwrap();
+        let acknowledgement: serde_json::Value = serde_json::from_str(created.trim()).unwrap();
+        assert_eq!(acknowledgement["id"], 1);
+        assert_eq!(
+            agentpalace_mcp::decode_tool_payload(&acknowledgement).unwrap()["success"],
+            true
+        );
         writeln!(
             stdin,
             "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"agentpalace_identity_packet\",\"arguments\":{{}}}}}}"
@@ -217,14 +238,12 @@ fn compiled_binary_falls_back_for_missing_bound_lineage_and_explains_creation() 
         .unwrap();
     }
 
-    let stdout = child.stdout.take().unwrap();
-    let mut reader = StdBufReader::new(stdout);
-    let mut created = String::new();
     let mut response = String::new();
-    reader.read_line(&mut created).unwrap();
     reader.read_line(&mut response).unwrap();
     let created: serde_json::Value = serde_json::from_str(created.trim()).unwrap();
     let response: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+    assert_eq!(created["id"], 1);
+    assert_eq!(response["id"], 2);
     assert_eq!(agentpalace_mcp::decode_tool_payload(&created).unwrap()["success"], true);
     let packet = agentpalace_mcp::decode_tool_payload(&response).unwrap();
     assert_eq!(packet["lineage"]["lineage_id"], "default-lineage");
@@ -305,10 +324,14 @@ fn compiled_binary_honors_config_dir_env_var_for_default_palace_location() {
     reader.read_line(&mut initialize).unwrap();
     reader.read_line(&mut status).unwrap();
 
-    let initialize: serde_json::Value = serde_json::from_str(initialize.trim()).unwrap();
-    let status: serde_json::Value = serde_json::from_str(status.trim()).unwrap();
+    let responses: [serde_json::Value; 2] = [
+        serde_json::from_str(initialize.trim()).unwrap(),
+        serde_json::from_str(status.trim()).unwrap(),
+    ];
+    let initialize = responses.iter().find(|response| response["id"] == 1).unwrap();
+    let status = responses.iter().find(|response| response["id"] == 2).unwrap();
     assert_eq!(initialize["result"]["protocolVersion"], "2024-11-05");
-    assert_eq!(agentpalace_mcp::decode_tool_payload(&status).unwrap()["total_drawers"], 0);
+    assert_eq!(agentpalace_mcp::decode_tool_payload(status).unwrap()["total_drawers"], 0);
 
     let exit = child.wait().unwrap();
     assert!(exit.success());

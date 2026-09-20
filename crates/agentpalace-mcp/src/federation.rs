@@ -21,6 +21,7 @@ use tokio::task::JoinSet;
 
 use crate::{McpError, ToolError, ToolResult};
 
+#[derive(Clone)]
 pub struct FederationRouter {
     pub rules: FederationRuntimeConfig,
     pub remotes: BTreeMap<String, Arc<dyn RemoteApi>>,

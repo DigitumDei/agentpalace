@@ -160,10 +160,13 @@ and third-party notices. Refresh it when upgrading the bundled runtime.
 
 ## Claude PR Review Completion
 
-The Claude review workflow reviews the current PR commit, including draft
-checkpoints and commits with earlier Claude comments. It uses an explicit prompt
-rather than the upstream code-review plugin, whose draft and existing-comment
-skip rules do not fit checkpoint delivery.
+The Claude review workflow skips draft PRs so checkpoint pushes can run CI without
+automatic review comments. Marking a PR ready for review triggers a review of the
+current commit; subsequent pushes and reopen events trigger review while the PR is
+not a draft, including commits with earlier Claude comments. It uses an explicit
+prompt rather than the upstream code-review plugin so earlier comments do not
+prevent review of a new commit. Explicit `@claude` requests remain available through
+the separate Claude workflow.
 
 The agent obtains the diff through `gh pr diff` and inspects source using
 Read, Grep, and Glob. Its existing comment tools publish findings and a final
