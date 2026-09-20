@@ -45,6 +45,23 @@ Default effective degraded limits:
 - search results capped at `3`
 - wake-up drawers capped at `4`
 
+
+MCP applies the effective `queue_limit` independently to two admission lanes:
+`agentpalace_task_get`, `agentpalace_task_claim`, and `agentpalace_task_renew` share
+the lease lane; all other tools share the memory lane. Up to `2 × queue_limit`
+tool calls can therefore be admitted at once (up to 16 with the degraded cap of
+8). A full lane rejects excess calls without consuming the other lane's capacity.
+Memory execution remains serialized on one dedicated thread per MCP server,
+shared by server clones. This additional thread keeps synchronous embedding work
+off the Tokio workers and does not consume `max_blocking_threads`, so a single
+async worker and a single blocking-pool thread remain supported. The thread exits
+when the server and its outstanding work are dropped.
+
+Stdio reads requests concurrently and serializes complete JSON response lines;
+responses may arrive out of request order and must be matched by JSON-RPC `id`.
+EOF drains admitted requests before closing output. Lease checks can complete
+while an earlier memory request is still running.
+
 ## Recommended Operating Pattern
 
 1. Keep `degraded_mode = true` on the smallest hosts unless measurements on the target machine justify relaxing it.
