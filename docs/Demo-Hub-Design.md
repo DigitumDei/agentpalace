@@ -237,7 +237,10 @@ resource/permission ceiling. Never ask users to approve unsolicited codes.
 Reuse the same token storage, refresh, revocation, and retry rules for both
 flows. Tokens belong to the initiating Linux/WSL process, not the browser's
 Windows account. Device login does not imply a Linux credential store is
-available: retain the explicit secure-store/in-memory behavior below.
+available: retain the explicit secure-store/in-memory behavior below. The
+CLI's default owner-only credential file lives under the AgentPalace config
+home, while embedding applications may inject an OS credential backend;
+`allow_in_memory` remains an explicit volatile outcome.
 
 ### Tokens, permissions, and retries
 

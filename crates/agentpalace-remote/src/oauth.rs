@@ -5,6 +5,7 @@
 //! protected resources. Token persistence is injected through [`TokenStore`]; the default
 //! in-memory store is explicit and is never serialized or logged.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -63,7 +64,7 @@ pub struct AuthorizationServerMetadata {
     pub device_authorization_endpoint: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct DeviceAuthorizationResponse {
     device_code: String,
     user_code: String,
@@ -97,7 +98,7 @@ pub(crate) fn resource_metadata_from_challenge(value: &str) -> Option<String> {
 }
 
 /// Access and rotating refresh credentials. This type intentionally has no `Display` impl.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthSession {
     pub access_token: String,
     #[serde(default)]
@@ -129,6 +130,28 @@ pub struct InMemoryTokenStore(Mutex<Option<OAuthSession>>);
 #[derive(Debug, Default)]
 pub struct UnavailableTokenStore;
 
+/// A local persistent store for CLI/native clients. The file is created with owner-only
+/// permissions where the platform supports them and is never included in config or output.
+/// Applications with a stronger OS credential facility should inject that facility instead.
+#[derive(Debug)]
+pub struct FileTokenStore {
+    path: PathBuf,
+    lock: Mutex<()>,
+}
+
+impl FileTokenStore {
+    /// Create a store at `path`, creating its parent directory on first save.
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self { path: path.as_ref().to_path_buf(), lock: Mutex::new(()) }
+    }
+
+    async fn read_all(&self) -> Vec<OAuthSession> {
+        let _guard = self.lock.lock().await;
+        let Ok(bytes) = std::fs::read(&self.path) else { return Vec::new() };
+        serde_json::from_slice(&bytes).unwrap_or_default()
+    }
+}
+
 #[async_trait::async_trait]
 impl TokenStore for UnavailableTokenStore {
     async fn load(&self, _resource: &str, _issuer: &str, _client_id: &str, _account: Option<&str>) -> Option<OAuthSession> { None }
@@ -153,6 +176,36 @@ impl TokenStore for InMemoryTokenStore {
         if guard.as_ref().is_some_and(|s| s.resource == resource && s.issuer == issuer && s.client_id == client_id && s.account.as_deref() == account) {
             *guard = None;
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenStore for FileTokenStore {
+    async fn load(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Option<OAuthSession> {
+        self.read_all().await.into_iter().find(|session| session.resource == resource && session.issuer == issuer && session.client_id == client_id && session.account.as_deref() == account)
+    }
+
+    async fn save(&self, session: OAuthSession) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        let mut sessions: Vec<OAuthSession> = std::fs::read(&self.path).ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+        sessions.retain(|current| !(current.resource == session.resource && current.issuer == session.issuer && current.client_id == session.client_id && current.account.as_deref() == session.account.as_deref()));
+        sessions.push(session);
+        let body = serde_json::to_vec(&sessions).map_err(|_| "OAuth credential store could not be encoded".to_owned())?;
+        if let Some(parent) = self.path.parent() { std::fs::create_dir_all(parent).map_err(|_| "OAuth credential store directory could not be created".to_owned())?; }
+        let temporary = self.path.with_extension("tmp");
+        std::fs::write(&temporary, body).map_err(|_| "OAuth credential store could not be written".to_owned())?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&temporary, std::os::unix::fs::PermissionsExt::from_mode(0o600)).map_err(|_| "OAuth credential store permissions could not be set".to_owned())?;
+        std::fs::rename(&temporary, &self.path).map_err(|_| "OAuth credential store could not be committed".to_owned())
+    }
+
+    async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) {
+        let _guard = self.lock.lock().await;
+        let Ok(bytes) = std::fs::read(&self.path) else { return };
+        let mut sessions: Vec<OAuthSession> = serde_json::from_slice(&bytes).unwrap_or_default();
+        sessions.retain(|session| !(session.resource == resource && session.issuer == issuer && session.client_id == client_id && session.account.as_deref() == account));
+        if let Ok(body) = serde_json::to_vec(&sessions) { let _ = std::fs::write(&self.path, body); }
     }
 }
 
@@ -199,7 +252,13 @@ pub fn validate_metadata(resource: &ProtectedResourceMetadata, server: &Authoriz
     let _ = validate_oauth_url(&server.authorization_endpoint, configured_origin, allow_loopback_demo)?;
     let _ = validate_oauth_url(&server.token_endpoint, configured_origin, allow_loopback_demo)?;
     if let Some(endpoint) = &server.revocation_endpoint { let _ = validate_oauth_url(endpoint, configured_origin, allow_loopback_demo)?; }
-    if let Some(endpoint) = &server.device_authorization_endpoint { let _ = validate_oauth_url(endpoint, configured_origin, allow_loopback_demo)?; }
+    if let Some(endpoint) = &server.device_authorization_endpoint {
+        let device_endpoint = reqwest::Url::parse(endpoint).map_err(|_| "invalid device authorization endpoint".to_owned())?;
+        if issuer.origin() != device_endpoint.origin() {
+            return Err("device authorization endpoint is unrelated to the discovered issuer".to_owned());
+        }
+        let _ = validate_oauth_url(endpoint, configured_origin, allow_loopback_demo)?;
+    }
     Ok(())
 }
 
@@ -461,6 +520,9 @@ pub async fn revoke(http: &reqwest::Client, metadata: &AuthorizationServerMetada
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, body::Body, extract::State, http::{StatusCode, Uri}, response::Response, routing::post};
+    use std::collections::VecDeque;
+    use std::sync::Arc;
     #[test]
     fn pkce_is_s256_and_state_is_unpredictable() {
         let (verifier, challenge) = new_pkce_pair();
@@ -508,6 +570,20 @@ mod tests {
         };
         assert!(validate_metadata(&protected, &server, &resource, &resource, false).is_err());
     }
+
+    #[test]
+    fn device_endpoint_must_share_issuer_origin() {
+        let resource = reqwest::Url::parse("https://hub.example").expect("test URL");
+        let protected = ProtectedResourceMetadata { resource: resource.to_string(), authorization_servers: vec!["https://issuer.example".to_owned()] };
+        let server = AuthorizationServerMetadata {
+            issuer: "https://issuer.example".to_owned(),
+            authorization_endpoint: "https://issuer.example/authorize".to_owned(),
+            token_endpoint: "https://issuer.example/token".to_owned(),
+            revocation_endpoint: None,
+            device_authorization_endpoint: Some("https://unrelated.example/device".to_owned()),
+        };
+        assert!(validate_metadata(&protected, &server, &resource, &resource, false).is_err());
+    }
     #[test]
     fn non_loopback_http_is_rejected() {
         let origin = reqwest::Url::parse("https://hub.example").expect("test URL");
@@ -533,5 +609,101 @@ mod tests {
         assert!(store.load("https://resource", "https://issuer", "client", None).await.is_some());
         assert!(store.load("https://other", "https://issuer", "client", None).await.is_none());
         assert!(UnavailableTokenStore.save(session).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn file_store_survives_client_process_boundaries_and_clears() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("oauth_tokens.json");
+        let session = OAuthSession { access_token: "access".to_owned(), refresh_token: Some("refresh".to_owned()), expires_at: None, resource: "https://resource".to_owned(), issuer: "https://issuer".to_owned(), client_id: "client".to_owned(), account: None };
+        FileTokenStore::new(&path).save(session.clone()).await.expect("file store");
+        let other = OAuthSession { issuer: "https://other-issuer".to_owned(), access_token: "other-access".to_owned(), ..session.clone() };
+        FileTokenStore::new(&path).save(other).await.expect("second issuer");
+        assert_eq!(FileTokenStore::new(&path).load("https://resource", "https://issuer", "client", None).await.map(|s| s.access_token), Some("access".to_owned()));
+        FileTokenStore::new(&path).clear("https://resource", "https://issuer", "client", None).await;
+        assert!(FileTokenStore::new(&path).load("https://resource", "https://issuer", "client", None).await.is_none());
+        assert_eq!(FileTokenStore::new(&path).load("https://resource", "https://other-issuer", "client", None).await.map(|s| s.access_token), Some("other-access".to_owned()));
+    }
+
+    async fn device_server(responses: Vec<(StatusCode, &'static str)>) -> (String, Arc<Mutex<VecDeque<(StatusCode, &'static str)>>>, tokio::task::JoinHandle<()>) {
+        let state = Arc::new(Mutex::new(responses.into_iter().collect::<VecDeque<_>>()));
+        let app = Router::new().route("/device", post(mock_device)).route("/token", post(mock_device)).with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("mock listener");
+        let address = listener.local_addr().expect("mock address");
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.expect("mock server"); });
+        (format!("http://{address}"), state, task)
+    }
+
+    async fn mock_device(State(state): State<Arc<Mutex<VecDeque<(StatusCode, &'static str)>>>>, _uri: Uri) -> Response<Body> {
+        let body = state.lock().await.pop_front().unwrap_or((StatusCode::INTERNAL_SERVER_ERROR, "{}"));
+        Response::builder().status(body.0).header("content-type", "application/json").body(Body::from(body.1)).expect("mock response")
+    }
+
+    fn device_metadata(origin: &str) -> AuthorizationServerMetadata {
+        AuthorizationServerMetadata { issuer: origin.to_owned(), authorization_endpoint: format!("{origin}/authorize"), token_endpoint: format!("{origin}/token"), revocation_endpoint: None, device_authorization_endpoint: Some(format!("{origin}/device")) }
+    }
+
+    fn device_config(timeout: u64) -> OAuthConfig {
+        OAuthConfig { client_id: "client".to_owned(), account: None, allow_in_memory: true, allow_loopback_demo: true, login_mode: OAuthLoginMode::Device, token_store: None, login_timeout_seconds: timeout }
+    }
+
+    #[tokio::test]
+    async fn device_login_polls_pending_then_succeeds_without_returning_device_code() {
+        let (origin, _state, task) = device_server(vec![
+            (StatusCode::OK, r#"{"device_code":"private-device-code","user_code":"ABCD-EFGH","verification_uri":"https://issuer.example/verify","expires_in":30,"interval":1}"#),
+            (StatusCode::BAD_REQUEST, r#"{"error":"authorization_pending"}"#),
+            (StatusCode::OK, r#"{"access_token":"access-token","refresh_token":"refresh-token","expires_in":60}"#),
+        ]).await;
+        let result = device_login(&reqwest::Client::new(), &device_metadata(&origin), &device_config(5), &origin).await.expect("device login");
+        assert_eq!(result.access_token, "access-token");
+        assert_eq!(result.refresh_token.as_deref(), Some("refresh-token"));
+        assert!(!format!("{result:?}").contains("private-device-code"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn device_login_reports_denial_and_reused_code() {
+        for error in ["access_denied", "invalid_grant"] {
+            let (origin, _state, task) = device_server(vec![
+                (StatusCode::OK, r#"{"device_code":"private","user_code":"ABCD","verification_uri":"https://issuer.example/verify","expires_in":30,"interval":1}"#),
+                (StatusCode::BAD_REQUEST, if error == "access_denied" { r#"{"error":"access_denied"}"# } else { r#"{"error":"invalid_grant"}"# }),
+            ]).await;
+            let result = device_login(&reqwest::Client::new(), &device_metadata(&origin), &device_config(5), &origin).await;
+            let message = result.expect_err("device login should fail").to_string();
+            assert!(!message.contains("private"));
+            assert!(message.contains(if error == "access_denied" { "denied" } else { "rejected" }));
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn device_login_bounds_slow_down_and_expiry() {
+        let (origin, state, task) = device_server(vec![
+            (StatusCode::OK, r#"{"device_code":"private","user_code":"ABCD","verification_uri":"https://issuer.example/verify","expires_in":30,"interval":1}"#),
+            (StatusCode::BAD_REQUEST, r#"{"error":"slow_down"}"#),
+        ]).await;
+        let result = device_login(&reqwest::Client::new(), &device_metadata(&origin), &device_config(1), &origin).await;
+        assert!(result.expect_err("short device timeout").contains("expired"));
+        assert_eq!(state.lock().await.len(), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn device_login_rejects_issuers_without_device_support() {
+        let metadata = AuthorizationServerMetadata { issuer: "https://issuer.example".to_owned(), authorization_endpoint: "https://issuer.example/authorize".to_owned(), token_endpoint: "https://issuer.example/token".to_owned(), revocation_endpoint: None, device_authorization_endpoint: None };
+        let error = device_login(&reqwest::Client::new(), &metadata, &device_config(1), "https://issuer.example").await.expect_err("unsupported device flow");
+        assert!(error.contains("does not advertise device authorization"));
+    }
+
+    #[tokio::test]
+    async fn device_login_bounds_transient_network_retry() {
+        let (origin, _state, task) = device_server(vec![
+            (StatusCode::OK, r#"{"device_code":"private","user_code":"ABCD","verification_uri":"https://issuer.example/verify","expires_in":30,"interval":1}"#),
+        ]).await;
+        let mut metadata = device_metadata(&origin);
+        metadata.token_endpoint = "http://127.0.0.1:1/token".to_owned();
+        let error = device_login(&reqwest::Client::new(), &metadata, &device_config(3), &origin).await.expect_err("network retry should expire");
+        assert!(error.contains("expired"));
+        task.abort();
     }
 }

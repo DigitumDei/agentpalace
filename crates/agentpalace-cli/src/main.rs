@@ -5,6 +5,7 @@ use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use agentpalace_config::{
@@ -25,7 +26,7 @@ use agentpalace_ingest::{
     prepare_project_batch_with_config, project_branch_source_prefix,
     project_canonical_source_prefix, project_root_relative, wing_kind_source_prefix,
 };
-use agentpalace_remote::{OAuthConfig, RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
+use agentpalace_remote::{FileTokenStore, InMemoryTokenStore, OAuthConfig, RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
 use agentpalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
 use agentpalace_server::{TokenRegistry, build_router};
 use agentpalace_storage::{
@@ -725,6 +726,7 @@ fn execute_auth(
     let oauth = remote.oauth.as_ref().ok_or_else(|| {
         clap::Error::raw(clap::error::ErrorKind::InvalidValue, format!("remote `{remote_name}` has no OAuth configuration"))
     })?;
+    let token_store = cli_oauth_store(context, oauth.allow_in_memory).map_err(config_error)?;
     let client = RemoteClient::new(RemoteEndpoint {
         name: remote.name.clone(),
         base_url: remote.url.clone(),
@@ -735,7 +737,7 @@ fn execute_auth(
             allow_in_memory: oauth.allow_in_memory,
             allow_loopback_demo: oauth.allow_loopback_demo,
             login_mode: oauth.login_mode,
-            token_store: None,
+            token_store: Some(token_store),
             login_timeout_seconds: oauth.login_timeout_seconds,
         }),
         timeout: remote.timeout,
@@ -1905,7 +1907,7 @@ fn execute_remote_mine(
             allow_in_memory: oauth.allow_in_memory,
             allow_loopback_demo: oauth.allow_loopback_demo,
             login_mode: oauth.login_mode,
-            token_store: None,
+            token_store: Some(cli_oauth_store(context, oauth.allow_in_memory).map_err(config_error)?),
             login_timeout_seconds: oauth.login_timeout_seconds,
         }),
         timeout: resolved_remote.timeout,
@@ -2702,6 +2704,17 @@ fn load_runtime_config(
         config.palace_path = palace_path.to_path_buf();
     }
     Ok(config)
+}
+
+fn cli_oauth_store(
+    context: &CliContext,
+    allow_in_memory: bool,
+) -> Result<agentpalace_remote::SharedTokenStore, agentpalace_core::AgentPalaceError> {
+    if allow_in_memory {
+        return Ok(Arc::new(InMemoryTokenStore::default()));
+    }
+    let paths = ConfigLoader::init_default(context.config_base_dir.as_deref())?;
+    Ok(Arc::new(FileTokenStore::new(paths.base_dir.join("oauth_tokens.json"))))
 }
 
 fn write_global_config_override(

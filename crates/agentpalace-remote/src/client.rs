@@ -453,11 +453,7 @@ impl RemoteClient {
             return Ok(());
         }
         let session = crate::browser_login(&self.http, metadata, config, resource).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
-        *self.token.lock().await = Some(session.access_token.clone());
-        *self.oauth_session.lock().await = Some(session);
-        let retained = self.oauth_session.lock().await.clone().ok_or_else(|| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: "OAuth login session was not retained".to_owned(), resource_metadata: None })?;
-        self.token_store.save(retained).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
-        Ok(())
+        self.commit_session(session).await
     }
 
     /// Discover metadata from a preserved RFC 9728 challenge and perform one explicit browser
@@ -484,11 +480,26 @@ impl RemoteClient {
     async fn login_device(&self, metadata: &crate::AuthorizationServerMetadata, resource: &str) -> Result<()> {
         let config = self.oauth.as_ref().ok_or_else(|| RemoteError::InvalidConfig { remote: self.name.clone(), message: "OAuth login requested for a bearer-token remote".to_owned() })?;
         let _guard = self.login_lock.lock().await;
+        if self.oauth_session.lock().await.as_ref().is_some_and(|session| {
+            session.resource == resource
+                && session.issuer == metadata.issuer
+                && session.client_id == config.client_id
+                && session.account.as_deref() == config.account.as_deref()
+        }) {
+            return Ok(());
+        }
         let session = crate::device_login(&self.http, metadata, config, resource).await
             .map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
+        self.commit_session(session).await
+    }
+
+    async fn commit_session(&self, session: crate::OAuthSession) -> Result<()> {
+        // Persist first. A failed store must not leave a usable in-memory grant that
+        // contradicts the outcome reported to the caller.
+        self.token_store.save(session.clone()).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
         *self.token.lock().await = Some(session.access_token.clone());
-        *self.oauth_session.lock().await = Some(session.clone());
-        self.token_store.save(session).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })
+        *self.oauth_session.lock().await = Some(session);
+        Ok(())
     }
 
     /// Load a previously authorized grant for the exact resource/issuer/client/account tuple.
@@ -514,11 +525,7 @@ impl RemoteClient {
                 return Err(RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None });
             }
         };
-        *self.token.lock().await = Some(session.access_token.clone());
-        *self.oauth_session.lock().await = Some(session);
-        let session = self.oauth_session.lock().await.clone().ok_or_else(|| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: "refreshed OAuth session was not retained".to_owned(), resource_metadata: None })?;
-        self.token_store.save(session).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
-        Ok(())
+        self.commit_session(session).await
     }
 
     /// Revoke and forget the current grant. Local credentials are cleared even when revocation
