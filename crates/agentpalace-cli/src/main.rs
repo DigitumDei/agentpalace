@@ -729,8 +729,12 @@ fn execute_auth(
             format!("remote `{remote_name}` has no OAuth configuration"),
         ));
     }
-    let client = RemoteClient::new(cli_remote_endpoint(context, remote).map_err(config_error)?)
-        .map_err(|error| clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string()))?;
+    let client = cli_remote_client(context, remote).map_err(|error| match error {
+        CliRemoteClientError::Config(error) => config_error(error),
+        CliRemoteClientError::Client(error) => {
+            clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string())
+        }
+    })?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()
         .map_err(|error| clap::Error::raw(clap::error::ErrorKind::Io, error.to_string()))?;
     let result = runtime.block_on(async {
@@ -1888,11 +1892,11 @@ fn execute_remote_mine(
     }
 
     // ── 5. Build the remote client ───────────────────────────────────────────
-    let endpoint = cli_remote_endpoint(context, resolved_remote).map_err(config_error)?;
-    let client = match RemoteClient::new(endpoint) {
+    let client = match cli_remote_client(context, resolved_remote) {
         Ok(c) => c,
-        Err(e) => {
-            let msg = format!("failed to build remote client for '{}': {e}\n", remote_name);
+        Err(CliRemoteClientError::Config(error)) => return Err(config_error(error)),
+        Err(CliRemoteClientError::Client(error)) => {
+            let msg = format!("failed to build remote client for '{}': {error}\n", remote_name);
             let output = if dual_write {
                 format!("  Remote replication: failed — {msg}")
             } else {
@@ -2728,6 +2732,34 @@ fn cli_remote_endpoint(
     })
 }
 
+enum CliRemoteClientError {
+    Config(agentpalace_core::AgentPalaceError),
+    Client(RemoteError),
+}
+
+impl std::fmt::Display for CliRemoteClientError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(error) => error.fmt(formatter),
+            Self::Client(error) => error.fmt(formatter),
+        }
+    }
+}
+
+/// Construct every CLI remote client from the CLI-owned endpoint.
+///
+/// Keeping the `RemoteClient::new` call beside `cli_remote_endpoint` makes it
+/// difficult for a new CLI command to accidentally fall back to the remote
+/// crate's unavailable/default store instead of the initiating process's
+/// configured persistent or explicitly volatile store.
+fn cli_remote_client(
+    context: &CliContext,
+    remote: &agentpalace_config::ResolvedRemote,
+) -> Result<RemoteClient, CliRemoteClientError> {
+    let endpoint = cli_remote_endpoint(context, remote).map_err(CliRemoteClientError::Config)?;
+    RemoteClient::new(endpoint).map_err(CliRemoteClientError::Client)
+}
+
 fn write_global_config_override(
     paths: &ResolvedPaths,
     palace_path: &Path,
@@ -3252,6 +3284,27 @@ mod tests {
         assert_eq!(endpoint.base_url, remote.url);
         assert_eq!(endpoint.token, remote.token);
         assert!(endpoint.oauth.is_none(), "non-OAuth remotes must not receive a token store");
+        assert!(!config_root.join("oauth_tokens.json").exists());
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn cli_remote_client_constructs_oauth_and_static_paths_through_shared_builder() {
+        let config_root = temp_config_root("client-builder");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let oauth_client = cli_remote_client(&context, &oauth_test_remote(false)).unwrap();
+        assert_eq!(oauth_client.base_url(), "https://hub.example/");
+
+        let static_remote = agentpalace_config::ResolvedRemote {
+            name: "offline".to_owned(),
+            url: "https://hub.example".to_owned(),
+            token: Some("static-token".to_owned()),
+            oauth: None,
+            timeout: Duration::from_secs(5),
+        };
+        let static_client = cli_remote_client(&context, &static_remote).unwrap();
+        assert_eq!(static_client.base_url(), "https://hub.example/");
         assert!(!config_root.join("oauth_tokens.json").exists());
         remove_dir_all_if_exists(&config_root);
     }
