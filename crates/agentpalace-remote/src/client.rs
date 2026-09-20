@@ -1174,7 +1174,7 @@ mod tests {
             (session.resource == resource && session.issuer == issuer && session.client_id == client_id && session.account.as_deref() == account).then_some(session)
         }
 
-        async fn save(&self, _session: crate::OAuthSession) -> Result<(), String> {
+        async fn save(&self, _session: crate::OAuthSession) -> std::result::Result<(), String> {
             Err("test credential store failure".to_owned())
         }
 
