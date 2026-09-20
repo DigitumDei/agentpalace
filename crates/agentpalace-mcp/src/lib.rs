@@ -14987,7 +14987,7 @@ mod tests {
             coordination_default_wing: None,
         };
 
-        let harness = test_harness_with_federation(federation).await;
+        let harness = test_harness_with_manual_replication(federation).await;
 
         // Queue an add under one spelling of the predicate...
         let add_resp = harness
@@ -15087,7 +15087,7 @@ mod tests {
             coordination: BTreeMap::new(),
             coordination_default_wing: None,
         };
-        let harness = test_harness_with_federation(federation).await;
+        let harness = test_harness_with_manual_replication(federation).await;
 
         let add_args = json!({
             "subject": "ReusePerson",
@@ -15425,6 +15425,29 @@ mod tests {
             "the age safeguard must not block activation of committed effects, even when the \
              intent is fresh"
         );
+    }
+
+    // These tests claim and acknowledge the outbox themselves. Do not start a
+    // second consumer that can lease or retry the rows before the assertions.
+    async fn test_harness_with_manual_replication(federation: FederationRuntimeConfig) -> TestHarness {
+        let tempdir = TempDir::new().unwrap();
+        let palace_path = tempdir.path().join("palace");
+        let config = AgentPalaceConfig { federation, ..make_base_config(&palace_path, &tempdir) };
+        let queue_limit = config.low_cpu.effective_queue_limit().min(Semaphore::MAX_PERMITS);
+        let runtime = McpRuntime::new(
+            config, DeterministicStubProvider::new(EmbeddingProfile::Balanced), None,
+        ).await.unwrap();
+        let leases = Arc::new(LeaseRuntime::from_runtime(&runtime));
+        let server = McpServer {
+            memory_executor: MemoryExecutor::new().unwrap(),
+            runtime: Arc::new(Mutex::new(runtime)),
+            leases,
+            lease_queue_limit: Arc::new(Semaphore::new(queue_limit)),
+            queue_limit: Arc::new(Semaphore::new(queue_limit)),
+        };
+        seed_drawers(&server).await;
+        seed_knowledge_graph(&server).await;
+        TestHarness { _tempdir: tempdir, server }
     }
 
     async fn test_harness_with_federation(federation: FederationRuntimeConfig) -> TestHarness {
