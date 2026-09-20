@@ -2737,6 +2737,17 @@ enum CliRemoteClientError {
     Client(RemoteError),
 }
 
+impl std::fmt::Debug for CliRemoteClientError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keep panic/test diagnostics from accidentally formatting response bodies or
+        // other data that may become sensitive as the wrapped errors evolve.
+        match self {
+            Self::Config(_) => formatter.write_str("CliRemoteClientError::Config(..)"),
+            Self::Client(_) => formatter.write_str("CliRemoteClientError::Client(..)"),
+        }
+    }
+}
+
 impl std::fmt::Display for CliRemoteClientError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3217,7 +3228,14 @@ mod tests {
             &session.client_id,
             session.account.as_deref(),
         ));
-        assert_eq!(loaded, Some(session));
+        let loaded = loaded.expect("persistent CLI store should reload the saved session");
+        assert_eq!(loaded.access_token, session.access_token);
+        assert_eq!(loaded.refresh_token, session.refresh_token);
+        assert_eq!(loaded.expires_at, session.expires_at);
+        assert_eq!(loaded.resource, session.resource);
+        assert_eq!(loaded.issuer, session.issuer);
+        assert_eq!(loaded.client_id, session.client_id);
+        assert_eq!(loaded.account, session.account);
 
         let path = config_root.join("oauth_tokens.json");
         assert!(path.is_file(), "persistent CLI store should create its credential file");
