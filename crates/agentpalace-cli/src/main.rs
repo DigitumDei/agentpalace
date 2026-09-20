@@ -1899,19 +1899,26 @@ fn execute_remote_mine(
     }
 
     // ── 5. Build the remote client ───────────────────────────────────────────
+    let oauth = match resolved_remote.oauth.as_ref() {
+        Some(oauth) => {
+            let token_store = cli_oauth_store(context, oauth.allow_in_memory).map_err(config_error)?;
+            Some(OAuthConfig {
+                client_id: oauth.client_id.clone(),
+                account: oauth.account.clone(),
+                allow_in_memory: oauth.allow_in_memory,
+                allow_loopback_demo: oauth.allow_loopback_demo,
+                login_mode: oauth.login_mode,
+                token_store: Some(token_store),
+                login_timeout_seconds: oauth.login_timeout_seconds,
+            })
+        }
+        None => None,
+    };
     let endpoint = RemoteEndpoint {
         name: remote_name.to_owned(),
         base_url: remote_url.clone(),
         token: resolved_remote.token.clone(),
-        oauth: resolved_remote.oauth.as_ref().map(|oauth| OAuthConfig {
-            client_id: oauth.client_id.clone(),
-            account: oauth.account.clone(),
-            allow_in_memory: oauth.allow_in_memory,
-            allow_loopback_demo: oauth.allow_loopback_demo,
-            login_mode: oauth.login_mode,
-            token_store: Some(cli_oauth_store(context, oauth.allow_in_memory).map_err(config_error)?),
-            login_timeout_seconds: oauth.login_timeout_seconds,
-        }),
+        oauth,
         timeout: resolved_remote.timeout,
     };
     let client = match RemoteClient::new(endpoint) {
