@@ -1244,6 +1244,8 @@ where
 #[derive(Debug, Clone)]
 pub struct McpServer<P> {
     runtime: Arc<Mutex<McpRuntime<P>>>,
+    leases: Arc<LeaseRuntime>,
+    lease_queue_limit: Arc<Semaphore>,
     queue_limit: Arc<Semaphore>,
 }
 
@@ -1304,12 +1306,18 @@ where
             (!router.remotes.is_empty())
                 .then(|| (runtime.outbox.clone(), router.remotes.clone(), runtime.metrics.clone()))
         });
+        let leases = Arc::new(LeaseRuntime::from_runtime(&runtime));
         let runtime = Arc::new(Mutex::new(runtime));
         if let Some((outbox, remotes, metrics)) = federation_worker {
             tokio::spawn(run_replication_worker(outbox, remotes, metrics));
             tokio::spawn(run_staged_reconciliation(runtime.clone()));
         }
-        Ok(Self { runtime, queue_limit: Arc::new(Semaphore::new(queue_limit)) })
+        Ok(Self {
+            runtime,
+            leases,
+            lease_queue_limit: Arc::new(Semaphore::new(queue_limit)),
+            queue_limit: Arc::new(Semaphore::new(queue_limit)),
+        })
     }
 
     pub async fn handle_json_value(&self, request: Value) -> Value {
@@ -1379,7 +1387,12 @@ where
             );
         };
 
-        let _permit = match self.queue_limit.clone().try_acquire_owned() {
+        // Lease maintenance must remain available while memory work holds the runtime lock
+        // or fills its queue. Keep a separately bounded admission lane for these calls.
+        let lease_call =
+            matches!(tool, ToolName::TaskGet | ToolName::TaskClaim | ToolName::TaskRenew);
+        let queue = if lease_call { &self.lease_queue_limit } else { &self.queue_limit };
+        let _permit = match queue.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(TryAcquireError::NoPermits) => {
                 return jsonrpc_error(
@@ -1397,88 +1410,108 @@ where
             }
         };
 
-        let mut runtime = self.runtime.lock().await;
+        let result = if lease_call {
+            match tool {
+                ToolName::TaskGet => self.leases.tool_task_get(&call.arguments).await,
+                ToolName::TaskClaim => self.leases.tool_task_claim(&call.arguments).await,
+                ToolName::TaskRenew => self.leases.tool_task_renew(&call.arguments).await,
+                _ => unreachable!(),
+            }
+        } else {
+            let mut runtime = self.runtime.lock().await;
 
-        // `tool.routing()` is not just documentation here: which of the four inner `match`
-        // blocks below runs is decided by it, and each inner match only covers the `ToolName`
-        // variants that category is supposed to contain. A tool miscategorized by `routing()`
-        // (e.g. a coordination tool accidentally left `LocalOnly`) reaches the wrong inner
-        // match, which has no arm for it, and panics via the catch-all below instead of
-        // silently behaving as if it were still correctly routed — the same guarantee
-        // `routing_categories_are_consistent_with_semantics_doc` checks statically, backstopped
-        // here at dispatch time.
-        let result = match tool.routing() {
-            ToolRoutingCategory::LocalOnly => match tool {
-                ToolName::WakeUp => runtime.tool_wake_up(&call.arguments).await,
-                ToolName::GetAaaKSpec => runtime.tool_get_aaak_spec().await,
-                ToolName::DiaryWrite => runtime.tool_diary_write(&call.arguments).await,
-                ToolName::DiaryRead => runtime.tool_diary_read(&call.arguments).await,
-                ToolName::GetChangesSince => runtime.tool_get_changes_since(&call.arguments).await,
-                ToolName::Traverse => runtime.tool_traverse(&call.arguments).await,
-                ToolName::FindTunnels => runtime.tool_find_tunnels(&call.arguments).await,
-                ToolName::GraphStats => runtime.tool_graph_stats().await,
-                ToolName::IdentityRead => runtime.tool_identity_read().await,
-                ToolName::IdentityUpdate => runtime.tool_identity_update(&call.arguments).await,
-                ToolName::LineageSet => runtime.tool_lineage_set(&call.arguments).await,
-                ToolName::SelfObservationPropose => {
-                    runtime.tool_self_observation_propose(&call.arguments).await
-                }
-                ToolName::SelfObservationReview => {
-                    runtime.tool_self_observation_review(&call.arguments).await
-                }
-                ToolName::IdentityPacket => runtime.tool_identity_packet(&call.arguments).await,
-                ToolName::MigrationRecord => runtime.tool_migration_record(&call.arguments).await,
-                // Not federated in this phase (skills/delegation), or has no wire counterpart
-                // at all (a single coordination event has no `GET .../events/{id}` route — only
-                // the paginated feed does; see `tool_coordination_event_get`'s doc comment).
-                ToolName::CoordinationEventGet => {
-                    runtime.tool_coordination_event_get(&call.arguments).await
-                }
-                ToolName::CoordinationWings => runtime.tool_coordination_wings().await,
-                ToolName::SkillPropose => runtime.tool_skill_propose(&call.arguments).await,
-                ToolName::SkillGet => runtime.tool_skill_get(&call.arguments).await,
-                ToolName::SkillVersions => runtime.tool_skill_versions(&call.arguments).await,
-                ToolName::SkillList => runtime.tool_skill_list(&call.arguments).await,
-                ToolName::SkillRecordOutcome => {
-                    runtime.tool_skill_record_outcome(&call.arguments).await
-                }
-                ToolName::SkillPromote => runtime.tool_skill_promote(&call.arguments).await,
-                ToolName::SkillRetire => runtime.tool_skill_retire(&call.arguments).await,
-                ToolName::SkillReviews => runtime.tool_skill_reviews(&call.arguments).await,
-                ToolName::DelegationSpanStart => {
-                    runtime.tool_delegation_span_start(&call.arguments).await
-                }
-                ToolName::DelegationSpanGet => {
-                    runtime.tool_delegation_span_get(&call.arguments).await
-                }
-                ToolName::DelegationSpanClose => {
-                    runtime.tool_delegation_span_close(&call.arguments).await
-                }
-                ToolName::DelegationSpansForTask => {
-                    runtime.tool_delegation_spans_for_task(&call.arguments).await
-                }
-                ToolName::DelegationCheckpointAppend => {
-                    runtime.tool_delegation_checkpoint_append(&call.arguments).await
-                }
-                ToolName::DelegationCheckpointGet => {
-                    runtime.tool_delegation_checkpoint_get(&call.arguments).await
-                }
-                ToolName::DelegationTrace => runtime.tool_delegation_trace(&call.arguments).await,
-                ToolName::A2aAgentCard => runtime.tool_a2a_agent_card(&call.arguments).await,
-                ToolName::A2aTaskImport => runtime.tool_a2a_task_import(&call.arguments).await,
-                ToolName::A2aTaskExport => runtime.tool_a2a_task_export(&call.arguments).await,
-                ToolName::A2aMessageImport => {
-                    runtime.tool_a2a_message_import(&call.arguments).await
-                }
-                ToolName::A2aArtifactImport => {
-                    runtime.tool_a2a_artifact_import(&call.arguments).await
-                }
-                ToolName::McpTasksGet => runtime.tool_mcp_tasks_get(&call.arguments).await,
-                ToolName::McpTasksUpdate => runtime.tool_mcp_tasks_update(&call.arguments).await,
-                ToolName::McpTasksCancel => runtime.tool_mcp_tasks_cancel(&call.arguments).await,
-                ToolName::McpTasksImport => runtime.tool_mcp_tasks_import(&call.arguments).await,
-                other => unreachable!(
-                    "ToolName::routing() classified {other:?} as LocalOnly, \
+            // `tool.routing()` is not just documentation here: which of the four inner `match`
+            // blocks below runs is decided by it, and each inner match only covers the `ToolName`
+            // variants that category is supposed to contain. A tool miscategorized by `routing()`
+            // (e.g. a coordination tool accidentally left `LocalOnly`) reaches the wrong inner
+            // match, which has no arm for it, and panics via the catch-all below instead of
+            // silently behaving as if it were still correctly routed — the same guarantee
+            // `routing_categories_are_consistent_with_semantics_doc` checks statically, backstopped
+            // here at dispatch time.
+            match tool.routing() {
+                ToolRoutingCategory::LocalOnly => match tool {
+                    ToolName::WakeUp => runtime.tool_wake_up(&call.arguments).await,
+                    ToolName::GetAaaKSpec => runtime.tool_get_aaak_spec().await,
+                    ToolName::DiaryWrite => runtime.tool_diary_write(&call.arguments).await,
+                    ToolName::DiaryRead => runtime.tool_diary_read(&call.arguments).await,
+                    ToolName::GetChangesSince => {
+                        runtime.tool_get_changes_since(&call.arguments).await
+                    }
+                    ToolName::Traverse => runtime.tool_traverse(&call.arguments).await,
+                    ToolName::FindTunnels => runtime.tool_find_tunnels(&call.arguments).await,
+                    ToolName::GraphStats => runtime.tool_graph_stats().await,
+                    ToolName::IdentityRead => runtime.tool_identity_read().await,
+                    ToolName::IdentityUpdate => runtime.tool_identity_update(&call.arguments).await,
+                    ToolName::LineageSet => runtime.tool_lineage_set(&call.arguments).await,
+                    ToolName::SelfObservationPropose => {
+                        runtime.tool_self_observation_propose(&call.arguments).await
+                    }
+                    ToolName::SelfObservationReview => {
+                        runtime.tool_self_observation_review(&call.arguments).await
+                    }
+                    ToolName::IdentityPacket => runtime.tool_identity_packet(&call.arguments).await,
+                    ToolName::MigrationRecord => {
+                        runtime.tool_migration_record(&call.arguments).await
+                    }
+                    // Not federated in this phase (skills/delegation), or has no wire counterpart
+                    // at all (a single coordination event has no `GET .../events/{id}` route — only
+                    // the paginated feed does; see `tool_coordination_event_get`'s doc comment).
+                    ToolName::CoordinationEventGet => {
+                        runtime.tool_coordination_event_get(&call.arguments).await
+                    }
+                    ToolName::CoordinationWings => runtime.tool_coordination_wings().await,
+                    ToolName::SkillPropose => runtime.tool_skill_propose(&call.arguments).await,
+                    ToolName::SkillGet => runtime.tool_skill_get(&call.arguments).await,
+                    ToolName::SkillVersions => runtime.tool_skill_versions(&call.arguments).await,
+                    ToolName::SkillList => runtime.tool_skill_list(&call.arguments).await,
+                    ToolName::SkillRecordOutcome => {
+                        runtime.tool_skill_record_outcome(&call.arguments).await
+                    }
+                    ToolName::SkillPromote => runtime.tool_skill_promote(&call.arguments).await,
+                    ToolName::SkillRetire => runtime.tool_skill_retire(&call.arguments).await,
+                    ToolName::SkillReviews => runtime.tool_skill_reviews(&call.arguments).await,
+                    ToolName::DelegationSpanStart => {
+                        runtime.tool_delegation_span_start(&call.arguments).await
+                    }
+                    ToolName::DelegationSpanGet => {
+                        runtime.tool_delegation_span_get(&call.arguments).await
+                    }
+                    ToolName::DelegationSpanClose => {
+                        runtime.tool_delegation_span_close(&call.arguments).await
+                    }
+                    ToolName::DelegationSpansForTask => {
+                        runtime.tool_delegation_spans_for_task(&call.arguments).await
+                    }
+                    ToolName::DelegationCheckpointAppend => {
+                        runtime.tool_delegation_checkpoint_append(&call.arguments).await
+                    }
+                    ToolName::DelegationCheckpointGet => {
+                        runtime.tool_delegation_checkpoint_get(&call.arguments).await
+                    }
+                    ToolName::DelegationTrace => {
+                        runtime.tool_delegation_trace(&call.arguments).await
+                    }
+                    ToolName::A2aAgentCard => runtime.tool_a2a_agent_card(&call.arguments).await,
+                    ToolName::A2aTaskImport => runtime.tool_a2a_task_import(&call.arguments).await,
+                    ToolName::A2aTaskExport => runtime.tool_a2a_task_export(&call.arguments).await,
+                    ToolName::A2aMessageImport => {
+                        runtime.tool_a2a_message_import(&call.arguments).await
+                    }
+                    ToolName::A2aArtifactImport => {
+                        runtime.tool_a2a_artifact_import(&call.arguments).await
+                    }
+                    ToolName::McpTasksGet => runtime.tool_mcp_tasks_get(&call.arguments).await,
+                    ToolName::McpTasksUpdate => {
+                        runtime.tool_mcp_tasks_update(&call.arguments).await
+                    }
+                    ToolName::McpTasksCancel => {
+                        runtime.tool_mcp_tasks_cancel(&call.arguments).await
+                    }
+                    ToolName::McpTasksImport => {
+                        runtime.tool_mcp_tasks_import(&call.arguments).await
+                    }
+                    other => unreachable!(
+                        "ToolName::routing() classified {other:?} as LocalOnly, \
                      but dispatch_tool's LocalOnly arm does not handle it"
                 ),
             },
@@ -1505,33 +1538,34 @@ where
                 other => unreachable!(
                     "ToolName::routing() classified {other:?} as RoutableKg, \
                      but dispatch_tool's RoutableKg arm does not handle it"
-                ),
-            },
-            ToolRoutingCategory::RoutableCoordination => match tool {
-                ToolName::TaskCreate => runtime.tool_task_create(&call.arguments).await,
-                ToolName::TaskList => runtime.tool_task_list(&call.arguments).await,
-                ToolName::TaskGet => runtime.tool_task_get(&call.arguments).await,
-                ToolName::TaskClaim => runtime.tool_task_claim(&call.arguments).await,
-                ToolName::TaskRenew => runtime.tool_task_renew(&call.arguments).await,
-                ToolName::TaskTransition => runtime.tool_task_transition(&call.arguments).await,
-                ToolName::MessageSend => runtime.tool_message_send(&call.arguments).await,
-                ToolName::MessageGet => runtime.tool_message_get(&call.arguments).await,
-                ToolName::MessageAcknowledge => {
-                    runtime.tool_message_acknowledge(&call.arguments).await
-                }
-                ToolName::InboxRead => runtime.tool_inbox_read(&call.arguments).await,
-                ToolName::ArtifactPut => runtime.tool_artifact_put(&call.arguments).await,
-                ToolName::ArtifactGet => runtime.tool_artifact_get(&call.arguments).await,
-                ToolName::ResultPut => runtime.tool_result_put(&call.arguments).await,
-                ToolName::ResultGet => runtime.tool_result_get(&call.arguments).await,
-                ToolName::CoordinationEvents => {
-                    runtime.tool_coordination_events(&call.arguments).await
-                }
-                other => unreachable!(
-                    "ToolName::routing() classified {other:?} as RoutableCoordination, \
+                    ),
+                },
+                ToolRoutingCategory::RoutableCoordination => match tool {
+                    ToolName::TaskCreate => runtime.tool_task_create(&call.arguments).await,
+                    ToolName::TaskList => runtime.tool_task_list(&call.arguments).await,
+                    ToolName::TaskGet => unreachable!("handled by lease lane"),
+                    ToolName::TaskClaim => unreachable!("handled by lease lane"),
+                    ToolName::TaskRenew => unreachable!("handled by lease lane"),
+                    ToolName::TaskTransition => runtime.tool_task_transition(&call.arguments).await,
+                    ToolName::MessageSend => runtime.tool_message_send(&call.arguments).await,
+                    ToolName::MessageGet => runtime.tool_message_get(&call.arguments).await,
+                    ToolName::MessageAcknowledge => {
+                        runtime.tool_message_acknowledge(&call.arguments).await
+                    }
+                    ToolName::InboxRead => runtime.tool_inbox_read(&call.arguments).await,
+                    ToolName::ArtifactPut => runtime.tool_artifact_put(&call.arguments).await,
+                    ToolName::ArtifactGet => runtime.tool_artifact_get(&call.arguments).await,
+                    ToolName::ResultPut => runtime.tool_result_put(&call.arguments).await,
+                    ToolName::ResultGet => runtime.tool_result_get(&call.arguments).await,
+                    ToolName::CoordinationEvents => {
+                        runtime.tool_coordination_events(&call.arguments).await
+                    }
+                    other => unreachable!(
+                        "ToolName::routing() classified {other:?} as RoutableCoordination, \
                      but dispatch_tool's RoutableCoordination arm does not handle it"
-                ),
-            },
+                    ),
+                },
+            }
         };
 
         match result {
@@ -1546,6 +1580,100 @@ where
             Err(ToolError::Internal(error)) => {
                 jsonrpc_error(call.id, ErrorCode::InternalError, error.to_string())
             }
+        }
+    }
+}
+
+/// Lease operations retain existing compare-and-swap and federation semantics without
+/// waiting for memory/search/reconciliation to release the shared runtime lock.
+#[derive(Debug)]
+struct LeaseRuntime {
+    coordination: CoordinationStore,
+    federation: Option<FederationRouter>,
+}
+impl LeaseRuntime {
+    fn from_runtime<P>(runtime: &McpRuntime<P>) -> Self {
+        Self { coordination: runtime.coordination.clone(), federation: runtime.federation.clone() }
+    }
+    /// Get a task by exact ID. Local first; on a local miss, falls back to each configured
+    /// remote in name order (no wing is known for an ID-keyed lookup — see the federation
+    /// module comment).
+    async fn tool_task_get(&self, arguments: &Value) -> ToolResult<Value> {
+        let id = required_string(arguments, "task_id")?;
+        if let Some(task) = self.coordination.get_task(&id).map_tool_internal()? {
+            return Ok(json!({"found": true, "value": task}));
+        }
+        if let Some(router) = &self.federation {
+            if let Some(value) = router.coordination_task_get_fallback(&id).await? {
+                return Ok(json!({"found": true, "value": value}));
+            }
+        }
+        Ok(json!({"found": false}))
+    }
+    /// Claim a task, or reclaim an expired lease. Local first; a local "task not found" falls
+    /// back to each configured remote in name order, sending the claim to whichever one
+    /// actually owns the task. A revision conflict — local or remote — surfaces via
+    /// `revision_conflict_payload` either way; AgentPalace never retries on the caller's behalf.
+    async fn tool_task_claim(&self, arguments: &Value) -> ToolResult<Value> {
+        let expected_revision = required_i64(arguments, "expected_revision")?;
+        let task_id = required_string(arguments, "task_id")?;
+        let worker = required_string(arguments, "worker")?;
+        let lease_seconds = required_positive_i64(arguments, "lease_seconds")?;
+        match self.coordination.claim_task(
+            &task_id,
+            &worker,
+            expected_revision,
+            Duration::seconds(lease_seconds),
+        ) {
+            Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
+            Ok(RevisionedWrite::Conflict { actual_revision }) => {
+                Ok(revision_conflict_payload(expected_revision, actual_revision))
+            }
+            Err(err) if is_local_record_missing(&err) => {
+                if let Some(router) = &self.federation {
+                    let req =
+                        TaskLeaseRequest { expected_revision, lease_seconds, worker: Some(worker) };
+                    if let Some(value) =
+                        router.coordination_task_claim_fallback(&task_id, req).await?
+                    {
+                        return Ok(value);
+                    }
+                }
+                Err(err).map_tool_internal()
+            }
+            Err(err) => Err(err).map_tool_internal(),
+        }
+    }
+    /// Renew a live lease. See [`Self::tool_task_claim`] for the local-first/fallback and
+    /// conflict-shape notes — identical here.
+    async fn tool_task_renew(&self, arguments: &Value) -> ToolResult<Value> {
+        let expected_revision = required_i64(arguments, "expected_revision")?;
+        let task_id = required_string(arguments, "task_id")?;
+        let worker = required_string(arguments, "worker")?;
+        let lease_seconds = required_positive_i64(arguments, "lease_seconds")?;
+        match self.coordination.renew_lease(
+            &task_id,
+            &worker,
+            expected_revision,
+            Duration::seconds(lease_seconds),
+        ) {
+            Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
+            Ok(RevisionedWrite::Conflict { actual_revision }) => {
+                Ok(revision_conflict_payload(expected_revision, actual_revision))
+            }
+            Err(err) if is_local_record_missing(&err) => {
+                if let Some(router) = &self.federation {
+                    let req =
+                        TaskLeaseRequest { expected_revision, lease_seconds, worker: Some(worker) };
+                    if let Some(value) =
+                        router.coordination_task_renew_fallback(&task_id, req).await?
+                    {
+                        return Ok(value);
+                    }
+                }
+                Err(err).map_tool_internal()
+            }
+            Err(err) => Err(err).map_tool_internal(),
         }
     }
 }
@@ -4572,88 +4700,7 @@ where
         }
         Ok(json!(self.coordination.create_task(&input).map_tool_internal()?))
     }
-    /// Get a task by exact ID. Local first; on a local miss, falls back to each configured
-    /// remote in name order (no wing is known for an ID-keyed lookup — see the federation
-    /// module comment).
-    async fn tool_task_get(&mut self, arguments: &Value) -> ToolResult<Value> {
-        let id = required_string(arguments, "task_id")?;
-        if let Some(task) = self.coordination.get_task(&id).map_tool_internal()? {
-            return Ok(json!({"found": true, "value": task}));
-        }
-        if let Some(router) = &self.federation {
-            if let Some(value) = router.coordination_task_get_fallback(&id).await? {
-                return Ok(json!({"found": true, "value": value}));
-            }
-        }
-        Ok(json!({"found": false}))
-    }
-    /// Claim a task, or reclaim an expired lease. Local first; a local "task not found" falls
-    /// back to each configured remote in name order, sending the claim to whichever one
-    /// actually owns the task. A revision conflict — local or remote — surfaces via
-    /// `revision_conflict_payload` either way; AgentPalace never retries on the caller's behalf.
-    async fn tool_task_claim(&mut self, arguments: &Value) -> ToolResult<Value> {
-        let expected_revision = required_i64(arguments, "expected_revision")?;
-        let task_id = required_string(arguments, "task_id")?;
-        let worker = required_string(arguments, "worker")?;
-        let lease_seconds = required_positive_i64(arguments, "lease_seconds")?;
-        match self.coordination.claim_task(
-            &task_id,
-            &worker,
-            expected_revision,
-            Duration::seconds(lease_seconds),
-        ) {
-            Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
-            Ok(RevisionedWrite::Conflict { actual_revision }) => {
-                Ok(revision_conflict_payload(expected_revision, actual_revision))
-            }
-            Err(err) if is_local_record_missing(&err) => {
-                if let Some(router) = &self.federation {
-                    let req =
-                        TaskLeaseRequest { expected_revision, lease_seconds, worker: Some(worker) };
-                    if let Some(value) =
-                        router.coordination_task_claim_fallback(&task_id, req).await?
-                    {
-                        return Ok(value);
-                    }
-                }
-                Err(err).map_tool_internal()
-            }
-            Err(err) => Err(err).map_tool_internal(),
-        }
-    }
-    /// Renew a live lease. See [`Self::tool_task_claim`] for the local-first/fallback and
-    /// conflict-shape notes — identical here.
-    async fn tool_task_renew(&mut self, arguments: &Value) -> ToolResult<Value> {
-        let expected_revision = required_i64(arguments, "expected_revision")?;
-        let task_id = required_string(arguments, "task_id")?;
-        let worker = required_string(arguments, "worker")?;
-        let lease_seconds = required_positive_i64(arguments, "lease_seconds")?;
-        match self.coordination.renew_lease(
-            &task_id,
-            &worker,
-            expected_revision,
-            Duration::seconds(lease_seconds),
-        ) {
-            Ok(RevisionedWrite::Applied(task)) => Ok(json!({"success": true, "task": task})),
-            Ok(RevisionedWrite::Conflict { actual_revision }) => {
-                Ok(revision_conflict_payload(expected_revision, actual_revision))
-            }
-            Err(err) if is_local_record_missing(&err) => {
-                if let Some(router) = &self.federation {
-                    let req =
-                        TaskLeaseRequest { expected_revision, lease_seconds, worker: Some(worker) };
-                    if let Some(value) =
-                        router.coordination_task_renew_fallback(&task_id, req).await?
-                    {
-                        return Ok(value);
-                    }
-                }
-                Err(err).map_tool_internal()
-            }
-            Err(err) => Err(err).map_tool_internal(),
-        }
-    }
-    /// Transition a task's lifecycle state. See [`Self::tool_task_claim`] for the
+    /// Transition a task's lifecycle state. See [`LeaseRuntime::tool_task_claim`] for the
     /// local-first/fallback and conflict-shape notes — identical here.
     async fn tool_task_transition(&mut self, arguments: &Value) -> ToolResult<Value> {
         let state: TaskState = serde_json::from_value(json!(required_string(arguments, "state")?))
@@ -5337,7 +5384,7 @@ where
 
     /// Transition a task's lifecycle state using an inbound MCP Tasks extension status, under the
     /// same compare-and-swap revision semantics as `agentpalace_task_transition`. See
-    /// [`Self::tool_task_claim`] for the conflict-shape notes — identical here. Local-only: no
+    /// [`LeaseRuntime::tool_task_claim`] for the conflict-shape notes — identical here. Local-only: no
     /// MCP Tasks transport of its own to fall back to. A blank or unknown `task_id` is
     /// `ToolError::InvalidParams`, matching `tool_mcp_tasks_get` and JSON-RPC `-32602`.
     async fn tool_mcp_tasks_update(&mut self, arguments: &Value) -> ToolResult<Value> {
@@ -7856,6 +7903,62 @@ mod tests {
             }
             other => panic!("expected StorageError::Invariant, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn lease_maintenance_survives_blocked_memory_and_full_memory_queue() {
+        let mut harness = test_harness().await;
+        harness.server.queue_limit = Arc::new(Semaphore::new(1));
+        harness.server.lease_queue_limit = Arc::new(Semaphore::new(1));
+        let created = harness.server.handle_request(tool_call(1, "agentpalace_task_create",
+            json!({"title":"Lease isolation", "description":"Regression", "created_by":"manager",
+                   "wing":"alpha", "idempotency_key":"lease-isolation"}))).await;
+        let task = decode_tool_payload(&created).unwrap();
+        // Hold the exact lock a slow wake-up/search holds and exhaust its admission queue.
+        let _memory = harness.server.runtime.lock().await;
+        let _queue = harness.server.queue_limit.clone().acquire_many_owned(
+            harness.server.queue_limit.available_permits() as u32).await.unwrap();
+        let exercise = async {
+            let claimed = harness.server.handle_request(tool_call(2, "agentpalace_task_claim",
+                json!({"task_id":task["task_id"], "expected_revision":task["revision"],
+                       "worker":"worker", "lease_seconds":60}))).await;
+            let claimed = decode_tool_payload(&claimed).unwrap();
+            assert_eq!(claimed["success"], true);
+            let task = &claimed["task"];
+            let renewed = harness.server.handle_request(tool_call(3, "agentpalace_task_renew",
+                json!({"task_id":task["task_id"], "expected_revision":task["revision"],
+                       "worker":"worker", "lease_seconds":120}))).await;
+            let renewed = decode_tool_payload(&renewed).unwrap();
+            assert_eq!(renewed["success"], true);
+            assert!(renewed["task"]["revision"].as_i64().unwrap() > task["revision"].as_i64().unwrap());
+            let stale = harness.server.handle_request(tool_call(4, "agentpalace_task_renew",
+                json!({"task_id":task["task_id"], "expected_revision":task["revision"],
+                       "worker":"worker", "lease_seconds":120}))).await;
+            assert_eq!(decode_tool_payload(&stale).unwrap()["success"], false);
+            let wrong_owner = harness.server.handle_request(tool_call(6, "agentpalace_task_renew",
+                json!({"task_id":task["task_id"], "expected_revision":renewed["task"]["revision"],
+                       "worker":"another-worker", "lease_seconds":120}))).await;
+            assert!(wrong_owner.get("error").is_some(), "lease ownership must still be enforced");
+            let fetched = harness.server.handle_request(tool_call(5, "agentpalace_task_get",
+                json!({"task_id":task["task_id"]}))).await;
+            assert_eq!(decode_tool_payload(&fetched).unwrap()["value"], renewed["task"]);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), exercise).await
+            .expect("lease maintenance must not wait for memory work");
+    }
+
+    #[tokio::test]
+    async fn lease_lane_rejects_overload_without_consuming_memory_capacity() {
+        let mut harness = test_harness().await;
+        harness.server.queue_limit = Arc::new(Semaphore::new(1));
+        harness.server.lease_queue_limit = Arc::new(Semaphore::new(1));
+        let memory_capacity = harness.server.queue_limit.available_permits();
+        let _leases = harness.server.lease_queue_limit.clone().acquire_many_owned(
+            harness.server.lease_queue_limit.available_permits() as u32).await.unwrap();
+        let response = harness.server.handle_request(tool_call(1, "agentpalace_task_get",
+            json!({"task_id":"missing"}))).await;
+        assert!(response["error"]["message"].as_str().unwrap().contains("server busy"));
+        assert_eq!(harness.server.queue_limit.available_permits(), memory_capacity);
     }
 
     #[tokio::test]
@@ -13098,6 +13201,8 @@ mod tests {
         // Replace federation with the mock router (only if it has remotes).
         runtime.federation = if router.has_remotes() { Some(router) } else { None };
         let server = McpServer {
+            leases: Arc::new(LeaseRuntime::from_runtime(&runtime)),
+            lease_queue_limit: Arc::new(Semaphore::new(8)),
             runtime: Arc::new(Mutex::new(runtime)),
             queue_limit: Arc::new(Semaphore::new(8)),
         };
