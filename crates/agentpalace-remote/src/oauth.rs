@@ -537,6 +537,15 @@ mod tests {
     }
 
     #[test]
+    fn well_known_url_preserves_path_based_issuer() {
+        let issuer = reqwest::Url::parse("https://issuer.example/tenant1").expect("test URL");
+        assert_eq!(
+            well_known_url(&issuer).expect("well-known URL").as_str(),
+            "https://issuer.example/.well-known/oauth-authorization-server/tenant1"
+        );
+    }
+
+    #[test]
     fn automatic_login_mode_only_selects_device_when_browser_is_unusable() {
         assert_eq!(select_login_mode(OAuthLoginMode::Auto, true), OAuthLoginMode::Browser);
         assert_eq!(select_login_mode(OAuthLoginMode::Auto, false), OAuthLoginMode::Device);
