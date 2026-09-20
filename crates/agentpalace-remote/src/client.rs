@@ -958,9 +958,12 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+    use axum::response::IntoResponse;
+    use tempfile::tempdir;
+    use tokio::sync::Mutex;
 
     use super::*;
-    use crate::DEFAULT_TIMEOUT;
+    use crate::{DEFAULT_TIMEOUT, TokenStore};
     use crate::error::is_transient_http_status;
 
     fn endpoint(base_url: &str) -> RemoteEndpoint {
@@ -1127,6 +1130,60 @@ mod tests {
             timeout,
         })
         .unwrap()
+    }
+
+    fn oauth_endpoint(base_url: &str, store: crate::SharedTokenStore) -> RemoteEndpoint {
+        RemoteEndpoint {
+            name: "oauth-test-remote".to_owned(),
+            base_url: base_url.to_owned(),
+            token: None,
+            oauth: Some(crate::OAuthConfig {
+                client_id: "test-client".to_owned(),
+                account: Some("test-account".to_owned()),
+                allow_in_memory: false,
+                allow_loopback_demo: true,
+                login_mode: agentpalace_config::OAuthLoginMode::Device,
+                token_store: Some(store),
+                login_timeout_seconds: 5,
+            }),
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+
+    fn oauth_session(resource: &str, issuer: &str, access_token: &str) -> crate::OAuthSession {
+        crate::OAuthSession {
+            access_token: access_token.to_owned(),
+            refresh_token: Some("refresh-token".to_owned()),
+            expires_at: Some(123),
+            resource: resource.to_owned(),
+            issuer: issuer.to_owned(),
+            client_id: "test-client".to_owned(),
+            account: Some("test-account".to_owned()),
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingSaveStore {
+        session: Mutex<Option<crate::OAuthSession>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::TokenStore for FailingSaveStore {
+        async fn load(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Option<crate::OAuthSession> {
+            let session = self.session.lock().await.clone()?;
+            (session.resource == resource && session.issuer == issuer && session.client_id == client_id && session.account.as_deref() == account).then_some(session)
+        }
+
+        async fn save(&self, _session: crate::OAuthSession) -> Result<(), String> {
+            Err("test credential store failure".to_owned())
+        }
+
+        async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) {
+            let mut session = self.session.lock().await;
+            if session.as_ref().is_some_and(|value| value.resource == resource && value.issuer == issuer && value.client_id == client_id && value.account.as_deref() == account) {
+                *session = None;
+            }
+        }
     }
 
     async fn spawn_stub(app: axum::Router) -> std::net::SocketAddr {
@@ -1501,5 +1558,120 @@ mod tests {
             }
             other => panic!("expected InvalidResponse for undecodable read, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn stored_session_reloads_into_a_new_remote_client() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("oauth.json");
+        let store = Arc::new(crate::FileTokenStore::new(&path));
+        let resource = "https://hub.example/";
+        let issuer = "https://issuer.example";
+        let session = oauth_session(resource, issuer, "persisted-access");
+        store.save(session.clone()).await.unwrap();
+
+        let first = RemoteClient::new(oauth_endpoint("https://hub.example", store.clone())).unwrap();
+        let second = RemoteClient::new(oauth_endpoint("https://hub.example", Arc::new(crate::FileTokenStore::new(&path)))).unwrap();
+        assert!(first.load_stored_session(resource, issuer).await);
+        assert!(second.load_stored_session(resource, issuer).await);
+        assert_eq!(second.token.lock().await.as_deref(), Some("persisted-access"));
+        assert_eq!(second.oauth_session.lock().await.as_ref().map(|value| value.access_token.as_str()), Some("persisted-access"));
+    }
+
+    #[tokio::test]
+    async fn oauth_401_challenge_reloads_persistent_session_before_retry() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("oauth.json");
+        let store = Arc::new(crate::FileTokenStore::new(&path));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let resource = format!("http://{addr}/");
+        let issuer = format!("http://{addr}");
+        let app = axum::Router::new()
+            .route("/.well-known/oauth-protected-resource", axum::routing::get({
+                let resource = resource.clone();
+                let issuer = issuer.clone();
+                move || async move { axum::Json(serde_json::json!({"resource": resource, "authorization_servers": [issuer]})) }
+            }))
+            .route("/.well-known/oauth-authorization-server", axum::routing::get({
+                let issuer = issuer.clone();
+                move || async move { axum::Json(serde_json::json!({"issuer": issuer.clone(), "authorization_endpoint": format!("{issuer}/authorize"), "token_endpoint": format!("{issuer}/token")})) }
+            }))
+            .route("/v1/info", axum::routing::get({
+                let hits = Arc::clone(&hits);
+                let challenge_resource = resource.clone();
+                move || {
+                    let hits = Arc::clone(&hits);
+                    let resource = challenge_resource.clone();
+                    async move {
+                        if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                            (
+                                axum::http::StatusCode::UNAUTHORIZED,
+                                [(axum::http::header::WWW_AUTHENTICATE, format!("Bearer resource_metadata={resource}"))],
+                                "unauthorized",
+                            ).into_response()
+                        } else {
+                            axum::Json(serde_json::json!({"server_version":"test","federation_api_version":1u32,"embedding_profile":"balanced","capabilities":[]})).into_response()
+                        }
+                    }
+                }
+            }));
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let session = oauth_session(&resource, &issuer, "reloaded-access");
+        store.save(session).await.unwrap();
+        let client = RemoteClient::new(oauth_endpoint(&format!("http://{addr}"), store)).unwrap();
+        assert!(client.info().await.is_ok());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(client.token.lock().await.as_deref(), Some("reloaded-access"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn logout_clears_the_normalized_resource_record() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("oauth.json");
+        let store = Arc::new(crate::FileTokenStore::new(&path));
+        let client = RemoteClient::new(oauth_endpoint("https://hub.example", store.clone())).unwrap();
+        let session = oauth_session(client.base_url(), "https://issuer.example", "logout-access");
+        store.save(session).await.unwrap();
+        assert!(client.load_stored_session("https://hub.example/", "https://issuer.example").await);
+        client.logout(None).await.unwrap();
+        assert!(store.load("https://hub.example/", "https://issuer.example", "test-client", Some("test-account")).await.is_none());
+        assert!(client.token.lock().await.is_none());
+        assert!(client.oauth_session.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_clears_persistent_and_in_memory_credentials() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("oauth.json");
+        let store = Arc::new(crate::FileTokenStore::new(&path));
+        let client = RemoteClient::new(oauth_endpoint("https://hub.example", store.clone())).unwrap();
+        let session = oauth_session("https://hub.example/", "https://issuer.example", "stale-access");
+        store.save(session).await.unwrap();
+        assert!(client.load_stored_session("https://hub.example/", "https://issuer.example").await);
+        let metadata = crate::AuthorizationServerMetadata {
+            issuer: "https://issuer.example".to_owned(),
+            authorization_endpoint: "https://issuer.example/authorize".to_owned(),
+            token_endpoint: "http://127.0.0.1:1/token".to_owned(),
+            revocation_endpoint: None,
+            device_authorization_endpoint: None,
+        };
+        assert!(client.refresh(&metadata).await.is_err());
+        assert!(store.load("https://hub.example/", "https://issuer.example", "test-client", Some("test-account")).await.is_none());
+        assert!(client.token.lock().await.is_none());
+        assert!(client.oauth_session.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn grant_remains_in_memory_when_persistence_fails() {
+        let store = Arc::new(FailingSaveStore { session: Mutex::new(None) });
+        let client = RemoteClient::new(oauth_endpoint("https://hub.example", store)).unwrap();
+        let session = oauth_session("https://hub.example/", "https://issuer.example", "fresh-access");
+        let error = client.commit_session(session).await.expect_err("save failure must remain explicit");
+        assert!(matches!(error, RemoteError::AuthenticationRequired { .. }));
+        assert_eq!(client.token.lock().await.as_deref(), Some("fresh-access"));
+        assert_eq!(client.oauth_session.lock().await.as_ref().map(|value| value.access_token.as_str()), Some("fresh-access"));
     }
 }
