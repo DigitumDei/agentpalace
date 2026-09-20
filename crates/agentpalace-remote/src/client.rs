@@ -1666,12 +1666,18 @@ mod tests {
 
     #[tokio::test]
     async fn grant_remains_in_memory_when_persistence_fails() {
-        let store = Arc::new(FailingSaveStore { session: Mutex::new(None) });
-        let client = RemoteClient::new(oauth_endpoint("https://hub.example", store)).unwrap();
+        let stale = oauth_session("https://hub.example/", "https://issuer.example", "stale-access");
+        let store = Arc::new(FailingSaveStore { session: Mutex::new(Some(stale)) });
+        let client = RemoteClient::new(oauth_endpoint("https://hub.example", store.clone())).unwrap();
+        assert!(client.load_stored_session("https://hub.example/", "https://issuer.example").await);
+        assert_eq!(client.token.lock().await.as_deref(), Some("stale-access"));
         let session = oauth_session("https://hub.example/", "https://issuer.example", "fresh-access");
         let error = client.commit_session(session).await.expect_err("save failure must remain explicit");
         assert!(matches!(error, RemoteError::AuthenticationRequired { .. }));
+        // The newly acquired grant wins in-process even though the durable store
+        // still contains the older grant and reports the write failure.
         assert_eq!(client.token.lock().await.as_deref(), Some("fresh-access"));
         assert_eq!(client.oauth_session.lock().await.as_ref().map(|value| value.access_token.as_str()), Some("fresh-access"));
+        assert_eq!(store.load("https://hub.example/", "https://issuer.example", "test-client", Some("test-account")).await.map(|value| value.access_token), Some("stale-access".to_owned()));
     }
 }
