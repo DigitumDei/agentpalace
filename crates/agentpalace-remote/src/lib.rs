@@ -34,9 +34,11 @@ mod oauth;
 
 pub use client::RemoteClient;
 pub use error::{RemoteError, Result};
+pub use agentpalace_config::OAuthLoginMode;
 pub use oauth::{authorization_url, browser_login, discover_metadata, new_pkce_pair, new_state,
-    refresh, revoke, validate_callback_state, validate_metadata, validate_oauth_url, well_known_url,
-    AuthorizationServerMetadata, InMemoryTokenStore, OAuthConfig, OAuthSession,
+    refresh, revoke, select_login_mode, validate_callback_state, validate_metadata,
+    validate_oauth_url, well_known_url, AuthorizationServerMetadata, InMemoryTokenStore,
+    OAuthConfig, OAuthSession,
     ProtectedResourceMetadata, SharedTokenStore, TokenStore, UnavailableTokenStore};
 
 use agentpalace_federation::{

@@ -10,7 +10,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use agentpalace_config::{
     ConfigFileV1, ConfigLoader, AgentPalaceConfig, ProjectConfig, ProjectRegistryEntryV1,
     ProjectRoomConfig, ResolvedPaths, RouteMode, RouteQuery, WriteTarget, build_runtime,
-    resolve_route,
+    resolve_route, OAuthLoginMode,
 };
 use agentpalace_core::{EmbeddingProfile, RoomId, SearchQuery, WingId};
 use agentpalace_embeddings::{
@@ -385,12 +385,15 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommands {
-    /// Discover metadata from an RFC 9728 resource_metadata URL and open the browser.
+    /// Discover metadata from an RFC 9728 resource_metadata URL and start OAuth login.
     Login {
         #[arg(long)]
         remote: String,
         #[arg(long, value_name = "URL")]
         resource_metadata: String,
+        /// Login transport; defaults to the remote's configured mode.
+        #[arg(long, value_enum)]
+        mode: Option<CliOAuthLoginMode>,
     },
     /// Clear the locally stored grant. Revocation is issuer-specific and is performed by the
     /// library when metadata is supplied by an embedding application.
@@ -401,6 +404,19 @@ enum AuthCommands {
         #[arg(long)]
         issuer: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliOAuthLoginMode { Browser, Device, Auto }
+
+impl From<CliOAuthLoginMode> for OAuthLoginMode {
+    fn from(mode: CliOAuthLoginMode) -> Self {
+        match mode {
+            CliOAuthLoginMode::Browser => Self::Browser,
+            CliOAuthLoginMode::Device => Self::Device,
+            CliOAuthLoginMode::Auto => Self::Auto,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -695,11 +711,11 @@ fn execute_auth(
 ) -> Result<CliOutput, clap::Error> {
     let config = load_runtime_config(palace_override, context).map_err(config_error)?;
     enum AuthOperation {
-        Login(String),
+        Login(String, Option<OAuthLoginMode>),
         Logout(String),
     }
     let (remote_name, operation) = match command {
-        AuthCommands::Login { remote, resource_metadata } => (remote, AuthOperation::Login(resource_metadata)),
+        AuthCommands::Login { remote, resource_metadata, mode } => (remote, AuthOperation::Login(resource_metadata, mode.map(Into::into))),
         AuthCommands::Logout { remote, issuer } => (remote, AuthOperation::Logout(issuer)),
     };
     let remote = config.federation.remotes.get(&remote_name).ok_or_else(|| {
@@ -717,6 +733,7 @@ fn execute_auth(
             account: oauth.account.clone(),
             allow_in_memory: oauth.allow_in_memory,
             allow_loopback_demo: oauth.allow_loopback_demo,
+            login_mode: oauth.login_mode,
             token_store: None,
             login_timeout_seconds: oauth.login_timeout_seconds,
         }),
@@ -726,7 +743,7 @@ fn execute_auth(
         .map_err(|error| clap::Error::raw(clap::error::ErrorKind::Io, error.to_string()))?;
     let result = runtime.block_on(async {
         match operation {
-            AuthOperation::Login(resource_metadata) => client.login_from_challenge(&resource_metadata).await.map(|_| "OAuth login completed; credentials were stored by the configured token store.\n".to_owned()),
+            AuthOperation::Login(resource_metadata, mode) => client.login_from_challenge_with_mode(&resource_metadata, mode).await.map(|_| "OAuth login completed; credentials were stored by the configured token store.\n".to_owned()),
             AuthOperation::Logout(issuer) => {
                 let resource = remote.url.clone();
                 let loaded = client.load_stored_session(&resource, &issuer).await;
@@ -1886,6 +1903,7 @@ fn execute_remote_mine(
             account: oauth.account.clone(),
             allow_in_memory: oauth.allow_in_memory,
             allow_loopback_demo: oauth.allow_loopback_demo,
+            login_mode: oauth.login_mode,
             token_store: None,
             login_timeout_seconds: oauth.login_timeout_seconds,
         }),

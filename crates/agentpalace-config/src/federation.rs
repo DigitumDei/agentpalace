@@ -85,9 +85,28 @@ pub struct OAuthConfigV1 {
     /// Explicitly allow the exact configured loopback demo origin.
     #[serde(default)]
     pub allow_loopback_demo: bool,
+    /// Interactive login transport: `browser`, `device`, or `auto`.
+    #[serde(default)]
+    pub login_mode: OAuthLoginMode,
     /// Interactive login timeout in seconds.
     #[serde(default)]
     pub login_timeout_seconds: Option<u64>,
+}
+
+/// Interactive OAuth login transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthLoginMode {
+    /// Use the native browser and loopback callback flow.
+    Browser,
+    /// Use RFC 8628 device authorization without an inbound callback.
+    Device,
+    /// Use browser login when usable, otherwise use device authorization.
+    Auto,
+}
+
+impl Default for OAuthLoginMode {
+    fn default() -> Self { Self::Auto }
 }
 
 /// How requests for a particular resource are routed.
@@ -223,6 +242,7 @@ pub struct ResolvedOAuthConfig {
     pub account: Option<String>,
     pub allow_in_memory: bool,
     pub allow_loopback_demo: bool,
+    pub login_mode: OAuthLoginMode,
     pub login_timeout_seconds: u64,
 }
 
@@ -327,13 +347,22 @@ pub(crate) fn resolve_federation_config(
         let token = resolve_token(&raw.name, raw.token_env.as_deref(), raw.token, &env_lookup);
         let timeout = Duration::from_millis(raw.timeout_ms.unwrap_or(DEFAULT_REMOTE_TIMEOUT_MS));
 
-        let oauth = raw.oauth.map(|oauth| ResolvedOAuthConfig {
+        let oauth = raw.oauth.map(|oauth| {
+            if oauth.client_id.trim().is_empty() {
+                return Err(AgentPalaceError::ConfigParse {
+                    path: config_path.to_path_buf(),
+                    message: format!("federation.remotes.{}.oauth.client_id must not be empty", raw.name),
+                });
+            }
+            Ok(ResolvedOAuthConfig {
             client_id: oauth.client_id,
             account: oauth.account,
             allow_in_memory: oauth.allow_in_memory,
             allow_loopback_demo: oauth.allow_loopback_demo,
+            login_mode: oauth.login_mode,
             login_timeout_seconds: oauth.login_timeout_seconds.unwrap_or(300),
-        });
+            })
+        }).transpose()?;
         remotes.insert(raw.name.clone(), ResolvedRemote { name: raw.name, url, token, oauth, timeout });
     }
 
@@ -1047,6 +1076,7 @@ mod tests {
                     account: Some("alice".to_owned()),
                     allow_in_memory: true,
                     allow_loopback_demo: false,
+                    login_mode: OAuthLoginMode::Auto,
                     login_timeout_seconds: None,
                 }),
                 timeout_ms: None,
@@ -1062,6 +1092,33 @@ mod tests {
         assert_eq!(oauth.account.as_deref(), Some("alice"));
         assert!(oauth.allow_in_memory);
         assert_eq!(oauth.login_timeout_seconds, 300);
+        assert_eq!(oauth.login_mode, OAuthLoginMode::Auto);
+    }
+
+    #[test]
+    fn oauth_client_id_must_not_be_empty() {
+        let section = FederationConfigV1 {
+            remotes: vec![RemoteConfigV1 {
+                name: "oauth".to_owned(),
+                url: "https://hub.example".to_owned(),
+                token: None,
+                token_env: None,
+                oauth: Some(OAuthConfigV1 {
+                    client_id: "  ".to_owned(),
+                    account: None,
+                    allow_in_memory: false,
+                    allow_loopback_demo: false,
+                    login_mode: OAuthLoginMode::Auto,
+                    login_timeout_seconds: None,
+                }),
+                timeout_ms: None,
+            }],
+            default_mode: None,
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination: BTreeMap::new(),
+        };
+        assert!(resolve_federation_config(Some(section), config_path(), no_env()).is_err());
     }
 
     #[test]

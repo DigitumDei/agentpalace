@@ -461,11 +461,25 @@ impl RemoteClient {
     /// login. This is the intended foreground entry point; background calls only return the
     /// challenge in [`RemoteError::AuthenticationRequired`].
     pub async fn login_from_challenge(&self, resource_metadata: &str) -> Result<()> {
+        self.login_from_challenge_with_mode(resource_metadata, None).await
+    }
+
+    /// Discover metadata from a preserved challenge and perform login using an
+    /// optional foreground override, otherwise the configured login mode.
+    pub async fn login_from_challenge_with_mode(&self, resource_metadata: &str, mode: Option<agentpalace_config::OAuthLoginMode>) -> Result<()> {
         let config = self.oauth.as_ref().ok_or_else(|| RemoteError::InvalidConfig { remote: self.name.clone(), message: "OAuth login requested for a bearer-token remote".to_owned() })?;
         let resource = self.base_url.clone();
         let (protected, metadata) = crate::discover_metadata(&self.http, resource_metadata, &resource, &resource, config.allow_loopback_demo)
             .await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: Some(resource_metadata.to_owned()) })?;
-        self.login(&metadata, &protected.resource).await
+        match crate::select_login_mode(mode.unwrap_or(config.login_mode), true) {
+            agentpalace_config::OAuthLoginMode::Browser => self.login(&metadata, &protected.resource).await,
+            agentpalace_config::OAuthLoginMode::Device => Err(RemoteError::AuthenticationRequired {
+                remote: self.name.clone(),
+                action: "device authorization login is selected but not available in this client slice".to_owned(),
+                resource_metadata: Some(resource_metadata.to_owned()),
+            }),
+            agentpalace_config::OAuthLoginMode::Auto => unreachable!("automatic OAuth login mode is resolved before dispatch"),
+        }
     }
 
     /// Load a previously authorized grant for the exact resource/issuer/client/account tuple.

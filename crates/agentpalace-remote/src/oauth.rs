@@ -13,6 +13,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+use agentpalace_config::OAuthLoginMode;
 
 /// Public client configuration for an OAuth native application.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +29,9 @@ pub struct OAuthConfig {
     /// Explicitly allow the exact configured loopback origin for standards-compliant test issuers.
     #[serde(default)]
     pub allow_loopback_demo: bool,
+    /// Login transport selected for interactive authorization.
+    #[serde(default)]
+    pub login_mode: OAuthLoginMode,
     /// Optional host-provided secure credential backend. This is intentionally skipped by
     /// serde: credential implementations and secrets never belong in config files.
     #[serde(skip)]
@@ -193,6 +197,16 @@ pub fn now_seconds() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map_o
 /// Default bounded interactive timeout.
 pub fn login_timeout(config: &OAuthConfig) -> Duration { Duration::from_secs(config.login_timeout_seconds.clamp(1, 900)) }
 
+/// Resolve automatic login selection after the caller determines whether the
+/// browser/callback path is usable.
+pub fn select_login_mode(configured: OAuthLoginMode, browser_usable: bool) -> OAuthLoginMode {
+    match configured {
+        OAuthLoginMode::Auto if browser_usable => OAuthLoginMode::Browser,
+        OAuthLoginMode::Auto => OAuthLoginMode::Device,
+        mode => mode,
+    }
+}
+
 /// Fetch and validate protected-resource and authorization-server metadata. Redirects are not
 /// followed, so a malicious metadata endpoint cannot silently move discovery to another origin.
 pub async fn discover_metadata(
@@ -350,6 +364,14 @@ mod tests {
         assert!(validate_callback_state("a", "a").is_ok());
         assert!(validate_callback_state("a", "b").is_err());
         assert!(validate_callback_state("a", "").is_err());
+    }
+
+    #[test]
+    fn automatic_login_mode_only_selects_device_when_browser_is_unusable() {
+        assert_eq!(select_login_mode(OAuthLoginMode::Auto, true), OAuthLoginMode::Browser);
+        assert_eq!(select_login_mode(OAuthLoginMode::Auto, false), OAuthLoginMode::Device);
+        assert_eq!(select_login_mode(OAuthLoginMode::Device, true), OAuthLoginMode::Device);
+        assert_eq!(select_login_mode(OAuthLoginMode::Browser, false), OAuthLoginMode::Browser);
     }
     #[test]
     fn metadata_rejects_resource_and_endpoint_mismatch() {

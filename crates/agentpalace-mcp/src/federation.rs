@@ -48,6 +48,7 @@ impl FederationRouter {
                     account: oauth.account.clone(),
                     allow_in_memory: oauth.allow_in_memory,
                     allow_loopback_demo: oauth.allow_loopback_demo,
+                    login_mode: oauth.login_mode,
                     token_store: None,
                     login_timeout_seconds: oauth.login_timeout_seconds,
                 }),

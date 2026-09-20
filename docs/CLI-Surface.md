@@ -12,8 +12,12 @@ This is the frozen command surface for `agentpalace` v1.
 ### `auth login|logout`
 
 OAuth is opt-in per configured remote. `auth login --remote <NAME>
---resource-metadata <URL>` performs protected-resource and authorization-server
-discovery, opens one native-client browser flow with PKCE, and stores the grant
+--resource-metadata <URL> [--mode browser|device|auto]` performs
+protected-resource and authorization-server discovery, then selects the
+configured or explicitly requested login mode. `browser` uses one native-client
+PKCE flow; `device` uses the RFC 8628 flow once available; `auto` chooses the
+browser/callback path when usable and otherwise falls back to device authorization.
+The default configured mode is `auto`. The grant is stored
 through the configured secure token store (or only in memory when
 `allow_in_memory` is explicitly enabled). Background and MCP requests never
 open a browser; they return an actionable authentication-required result.
