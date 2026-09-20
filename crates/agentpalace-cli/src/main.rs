@@ -2694,7 +2694,7 @@ fn cli_oauth_store(
     Ok(Arc::new(FileTokenStore::new(paths.base_dir.join("oauth_tokens.json"))))
 }
 
-/// Build the one CLI-owned endpoint shape used by both authentication and remote commands.
+/// Build the one CLI-owned endpoint shape used by every CLI `RemoteClient` path.
 ///
 /// Keeping store injection here is important: login and later commands run in separate CLI
 /// processes, so the default store must be the same owner-only file. The explicit in-memory
@@ -2703,17 +2703,21 @@ fn cli_remote_endpoint(
     context: &CliContext,
     remote: &agentpalace_config::ResolvedRemote,
 ) -> Result<RemoteEndpoint, agentpalace_core::AgentPalaceError> {
-    let oauth = remote.oauth.as_ref().map(|oauth| {
-        cli_oauth_store(context, oauth.allow_in_memory).map(|token_store| OAuthConfig {
-            client_id: oauth.client_id.clone(),
-            account: oauth.account.clone(),
-            allow_in_memory: oauth.allow_in_memory,
-            allow_loopback_demo: oauth.allow_loopback_demo,
-            login_mode: oauth.login_mode,
-            token_store: Some(token_store),
-            login_timeout_seconds: oauth.login_timeout_seconds,
-        })
-    }).transpose()?;
+    let oauth = match remote.oauth.as_ref() {
+        Some(oauth) => {
+            let token_store = cli_oauth_store(context, oauth.allow_in_memory)?;
+            Some(OAuthConfig {
+                client_id: oauth.client_id.clone(),
+                account: oauth.account.clone(),
+                allow_in_memory: oauth.allow_in_memory,
+                allow_loopback_demo: oauth.allow_loopback_demo,
+                login_mode: oauth.login_mode,
+                token_store: Some(token_store),
+                login_timeout_seconds: oauth.login_timeout_seconds,
+            })
+        }
+        None => None,
+    };
 
     Ok(RemoteEndpoint {
         name: remote.name.clone(),
@@ -3210,6 +3214,24 @@ mod tests {
             session.account.as_deref(),
         )).is_none());
         assert!(!config_root.join("oauth_tokens.json").exists());
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn cli_endpoint_injects_store_without_changing_oauth_policy() {
+        let config_root = temp_config_root("oauth-policy");
+        let context = CliContext::for_tests(config_root.clone());
+        let remote = oauth_test_remote(false);
+
+        let endpoint = cli_remote_endpoint(&context, &remote).unwrap();
+        let oauth = endpoint.oauth.expect("OAuth remotes retain OAuth configuration");
+        assert_eq!(oauth.client_id, "cli-test");
+        assert_eq!(oauth.account.as_deref(), Some("owner"));
+        assert!(!oauth.allow_in_memory);
+        assert!(!oauth.allow_loopback_demo);
+        assert_eq!(oauth.login_mode, OAuthLoginMode::Auto);
+        assert_eq!(oauth.login_timeout_seconds, 300);
+        assert!(oauth.token_store.is_some(), "CLI must inject its initiating-process store");
         remove_dir_all_if_exists(&config_root);
     }
 
