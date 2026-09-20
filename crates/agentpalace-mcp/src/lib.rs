@@ -1314,7 +1314,14 @@ impl MemoryExecutor {
         self.sender
             .try_send(Box::new(move || {
                 if !reply.is_closed() {
-                    let _ = reply.send(job());
+                    // Isolate each request just as Tokio's per-request tasks do. Unwinding
+                    // drops its runtime guard and admission permit, but must not kill the
+                    // shared worker. Do not expose arbitrary panic payloads to clients.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+                        .unwrap_or_else(|_| Err(ToolError::Internal(McpError::Execution(
+                            "memory request panicked".to_owned(),
+                        ))));
+                    let _ = reply.send(result);
                 }
             }))
             .map_err(|error| ToolError::Internal(McpError::Execution(error.to_string())))?;
@@ -10382,6 +10389,54 @@ mod tests {
             .await;
         let rooms_payload = decode_tool_payload(&post_delete_rooms).unwrap();
         assert!(rooms_payload["rooms"].as_object().unwrap().is_empty());
+    }
+
+    #[derive(Debug)]
+    struct PanicOnceProvider {
+        inner: DeterministicStubProvider,
+        panic_next: bool,
+    }
+
+    impl EmbeddingProvider for PanicOnceProvider {
+        fn profile(&self) -> &'static agentpalace_core::EmbeddingProfileMetadata {
+            self.inner.profile()
+        }
+
+        fn startup_validation(&self) -> agentpalace_embeddings::Result<StartupValidation> {
+            self.inner.startup_validation()
+        }
+
+        fn embed(&mut self, request: &EmbeddingRequest)
+            -> agentpalace_embeddings::Result<agentpalace_embeddings::EmbeddingResponse> {
+            assert!(!std::mem::take(&mut self.panic_next), "synthetic private panic payload");
+            self.inner.embed(request)
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_request_panic_releases_capacity_and_worker_serves_next_request() {
+        let tempdir = TempDir::new().unwrap();
+        let mut config = make_base_config(&tempdir.path().join("palace"), &tempdir);
+        config.low_cpu.enabled = true;
+        config.low_cpu.queue_limit = 1;
+        let server = McpServer::from_parts(config, PanicOnceProvider {
+            inner: DeterministicStubProvider::new(EmbeddingProfile::Balanced),
+            panic_next: true,
+        }).await.unwrap();
+        let first = server.handle_request(tool_call(1, "agentpalace_search",
+            json!({"query":"trigger embedding panic", "limit":1}))).await;
+        assert_eq!(first["error"]["code"], -32000);
+        assert_eq!(first["error"]["message"], "memory execution failed: memory request panicked");
+        assert!(!first.to_string().contains("synthetic private panic payload"));
+        assert_eq!(server.queue_limit.available_permits(), 1);
+        assert!(server.runtime.try_lock().is_ok(), "panicking request must release runtime lock");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2),
+            server.handle_request(tool_call(2, "agentpalace_search",
+                json!({"query":"worker remains usable", "limit":1})))).await.unwrap();
+        assert!(decode_tool_payload(&second).is_some(), "next memory request failed: {second}");
+        let lease = server.handle_request(tool_call(3, "agentpalace_task_get",
+            json!({"task_id":"missing"}))).await;
+        assert_eq!(decode_tool_payload(&lease).unwrap()["found"], false);
     }
 
     // A separate watchdog releases the deliberately synchronous embed if a regression

@@ -175,7 +175,9 @@ Memory execution remains serialized on one dedicated thread per MCP server,
 shared by server clones. This additional thread keeps synchronous embedding work
 off the Tokio workers and does not consume `max_blocking_threads`, so a single
 async worker and a single blocking-pool thread remain supported. The thread exits
-when the server and its outstanding work are dropped.
+when the server and its outstanding work are dropped. An unwinding panic in a
+memory request returns an internal error for that request; the worker remains
+available for subsequent requests.
 
 Stdio reads requests concurrently and serializes complete JSON response lines;
 responses may arrive out of request order and must be matched by JSON-RPC `id`.
