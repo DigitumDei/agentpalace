@@ -3213,6 +3213,27 @@ mod tests {
         remove_dir_all_if_exists(&config_root);
     }
 
+    #[test]
+    fn cli_endpoint_preserves_static_bearer_and_offline_defaults() {
+        let config_root = temp_config_root("static-remote");
+        let context = CliContext::for_tests(config_root.clone());
+        let remote = agentpalace_config::ResolvedRemote {
+            name: "offline".to_owned(),
+            url: "https://hub.example".to_owned(),
+            token: Some("static-token".to_owned()),
+            oauth: None,
+            timeout: Duration::from_secs(5),
+        };
+
+        let endpoint = cli_remote_endpoint(&context, &remote).unwrap();
+        assert_eq!(endpoint.name, remote.name);
+        assert_eq!(endpoint.base_url, remote.url);
+        assert_eq!(endpoint.token, remote.token);
+        assert!(endpoint.oauth.is_none(), "non-OAuth remotes must not receive a token store");
+        assert!(!config_root.join("oauth_tokens.json").exists());
+        remove_dir_all_if_exists(&config_root);
+    }
+
     #[derive(Debug, Clone)]
     struct StubProvider {
         profile: EmbeddingProfile,
