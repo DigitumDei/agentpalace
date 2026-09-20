@@ -185,6 +185,15 @@ unavailable, provide the device-code flow below without repeatedly launching
 browsers. An unattended agent surfaces the user-facing login action; it does
 not approve its own grant.
 
+The shared client exposes `login_mode` as `browser`, `device`, or `auto` (default
+`auto`), and `auth login` accepts the same values through `--mode`. The command
+starts from the protected-resource `resource_metadata` URL in the authentication
+challenge; it does not discover from an unrelated hub URL. An explicit mode is
+honored once. Automatic mode makes one browser/callback usability decision and
+selects device authorization when that path is unavailable, so a headless or WSL
+client does not repeatedly launch a browser. Bearer-token remotes and offline
+defaults remain unchanged.
+
 ### Device-code login for WSL, SSH, and headless clients
 
 Device authorization is also a **demo launch requirement**. Offer normal

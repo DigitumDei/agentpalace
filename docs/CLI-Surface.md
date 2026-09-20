@@ -15,8 +15,10 @@ OAuth is opt-in per configured remote. `auth login --remote <NAME>
 --resource-metadata <URL> [--mode browser|device|auto]` performs
 protected-resource and authorization-server discovery, then selects the
 configured or explicitly requested login mode. `browser` uses one native-client
-PKCE flow; `device` uses the RFC 8628 flow once available; `auto` chooses the
-browser/callback path when usable and otherwise falls back to device authorization.
+PKCE flow; `device` selects the RFC 8628 flow; `auto` chooses the
+browser/callback path when usable and otherwise selects device authorization.
+The mode is selected once per foreground login, so automatic selection does not
+repeatedly launch a browser after the callback path is known to be unavailable.
 The default configured mode is `auto`. The grant is stored
 through the configured secure token store (or only in memory when
 `allow_in_memory` is explicitly enabled). Background and MCP requests never

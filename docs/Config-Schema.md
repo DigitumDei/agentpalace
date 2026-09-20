@@ -583,7 +583,11 @@ The optional `federation` section of `~/.agentpalace/config.json` controls routi
 - `timeout_ms`: HTTP request timeout in milliseconds. Default: `5000`
 
 OAuth is represented by the non-secret `oauth` settings above. Run
-`agentpalace auth login --remote NAME --resource-metadata URL` for an explicit browser login;
+`agentpalace auth login --remote NAME --resource-metadata URL [--mode browser|device|auto]`;
+the command starts from the protected-resource metadata URL in the
+authentication challenge and uses the configured `login_mode` unless the CLI
+override is supplied. `auto` selects browser/callback only when usable,
+otherwise selecting device authorization;
 unattended calls return an authentication-required result instead of opening a browser. Library
 callers may inject a secure `TokenStore`; `allow_in_memory` is the explicit volatile/test mode and
 otherwise unavailable secure storage is reported. `agentpalace auth logout --remote NAME` clears

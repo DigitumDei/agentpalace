@@ -407,6 +407,7 @@ enum AuthCommands {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
 enum CliOAuthLoginMode { Browser, Device, Auto }
 
 impl From<CliOAuthLoginMode> for OAuthLoginMode {
@@ -3088,6 +3089,26 @@ mod tests {
     };
     use agentpalace_storage::{MaintenanceLeaseStore, StorageLayout};
     use tempfile::tempdir;
+
+    #[test]
+    fn auth_login_accepts_explicit_provider_neutral_mode() {
+        let cli = Cli::try_parse_from([
+            "agentpalace",
+            "auth",
+            "login",
+            "--remote",
+            "demo",
+            "--resource-metadata",
+            "https://hub.example/.well-known/oauth-protected-resource",
+            "--mode",
+            "device",
+        ])
+        .expect("auth login should parse");
+        match cli.command {
+            Commands::Auth { command: AuthCommands::Login { mode: Some(CliOAuthLoginMode::Device), .. } } => {}
+            _ => panic!("expected explicit device login mode"),
+        }
+    }
 
     #[derive(Debug, Clone)]
     struct StubProvider {

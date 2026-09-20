@@ -471,7 +471,7 @@ impl RemoteClient {
         let resource = self.base_url.clone();
         let (protected, metadata) = crate::discover_metadata(&self.http, resource_metadata, &resource, &resource, config.allow_loopback_demo)
             .await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: Some(resource_metadata.to_owned()) })?;
-        match crate::select_login_mode(mode.unwrap_or(config.login_mode), true) {
+        match crate::select_login_mode(mode.unwrap_or(config.login_mode), crate::browser_callback_usable()) {
             agentpalace_config::OAuthLoginMode::Browser => self.login(&metadata, &protected.resource).await,
             agentpalace_config::OAuthLoginMode::Device => Err(RemoteError::AuthenticationRequired {
                 remote: self.name.clone(),

@@ -1122,6 +1122,13 @@ mod tests {
     }
 
     #[test]
+    fn oauth_login_mode_is_strictly_validated_from_yaml() {
+        let value = serde_yaml::from_str::<OAuthLoginMode>("device").expect("device mode");
+        assert_eq!(value, OAuthLoginMode::Device);
+        assert!(serde_yaml::from_str::<OAuthLoginMode>("headless").is_err());
+    }
+
+    #[test]
     fn token_env_missing_falls_back_to_inline() {
         let section = FederationConfigV1 {
             remotes: vec![RemoteConfigV1 {

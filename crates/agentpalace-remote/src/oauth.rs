@@ -207,6 +207,31 @@ pub fn select_login_mode(configured: OAuthLoginMode, browser_usable: bool) -> OA
     }
 }
 
+/// Return whether this process has the prerequisites for the native browser flow.
+///
+/// This is deliberately a local capability check: it does not contact the hub and it does not
+/// launch a browser. Device mode is therefore selected before any browser side effect when the
+/// client is headless (or no platform opener is available).
+pub fn browser_callback_usable() -> bool {
+    if std::net::TcpListener::bind(("127.0.0.1", 0)).is_err() {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    { return true; }
+    #[cfg(target_os = "macos")]
+    { return command_in_path("open"); }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("BROWSER").is_some_and(|value| !value.is_empty()) || command_in_path("xdg-open")
+    }
+}
+
+#[cfg(unix)]
+fn command_in_path(command: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else { return false };
+    std::env::split_paths(&path).any(|dir| dir.join(command).is_file())
+}
+
 /// Fetch and validate protected-resource and authorization-server metadata. Redirects are not
 /// followed, so a malicious metadata endpoint cannot silently move discovery to another origin.
 pub async fn discover_metadata(
@@ -372,6 +397,11 @@ mod tests {
         assert_eq!(select_login_mode(OAuthLoginMode::Auto, false), OAuthLoginMode::Device);
         assert_eq!(select_login_mode(OAuthLoginMode::Device, true), OAuthLoginMode::Device);
         assert_eq!(select_login_mode(OAuthLoginMode::Browser, false), OAuthLoginMode::Browser);
+    }
+
+    #[test]
+    fn browser_capability_check_does_not_launch_a_process() {
+        let _ = browser_callback_usable();
     }
     #[test]
     fn metadata_rejects_resource_and_endpoint_mismatch() {
