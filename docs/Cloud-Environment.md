@@ -164,6 +164,14 @@ the per-package test split, the lint policy, and the offline-embeddings rule.
 Note that `.claude/` is gitignored, so local permission allowlists do not travel to the cloud
 environment; expect a fresh session to ask for approval on commands until you configure it.
 
+## Automatic pull request reviews
+
+The Claude Code Review workflow skips draft pull requests, so drafts can be used for
+CI checks without automatic review comments. Marking a pull request ready for review
+triggers Claude; subsequent pushes and reopen events also trigger review while it is
+not a draft. Normal CI continues to run on drafts. Explicit `@claude` requests remain
+available through the separate Claude workflow.
+
 ## Verifying a new environment
 
 ```bash
