@@ -1549,6 +1549,7 @@ where
                 &rule,
                 &project_config,
                 Some(&project_id),
+                context,
                 false,
             );
         }
@@ -1799,6 +1800,7 @@ fn execute_remote_mine(
     rule: &agentpalace_config::ResolvedRouteRule,
     project_config: &ProjectConfig,
     project_id: Option<&str>,
+    context: &CliContext,
     dual_write: bool,
 ) -> Result<CliOutput, clap::Error> {
     // `--batch-size N` (N>0) caps files per remote request, letting low-spec

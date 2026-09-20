@@ -165,7 +165,33 @@ impl RemoteClient {
         // The handshake is a read. A failed handshake therefore degrades to
         // `Unreachable` for the mutations gated behind it — "before send", never
         // `UnknownOutcome`.
-        self.execute(rb, CallKind::Read).await
+        match self.execute(rb, CallKind::Read).await {
+            Err(RemoteError::AuthenticationRequired { resource_metadata: Some(challenge), .. }) if self.oauth.is_some() => {
+                if self.load_stored_session_from_challenge(&challenge).await {
+                    self.execute(self.http.get(self.url("v1/info")?), CallKind::Read).await
+                } else {
+                    Err(RemoteError::AuthenticationRequired {
+                        remote: self.name.clone(),
+                        action: "run the explicit remote OAuth login command".to_owned(),
+                        resource_metadata: Some(challenge),
+                    })
+                }
+            }
+            result => result,
+        }
+    }
+
+    async fn load_stored_session_from_challenge(&self, resource_metadata: &str) -> bool {
+        let Some(config) = self.oauth.as_ref() else { return false };
+        let resource = self.base_url.clone();
+        let Ok((protected, metadata)) = crate::discover_metadata(
+            &self.http,
+            resource_metadata,
+            &resource,
+            &resource,
+            config.allow_loopback_demo,
+        ).await else { return false };
+        self.load_stored_session(&protected.resource, &metadata.issuer).await
     }
 
     /// Ensure the version handshake has been performed, returning a reference
@@ -494,11 +520,12 @@ impl RemoteClient {
     }
 
     async fn commit_session(&self, session: crate::OAuthSession) -> Result<()> {
-        // Persist first. A failed store must not leave a usable in-memory grant that
-        // contradicts the outcome reported to the caller.
-        self.token_store.save(session.clone()).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
+        // Publish the newly obtained grant before persistence. A transient secure-store
+        // failure must not discard a grant that just cost the user an interactive login, and
+        // the caller still receives the explicit persistence error for remediation.
         *self.token.lock().await = Some(session.access_token.clone());
-        *self.oauth_session.lock().await = Some(session);
+        *self.oauth_session.lock().await = Some(session.clone());
+        self.token_store.save(session).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
         Ok(())
     }
 

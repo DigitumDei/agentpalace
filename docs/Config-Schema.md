@@ -588,10 +588,12 @@ the command starts from the protected-resource metadata URL in the
 authentication challenge and uses the configured `login_mode` unless the CLI
 override is supplied. `auto` selects browser/callback only when usable,
 otherwise selecting device authorization;
-unattended calls return an authentication-required result instead of opening a browser. Library
-the CLI uses an owner-only local credential store under the configured AgentPalace home; embedding
+unattended calls return an authentication-required result instead of opening a browser. The CLI
+uses an owner-only local credential store under the configured AgentPalace home; embedding
 callers may inject a stronger secure `TokenStore`. `allow_in_memory` is the explicit volatile/test mode and
-otherwise storage failures are reported. `agentpalace auth logout --remote NAME --issuer ISSUER` clears
+otherwise storage failures are reported. Subsequent CLI commands load a matching stored grant after
+the remote's protected-resource challenge, so login and use may be separate processes.
+`agentpalace auth logout --remote NAME --issuer ISSUER` clears
 the local grant. `allow_loopback_demo` is required for an exact loopback issuer; other discovered
 metadata and endpoints must use HTTPS.
 

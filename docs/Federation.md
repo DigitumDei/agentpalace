@@ -85,8 +85,9 @@ only for an explicitly opted-in exact loopback demo origin; the native callback 
 PKCE uses S256 and callback state is mandatory. Credentials must be supplied by a secure
 `TokenStore` passed through the OAuth configuration; the included in-memory store is an explicit
 volatile/test choice. Store keys include resource, issuer, client ID, and optional account. If
-secure storage is unavailable, login reports it without retaining the grant. No token is placed in
-ordinary config, MCP output, logs, command arguments, or URLs.
+secure storage is unavailable or a save fails, login reports the persistence error but keeps the
+fresh grant only in the initiating process; a later process can use it only after storage succeeds.
+No token is placed in ordinary config, MCP output, logs, command arguments, or URLs.
 
 ## Part 1 — Running a server (the hub)
 
