@@ -1600,15 +1600,15 @@ mod tests {
             }))
             .route("/v1/info", axum::routing::get({
                 let hits = Arc::clone(&hits);
-                let challenge_resource = resource.clone();
+                let metadata_url = format!("{resource}.well-known/oauth-protected-resource");
                 move || {
                     let hits = Arc::clone(&hits);
-                    let resource = challenge_resource.clone();
+                    let metadata_url = metadata_url.clone();
                     async move {
                         if hits.fetch_add(1, Ordering::SeqCst) == 0 {
                             (
                                 axum::http::StatusCode::UNAUTHORIZED,
-                                [(axum::http::header::WWW_AUTHENTICATE, format!("Bearer resource_metadata={resource}"))],
+                                [(axum::http::header::WWW_AUTHENTICATE, format!("Bearer resource_metadata={metadata_url}"))],
                                 "unauthorized",
                             ).into_response()
                         } else {
