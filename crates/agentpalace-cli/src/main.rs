@@ -3105,7 +3105,7 @@ mod tests {
         ])
         .expect("auth login should parse");
         match cli.command {
-            Commands::Auth { command: AuthCommands::Login { mode: Some(CliOAuthLoginMode::Device), .. } } => {}
+            Some(Commands::Auth { command: AuthCommands::Login { mode: Some(CliOAuthLoginMode::Device), .. } }) => {}
             _ => panic!("expected explicit device login mode"),
         }
     }
