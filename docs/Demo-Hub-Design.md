@@ -1,8 +1,8 @@
 # Demo hub design
 
-Status: implementation in progress, 2026-09-21. The architecture foundation is
-implemented in `agentpalace-demo-hub`; HTTP handlers, persistent grants, and the
-Google claim-validation flow remain subsequent slices. The demo has not shipped
+Status: implementation in progress, 2026-09-21. The gateway protocol slice is
+implemented in `agentpalace-demo-hub`; durable deployment storage and the live
+Google JWKS adapter remain hosting-layer work. The demo has not shipped
 and AgentPalace is not ready for 1.0.
 
 A tester supplies their own Google OAuth credentials and admin email, starts
