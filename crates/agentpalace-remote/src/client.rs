@@ -1160,7 +1160,7 @@ mod tests {
         crate::OAuthSession {
             access_token: access_token.to_owned(),
             refresh_token: Some("refresh-token".to_owned()),
-            expires_at: Some(123),
+            expires_at: None,
             resource: resource.to_owned(),
             issuer: issuer.to_owned(),
             client_id: "test-client".to_owned(),
