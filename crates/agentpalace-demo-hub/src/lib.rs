@@ -242,13 +242,33 @@ struct GatewayState { codes: BTreeMap<String, CodeGrant>, browser: BTreeMap<Stri
 
 /// A hub browser session. The CSRF secret is never serialized or returned.
 #[derive(Debug, Clone)]
-pub struct BrowserSession { /// Authenticated owner. pub owner: AdmissionIdentity, /// Session CSRF value. pub csrf: String, /// Last successful upstream authentication. pub authenticated_at: u64 }
+pub struct BrowserSession {
+    /// Authenticated owner.
+    pub owner: AdmissionIdentity,
+    /// Session CSRF value.
+    pub csrf: String,
+    /// Last successful upstream authentication.
+    pub authenticated_at: u64,
+}
 
 /// A deliberately small role ceiling for agents acting through an owner grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentGrantRole { /// Read-only access. Readonly, /// Read and write access. Write }
+pub enum AgentGrantRole {
+    /// Read-only access.
+    Readonly,
+    /// Read and write access.
+    Write,
+}
 
-impl AgentGrantRole { /// Admin-owned agents may never exceed this ceiling. pub const fn admin_ceiling(self) -> Self { match self { Self::Write => Self::Write, Self::Readonly => Self::Readonly } } }
+impl AgentGrantRole {
+    /// Admin-owned agents may never exceed this ceiling.
+    pub const fn admin_ceiling(self) -> Self {
+        match self {
+            Self::Write => Self::Write,
+            Self::Readonly => Self::Readonly,
+        }
+    }
+}
 
 impl Gateway {
     /// Create a gateway after validating its server-side configuration.
@@ -503,7 +523,15 @@ pub struct TokenResponse { pub access_token: String, pub refresh_token: String, 
 /// output and logs.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DeviceResponse { /// Private client-only polling credential. pub device_code: String, /// User-facing verification code. pub user_code: String, pub verification_uri: String, pub expires_in: u64, pub interval: u64 }
+pub struct DeviceResponse {
+    /// Private client-only polling credential.
+    pub device_code: String,
+    /// User-facing verification code.
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
 /// Protocol failures map to standard OAuth error names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ProtocolError { InvalidRequest, InvalidGrant, AccessDenied, AuthorizationPending, SlowDown, ExpiredToken, ServerError }
