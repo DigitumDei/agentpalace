@@ -192,7 +192,7 @@ impl RemoteClient {
             config.allow_loopback_demo,
         ).await else { return false };
         if !self.load_stored_session(&protected.resource, &metadata.issuer).await { return false; }
-        let expired = self.oauth_session.lock().await.as_ref().and_then(|session| session.expires_at).is_some_and(|expires_at| expires_at <= crate::now_seconds());
+        let expired = self.oauth_session.lock().await.as_ref().and_then(|session| session.expires_at).is_some_and(|expires_at| expires_at <= crate::oauth::now_seconds());
         if expired { self.refresh(&metadata).await.is_ok() } else { true }
     }
 
@@ -481,7 +481,7 @@ impl RemoteClient {
             return Ok(());
         }
         let mut session = crate::browser_login(&self.http, metadata, config, resource).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
-        session.resource = self.base_url.clone();
+        session.resource = self.base_url.to_string();
         self.commit_session(session).await
     }
 
@@ -519,7 +519,7 @@ impl RemoteClient {
         }
         let mut session = crate::device_login(&self.http, metadata, config, resource).await
             .map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
-        session.resource = self.base_url.clone();
+        session.resource = self.base_url.to_string();
         self.commit_session(session).await
     }
 
@@ -553,7 +553,7 @@ impl RemoteClient {
                 let clear_error = self.token_store.clear(&current.resource, &current.issuer, &current.client_id, current.account.as_deref()).await.err();
                 *self.token.lock().await = None;
                 *self.oauth_session.lock().await = None;
-                let action = clear_error.map_or(message, |clear| format!("{message}; credential cleanup also failed: {clear}"));
+                let action = clear_error.map_or(message.clone(), |clear| format!("{message}; credential cleanup also failed: {clear}"));
                 return Err(RemoteError::AuthenticationRequired { remote: self.name.clone(), action, resource_metadata: None });
             }
         };
