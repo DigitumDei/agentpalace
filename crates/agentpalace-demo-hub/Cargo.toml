@@ -8,7 +8,10 @@ description = "Fail-closed authorization gateway foundation for the local AgentP
 
 [dependencies]
 agentpalace-core = { path = "../agentpalace-core" }
+axum = { version = "0.8", default-features = true }
+blake3.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [lints]

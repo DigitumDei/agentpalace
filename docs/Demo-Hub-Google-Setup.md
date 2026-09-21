@@ -1,9 +1,8 @@
 # Google OAuth setup for the local demo
 
-Status: preparation guide, 2026-09-17. The Docker demo is still a proposal.
-The localhost URL and callback below are the proposed package defaults; confirm
-them against the implemented example before creating credentials. No Google
-Cloud resources have been created by this work.
+Status: tester-owned setup guide, 2026-09-21. The gateway supports the
+documented loopback protocol endpoints; no Google Cloud resources have been
+created by this work.
 
 The tester performs this setup in their own Google Cloud project. It provides
 Google sign-in for containers running on their machine; it does not deploy
@@ -51,8 +50,8 @@ to match before use.
 
 ## 3. Supply the tester's local settings
 
-The package will provide an example environment/configuration file with these
-inputs (exact variable names will be finalized with implementation):
+The gateway configuration supplies these inputs (the package does not provide
+credentials or a maintainer-owned account):
 
 | Setting | Value |
 |---|---|

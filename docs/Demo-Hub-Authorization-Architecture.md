@@ -1,13 +1,13 @@
 # Demo hub authorization architecture
 
-Status: implemented foundation, 2026-09-21. This note records the component
-decision for issue #164's gateway slice. It does not claim live Google evidence,
-deployment, or a finished authentication service.
+Status: implemented gateway slice, 2026-09-21. This note records the component
+decision and the protocol boundary for issue #164. It does not claim live Google
+evidence, deployment, or operation of a tester's account.
 
 ## Boundary and ownership
 
 `agentpalace-demo-hub` is the dedicated gateway crate and `demo-hub` is its
-configuration-only binary in this slice. The gateway is the only place where
+local gateway binary. The gateway is the only place where
 Google-specific login belongs. It receives verified upstream identity evidence,
 maps it to the existing provider-neutral `AuthenticatedOwner` (`owner_id`,
 issuer, subject, and email-at-write), and later issues credentials whose
@@ -39,11 +39,13 @@ ceilings, grant ownership, and provenance separation. Dependency versions are
 introduced with the endpoint slices so the lockfile changes remain reviewable
 and each protocol surface has matching tests.
 
-## Planned gateway surfaces
+## Implemented gateway surfaces
 
-The architecture contract advertises protected-resource and authorization-server
-metadata, native registration, authorization/token/revocation, and device
-authorization/verification endpoints. Later slices must implement them with:
+The gateway advertises protected-resource and authorization-server metadata,
+native registration, authorization/token/revocation, and device
+authorization/verification endpoints. The in-memory demo state implements the
+protocol invariants below; a durable adapter must persist the same records
+atomically before deployment:
 
 * authorization codes bound to client, redirect, S256 challenge, owner,
   resource, and consent, then consumed once and expired quickly;
@@ -54,8 +56,9 @@ authorization/verification endpoints. Later slices must implement them with:
 * browser sessions protected by CSRF, with recent authentication required for
   administration and connection lists/revocation limited to the authenticated
   owner's grants;
-* a fail-closed admission-policy interface until the access-control slice is
-  available. Verified email is evidence; the immutable owner ID and
+* a fail-closed admission-policy interface. The default denies every identity;
+  an access-control adapter must admit only verified email plus stable
+  issuer/subject and immutable owner ID. Verified email is evidence; the immutable owner ID and
   issuer/subject binding are authoritative. Email changes and subject
   reassignment require explicit admission handling, and external non-Gmail or
   non-Workspace mailboxes require the design's additional mailbox proof.
