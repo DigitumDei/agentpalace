@@ -516,7 +516,7 @@ fn issue(state: &mut GatewayState, owner: AdmissionIdentity, resource: &str) -> 
 fn issue_with_family(state: &mut GatewayState, family: String, owner: AdmissionIdentity, resource: &str, grant_expiry: u64) -> TokenResponse { let access = secret("access", owner.owner.id.as_str(), resource); let refresh = secret("refresh", owner.owner.id.as_str(), &access); state.access.insert(access.clone(), AccessGrant { owner: owner.clone(), resource: resource.into(), expires: now()+900, revoked: false }); state.refresh.insert(refresh.clone(), RefreshGrant { family, owner, resource: resource.into(), expires: grant_expiry, current: refresh.clone(), revoked: false }); TokenResponse { access_token: access, refresh_token: refresh, token_type: "Bearer".into(), expires_in: 900, resource: resource.into() } }
 
 /// OAuth token response issued by the hub, never by Google.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenResponse { pub access_token: String, pub refresh_token: String, pub token_type: String, pub expires_in: u64, pub resource: String }
 /// RFC 8628 response. The device code is returned to the requesting client
 /// over the token endpoint response; clients must keep it out of user-facing
@@ -763,7 +763,7 @@ mod tests {
         let code = gateway.authorize_code("agentpalace-native", "http://127.0.0.1:49152/callback", &pkce("v"), "http://localhost:8080/api", identity.clone(), true, "state", "state", "nonce", "nonce").expect("code");
         let token = gateway.exchange_code(&code, "agentpalace-native", "http://127.0.0.1:49152/callback", "v", "http://localhost:8080/api").expect("token");
         assert!(gateway.authorize_rest(&token.access_token, "wrong-resource").is_err());
-        assert_eq!(gateway.authorize_rest(&token.access_token, "http://localhost:8080/api").expect("hub token").owner.owner.id, "owner-1");
+        assert_eq!(gateway.authorize_rest(&token.access_token, "http://localhost:8080/api").expect("hub token").owner.id, "owner-1");
         let mut claims = GoogleIdClaims { iss: "https://accounts.google.com".into(), aud: "google-client".into(), sub: "subject-1".into(), email: "person@example.com".into(), email_verified: true, exp: now() + 60, nonce: "nonce".into() };
         assert!(verify_google_claims(&config(GatewayMode::LoopbackDemo).google, &claims, "nonce").is_ok());
         claims.email_verified = false;
@@ -784,7 +784,7 @@ mod tests {
         let (gateway, identity) = gateway();
         let owner = gateway.policy.admit(&identity).expect("admission");
         gateway.create_session("s", owner, "csrf").expect("session");
-        assert_eq!(gateway.require_recent_auth("s", Duration::from_secs(60)).expect("recent").owner.owner.id, "owner-1");
+        assert_eq!(gateway.require_recent_auth("s", Duration::from_secs(60)).expect("recent").owner.id, "owner-1");
         assert_eq!(gateway.revoke_own_grant("s", "wrong", "token"), Err(ProtocolError::InvalidRequest));
     }
 
