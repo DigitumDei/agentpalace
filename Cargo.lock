@@ -78,6 +78,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentpalace-demo-hub"
+version = "0.1.0"
+dependencies = [
+ "agentpalace-core",
+ "axum",
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "agentpalace-dialect"
 version = "0.1.0"
 dependencies = [
