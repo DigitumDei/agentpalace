@@ -98,6 +98,7 @@ and `search` use the same executable. See [HTTP MCP setup](docs/Federation.md#ht
 | `agentpalace-remote` | Federation HTTP client (RemoteApi trait + RemoteClient) |
 | `agentpalace-a2a` | A2A protocol adapter: translation library between A2A and coordination storage |
 | `agentpalace-mcp-tasks` | MCP Tasks extension adapter: translation library between `io.modelcontextprotocol/tasks` and coordination storage |
+| `agentpalace-demo-hub` | Fail-closed authorization gateway foundation and protocol metadata contract for the local demo hub |
 
 ## Requirements
 

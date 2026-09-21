@@ -1,8 +1,9 @@
 # Demo hub design
 
-Status: proposal, 2026-09-17. The hub, API examples, and new provenance fields
-below are not implemented. The accompanying release-series change starts 0.2;
-it does not mean the demo has shipped or AgentPalace is ready for 1.0.
+Status: implementation in progress, 2026-09-21. The architecture foundation is
+implemented in `agentpalace-demo-hub`; HTTP handlers, persistent grants, and the
+Google claim-validation flow remain subsequent slices. The demo has not shipped
+and AgentPalace is not ready for 1.0.
 
 A tester supplies their own Google OAuth credentials and admin email, starts
 the Docker example, and connects a local palace. Public hosting, retention,

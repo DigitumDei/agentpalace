@@ -1,0 +1,15 @@
+[package]
+name = "agentpalace-demo-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Fail-closed authorization gateway foundation for the local AgentPalace demo hub."
+
+[dependencies]
+agentpalace-core = { path = "../agentpalace-core" }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
