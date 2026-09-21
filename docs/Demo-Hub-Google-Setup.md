@@ -99,6 +99,13 @@ For an SSH-hosted client, device authorization remains supported when the hub
 is reachable from that client and the browser. Exposing or tunneling a remotely
 hosted hub is outside this local package's required setup.
 
+For real-browser validation, first confirm Docker Desktop is running, WSL can
+resolve and reach the configured hub origin, and the browser can reach that same
+origin. Keep the demo loopback-only. Run CLI login once with `--mode browser`,
+make an authenticated read, then repeat with `--mode device` from WSL or a
+headless client. These are instructions only; this repository does not claim
+live Google-account or Google-resource evidence.
+
 ## Troubleshooting
 
 - **redirect_uri_mismatch:** compare the full registered callback to the

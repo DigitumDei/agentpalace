@@ -191,7 +191,9 @@ impl RemoteClient {
             &resource,
             config.allow_loopback_demo,
         ).await else { return false };
-        self.load_stored_session(&protected.resource, &metadata.issuer).await
+        if !self.load_stored_session(&protected.resource, &metadata.issuer).await { return false; }
+        let expired = self.oauth_session.lock().await.as_ref().and_then(|session| session.expires_at).is_some_and(|expires_at| expires_at <= crate::now_seconds());
+        if expired { self.refresh(&metadata).await.is_ok() } else { true }
     }
 
     /// Ensure the version handshake has been performed, returning a reference
@@ -478,7 +480,8 @@ impl RemoteClient {
         }) {
             return Ok(());
         }
-        let session = crate::browser_login(&self.http, metadata, config, resource).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
+        let mut session = crate::browser_login(&self.http, metadata, config, resource).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
+        session.resource = self.base_url.clone();
         self.commit_session(session).await
     }
 
@@ -514,8 +517,9 @@ impl RemoteClient {
         }) {
             return Ok(());
         }
-        let session = crate::device_login(&self.http, metadata, config, resource).await
+        let mut session = crate::device_login(&self.http, metadata, config, resource).await
             .map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
+        session.resource = self.base_url.clone();
         self.commit_session(session).await
     }
 
@@ -546,10 +550,11 @@ impl RemoteClient {
         let session = match crate::refresh(&self.http, metadata, &current).await {
             Ok(session) => session,
             Err(message) => {
-                self.token_store.clear(&current.resource, &current.issuer, &current.client_id, current.account.as_deref()).await;
+                let clear_error = self.token_store.clear(&current.resource, &current.issuer, &current.client_id, current.account.as_deref()).await.err();
                 *self.token.lock().await = None;
                 *self.oauth_session.lock().await = None;
-                return Err(RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None });
+                let action = clear_error.map_or(message, |clear| format!("{message}; credential cleanup also failed: {clear}"));
+                return Err(RemoteError::AuthenticationRequired { remote: self.name.clone(), action, resource_metadata: None });
             }
         };
         self.commit_session(session).await
@@ -564,7 +569,8 @@ impl RemoteClient {
             let result = if let Some(metadata) = metadata {
                 crate::revoke(&self.http, metadata, &session).await
             } else { Ok(()) };
-            self.token_store.clear(&session.resource, &session.issuer, &session.client_id, session.account.as_deref()).await;
+            self.token_store.clear(&session.resource, &session.issuer, &session.client_id, session.account.as_deref()).await
+                .map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
             result.map_err(|message| RemoteError::RemoteRejected { remote: self.name.clone(), status: 401, body: message })?;
         }
         Ok(())
@@ -1178,11 +1184,12 @@ mod tests {
             Err("test credential store failure".to_owned())
         }
 
-        async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) {
+        async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> std::result::Result<(), String> {
             let mut session = self.session.lock().await;
             if session.as_ref().is_some_and(|value| value.resource == resource && value.issuer == issuer && value.client_id == client_id && value.account.as_deref() == account) {
                 *session = None;
             }
+            Ok(())
         }
     }
 
@@ -1633,7 +1640,7 @@ mod tests {
         let path = directory.path().join("oauth.json");
         let store = Arc::new(crate::FileTokenStore::new(&path));
         let client = RemoteClient::new(oauth_endpoint("https://hub.example", store.clone())).unwrap();
-        let session = oauth_session(client.base_url(), "https://issuer.example", "logout-access");
+        let session = oauth_session("https://hub.example", "https://issuer.example", "logout-access");
         store.save(session).await.unwrap();
         assert!(client.load_stored_session("https://hub.example/", "https://issuer.example").await);
         client.logout(None).await.unwrap();

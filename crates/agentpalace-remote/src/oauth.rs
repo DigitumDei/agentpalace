@@ -112,13 +112,19 @@ pub struct OAuthSession {
     pub account: Option<String>,
 }
 
+fn resource_key(raw: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw) else { return raw.to_owned() };
+    if !url.path().ends_with('/') { url.set_path(&format!("{}/", url.path())); }
+    url.to_string()
+}
+
 /// Storage boundary for credentials. Implementations must scope records by all session identity
 /// fields and must not use ordinary config files for secret material.
 #[async_trait::async_trait]
 pub trait TokenStore: Send + Sync + std::fmt::Debug {
     async fn load(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Option<OAuthSession>;
     async fn save(&self, session: OAuthSession) -> Result<(), String>;
-    async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>);
+    async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Result<(), String>;
 }
 
 /// Explicit volatile credential storage for offline/test use.
@@ -158,38 +164,39 @@ impl TokenStore for UnavailableTokenStore {
     async fn save(&self, _session: OAuthSession) -> Result<(), String> {
         Err("secure OS credential storage is unavailable; enable explicit in-memory mode".to_owned())
     }
-    async fn clear(&self, _resource: &str, _issuer: &str, _client_id: &str, _account: Option<&str>) {}
+    async fn clear(&self, _resource: &str, _issuer: &str, _client_id: &str, _account: Option<&str>) -> Result<(), String> { Ok(()) }
 }
 
 #[async_trait::async_trait]
 impl TokenStore for InMemoryTokenStore {
     async fn load(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Option<OAuthSession> {
         let value = self.0.lock().await.clone()?;
-        (value.resource == resource && value.issuer == issuer && value.client_id == client_id && value.account.as_deref() == account).then_some(value)
+        (resource_key(&value.resource) == resource_key(resource) && value.issuer == issuer && value.client_id == client_id && value.account.as_deref() == account).then_some(value)
     }
     async fn save(&self, session: OAuthSession) -> Result<(), String> {
         *self.0.lock().await = Some(session);
         Ok(())
     }
-    async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) {
+    async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Result<(), String> {
         let mut guard = self.0.lock().await;
-        if guard.as_ref().is_some_and(|s| s.resource == resource && s.issuer == issuer && s.client_id == client_id && s.account.as_deref() == account) {
+        if guard.as_ref().is_some_and(|s| resource_key(&s.resource) == resource_key(resource) && s.issuer == issuer && s.client_id == client_id && s.account.as_deref() == account) {
             *guard = None;
         }
+        Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl TokenStore for FileTokenStore {
     async fn load(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Option<OAuthSession> {
-        self.read_all().await.into_iter().find(|session| session.resource == resource && session.issuer == issuer && session.client_id == client_id && session.account.as_deref() == account)
+        self.read_all().await.into_iter().find(|session| resource_key(&session.resource) == resource_key(resource) && session.issuer == issuer && session.client_id == client_id && session.account.as_deref() == account)
     }
 
     async fn save(&self, session: OAuthSession) -> Result<(), String> {
         let _guard = self.lock.lock().await;
         let mut sessions: Vec<OAuthSession> = std::fs::read(&self.path).ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-        sessions.retain(|current| !(current.resource == session.resource && current.issuer == session.issuer && current.client_id == session.client_id && current.account.as_deref() == session.account.as_deref()));
+        sessions.retain(|current| !(resource_key(&current.resource) == resource_key(&session.resource) && current.issuer == session.issuer && current.client_id == session.client_id && current.account.as_deref() == session.account.as_deref()));
         sessions.push(session);
         let body = serde_json::to_vec(&sessions).map_err(|_| "OAuth credential store could not be encoded".to_owned())?;
         if let Some(parent) = self.path.parent() { std::fs::create_dir_all(parent).map_err(|_| "OAuth credential store directory could not be created".to_owned())?; }
@@ -200,12 +207,17 @@ impl TokenStore for FileTokenStore {
         std::fs::rename(&temporary, &self.path).map_err(|_| "OAuth credential store could not be committed".to_owned())
     }
 
-    async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) {
+    async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Result<(), String> {
         let _guard = self.lock.lock().await;
-        let Ok(bytes) = std::fs::read(&self.path) else { return };
-        let mut sessions: Vec<OAuthSession> = serde_json::from_slice(&bytes).unwrap_or_default();
-        sessions.retain(|session| !(session.resource == resource && session.issuer == issuer && session.client_id == client_id && session.account.as_deref() == account));
-        if let Ok(body) = serde_json::to_vec(&sessions) { let _ = std::fs::write(&self.path, body); }
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err("OAuth credential store could not be read".to_owned()),
+        };
+        let mut sessions: Vec<OAuthSession> = serde_json::from_slice(&bytes).map_err(|_| "OAuth credential store was malformed".to_owned())?;
+        sessions.retain(|session| !(resource_key(&session.resource) == resource_key(resource) && session.issuer == issuer && session.client_id == client_id && session.account.as_deref() == account));
+        let body = serde_json::to_vec(&sessions).map_err(|_| "OAuth credential store could not be encoded".to_owned())?;
+        std::fs::write(&self.path, body).map_err(|_| "OAuth credential store could not be written".to_owned())
     }
 }
 
@@ -302,7 +314,9 @@ pub fn browser_callback_usable() -> bool {
     { return command_in_path("open"); }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        std::env::var_os("BROWSER").is_some_and(|value| !value.is_empty()) || command_in_path("xdg-open")
+        std::env::var_os("BROWSER").is_some_and(|value| !value.is_empty())
+            || (std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some())
+                && command_in_path("xdg-open")
     }
 }
 
@@ -423,7 +437,8 @@ pub async fn device_login(
     // intentionally never formatted, logged, or returned by this function.
     eprintln!("Open {} and enter code {}.", grant.verification_uri, grant.user_code);
     let deadline = tokio::time::Instant::now() + login_timeout(config).min(Duration::from_secs(grant.expires_in.unwrap_or(900)));
-    let mut interval = Duration::from_secs(grant.interval.unwrap_or(5).clamp(1, 60));
+    let mut interval = Duration::from_secs(grant.interval.unwrap_or(5).max(1));
+    let mut network_backoff = interval;
     loop {
         tokio::time::sleep(interval).await;
         if tokio::time::Instant::now() >= deadline { return Err("device authorization expired".to_owned()); }
@@ -435,8 +450,8 @@ pub async fn device_login(
         let response = match response {
             Ok(response) => response,
             Err(_) => {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                interval = (interval * 2).min(Duration::from_secs(8)).min(remaining);
+                network_backoff = network_backoff.saturating_mul(2);
+                interval = interval.max(network_backoff);
                 continue;
             }
         };
@@ -449,13 +464,17 @@ pub async fn device_login(
         let error = serde_json::from_slice::<OAuthErrorResponse>(&bytes).map(|body| body.error).unwrap_or_default();
         match error.as_str() {
             "authorization_pending" => {}
-            "slow_down" => interval = (interval + Duration::from_secs(5)).min(Duration::from_secs(60)),
+            "slow_down" => {
+                interval = interval.saturating_add(Duration::from_secs(5));
+                network_backoff = network_backoff.max(interval);
+            }
             "expired_token" => return Err("device authorization expired".to_owned()),
             "access_denied" | "authorization_denied" => return Err("device authorization was denied".to_owned()),
             "invalid_grant" | "invalid_request" => return Err("device authorization code was rejected or already used".to_owned()),
             _ if status.is_client_error() => return Err("device authorization was rejected".to_owned()),
             _ => {
-                interval = (interval * 2).min(Duration::from_secs(8));
+                network_backoff = network_backoff.saturating_mul(2);
+                interval = interval.max(network_backoff);
             }
         }
     }
@@ -629,7 +648,7 @@ mod tests {
         let other = OAuthSession { issuer: "https://other-issuer".to_owned(), access_token: "other-access".to_owned(), ..session.clone() };
         FileTokenStore::new(&path).save(other).await.expect("second issuer");
         assert_eq!(FileTokenStore::new(&path).load("https://resource", "https://issuer", "client", None).await.map(|s| s.access_token), Some("access".to_owned()));
-        FileTokenStore::new(&path).clear("https://resource", "https://issuer", "client", None).await;
+        FileTokenStore::new(&path).clear("https://resource", "https://issuer", "client", None).await.expect("clear store");
         assert!(FileTokenStore::new(&path).load("https://resource", "https://issuer", "client", None).await.is_none());
         assert_eq!(FileTokenStore::new(&path).load("https://resource", "https://other-issuer", "client", None).await.map(|s| s.access_token), Some("other-access".to_owned()));
     }
@@ -690,10 +709,11 @@ mod tests {
         let (origin, state, task) = device_server(vec![
             (StatusCode::OK, r#"{"device_code":"private","user_code":"ABCD","verification_uri":"https://issuer.example/verify","expires_in":30,"interval":1}"#),
             (StatusCode::BAD_REQUEST, r#"{"error":"slow_down"}"#),
+            (StatusCode::OK, r#"{"access_token":"access","refresh_token":"rotated","expires_in":60}"#),
         ]).await;
-        let result = device_login(&reqwest::Client::new(), &device_metadata(&origin), &device_config(1), &origin).await;
-        assert!(result.expect_err("short device timeout").contains("expired"));
-        assert_eq!(state.lock().await.len(), 1);
+        let result = device_login(&reqwest::Client::new(), &device_metadata(&origin), &device_config(10), &origin).await.expect("slow_down should be consumed");
+        assert_eq!(result.refresh_token.as_deref(), Some("rotated"));
+        assert_eq!(state.lock().await.len(), 0);
         task.abort();
     }
 

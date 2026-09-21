@@ -739,7 +739,13 @@ fn execute_auth(
         .map_err(|error| clap::Error::raw(clap::error::ErrorKind::Io, error.to_string()))?;
     let result = runtime.block_on(async {
         match operation {
-            AuthOperation::Login(resource_metadata, mode) => client.login_from_challenge_with_mode(&resource_metadata, mode).await.map(|_| "OAuth login completed; credentials were stored by the configured token store.\n".to_owned()),
+            AuthOperation::Login(resource_metadata, mode) => client.login_from_challenge_with_mode(&resource_metadata, mode).await.map(|_| {
+                if remote.oauth.as_ref().is_some_and(|oauth| oauth.allow_in_memory) {
+                    "OAuth login completed; credentials are held in volatile memory for this process only.\n".to_owned()
+                } else {
+                    "OAuth login completed; credentials were stored by the configured token store.\n".to_owned()
+                }
+            }),
             AuthOperation::Logout(issuer) => {
                 let resource = client.base_url().to_owned();
                 let loaded = client.load_stored_session(&resource, &issuer).await;
