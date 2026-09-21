@@ -27,7 +27,7 @@ excluded from serialized output.
 |---|---|---|
 | HTTP routing and middleware | Axum 0.8 with Tokio | Route inventory, HTTPS/loopback rule, no `/mcp` or broad REST forwarding |
 | OAuth authorization-code/device protocol | `oauth2` maintained Rust implementation, with RFC 8252 PKCE and RFC 8628 handlers | One-time code binding, consent, resource/client checks, polling limits and error semantics |
-| Google OIDC discovery and ID-token validation | `openidconnect` maintained Rust implementation at the hosting adapter boundary | Exact issuer/audience/expiry/signature/verified-email checks, state and nonce, and no Google token admission |
+| Google OIDC discovery and ID-token validation | `openidconnect` maintained Rust implementation, injected through `GoogleOidcVerifier` | Exact issuer/audience/expiry/signature/verified-email checks, server-held state and nonce, and no Google token admission |
 | Hub JWT signing/key rotation | `jsonwebtoken` with a server-side key ring | Hub issuer/resource claims, 15-minute access lifetime, seven-day grant ceiling, key rotation and revocation |
 | Browser sessions and CSRF | `tower-sessions` plus Axum middleware | Secure cookie policy, CSRF on mutations, recent-auth admin boundary and own-connection filtering |
 | Durable grants, admissions, and revocation | Existing SQLite/Rusqlite storage boundary | Immutable owner/issuer/subject binding, email-change handling, refresh reuse detection and fail-closed admission policy |
@@ -62,6 +62,14 @@ atomically before deployment:
   issuer/subject binding are authoritative. Email changes and subject
   reassignment require explicit admission handling, and external non-Gmail or
   non-Workspace mailboxes require the design's additional mailbox proof.
+
+The HTTP `/authorize` handler creates a server-held browser transaction; it does
+not accept an identity object or caller-supplied expected state/nonce. The
+configured OIDC adapter exchanges the Google authorization code and validates
+the returned ID token at `/auth/google/callback`, after which the gateway
+consumes the transaction and returns a hub authorization code. A Google ID
+token or access token is never accepted by `/token` or by the protected
+resource.
 
 ## Explicit exclusions
 

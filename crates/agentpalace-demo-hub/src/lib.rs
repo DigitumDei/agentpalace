@@ -8,7 +8,7 @@
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::{get, post}, Json, Router};
+use axum::{extract::{Query, State}, http::StatusCode, response::IntoResponse, routing::{get, post}, Json, Router};
 use agentpalace_core::{AuthenticatedOwner, Issuer, OwnerId, SubjectBinding};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -53,6 +53,15 @@ pub struct GoogleIdClaims {
     pub exp: u64,
     /// OIDC nonce bound to the browser transaction.
     pub nonce: String,
+}
+
+/// Boundary for a maintained OIDC implementation (for example
+/// `openidconnect`). Implementations must validate the Google JWKS signature
+/// before returning claims; the gateway never decodes an unverified JWT.
+pub trait GoogleOidcVerifier: Send + Sync {
+    /// Exchange a Google authorization code and verify its ID token for the transaction nonce.
+    /// The implementation keeps the client secret and upstream token response server-side.
+    fn exchange_and_verify(&self, authorization_code: &str, expected_nonce: &str) -> Result<GoogleIdClaims, GoogleClaimError>;
 }
 
 /// Validate the security claims which are independent of a particular
@@ -209,9 +218,11 @@ impl AdmissionPolicy for DenyAllAdmission {
 #[derive(Debug, Clone)]
 struct CodeGrant { client_id: String, redirect_uri: String, challenge: String, resource: String, owner: AdmissionIdentity, expires: u64, used: bool }
 #[derive(Debug, Clone)]
-struct DeviceGrant { client_id: String, resource: String, user_code: String, owner: Option<AdmissionIdentity>, expires: u64, next_poll: u64, polls: u32, denied: bool }
+struct BrowserTransaction { client_id: String, redirect_uri: String, challenge: String, resource: String, state: String, nonce: String, expires: u64 }
 #[derive(Debug, Clone)]
-struct RefreshGrant { owner: AdmissionIdentity, resource: String, expires: u64, current: String, revoked: bool }
+struct DeviceGrant { client_id: String, resource: String, user_code: String, owner: Option<AdmissionIdentity>, verify_state: Option<String>, verify_nonce: Option<String>, expires: u64, next_poll: u64, polls: u32, verify_attempts: u32, denied: bool }
+#[derive(Debug, Clone)]
+struct RefreshGrant { family: String, owner: AdmissionIdentity, resource: String, expires: u64, current: String, revoked: bool }
 #[derive(Debug, Clone)]
 struct AccessGrant { owner: AdmissionIdentity, resource: String, expires: u64, revoked: bool }
 
@@ -222,11 +233,12 @@ struct AccessGrant { owner: AdmissionIdentity, resource: String, expires: u64, r
 pub struct Gateway {
     config: Arc<GatewayConfig>,
     policy: Arc<dyn AdmissionPolicy>,
+    verifier: Option<Arc<dyn GoogleOidcVerifier>>,
     state: Arc<Mutex<GatewayState>>,
 }
 
 #[derive(Default)]
-struct GatewayState { codes: BTreeMap<String, CodeGrant>, devices: BTreeMap<String, DeviceGrant>, refresh: BTreeMap<String, RefreshGrant>, access: BTreeMap<String, AccessGrant>, sessions: BTreeMap<String, BrowserSession> }
+struct GatewayState { codes: BTreeMap<String, CodeGrant>, browser: BTreeMap<String, BrowserTransaction>, devices: BTreeMap<String, DeviceGrant>, refresh: BTreeMap<String, RefreshGrant>, access: BTreeMap<String, AccessGrant>, sessions: BTreeMap<String, BrowserSession> }
 
 /// A hub browser session. The CSRF secret is never serialized or returned.
 #[derive(Debug, Clone)]
@@ -242,7 +254,14 @@ impl Gateway {
     /// Create a gateway after validating its server-side configuration.
     pub fn new(config: GatewayConfig, policy: Arc<dyn AdmissionPolicy>) -> Result<Self, GatewayConfigError> {
         config.validate()?;
-        Ok(Self { config: Arc::new(config), policy, state: Arc::new(Mutex::new(GatewayState::default())) })
+        Ok(Self { config: Arc::new(config), policy, verifier: None, state: Arc::new(Mutex::new(GatewayState::default())) })
+    }
+
+    /// Attach the maintained Google OIDC verifier supplied by the hosting
+    /// application. Without one, the callback fails closed.
+    pub fn with_google_verifier(mut self, verifier: Arc<dyn GoogleOidcVerifier>) -> Self {
+        self.verifier = Some(verifier);
+        self
     }
 
     /// Build the metadata routes and the protocol endpoints. No REST proxy or `/mcp` route is installed.
@@ -252,10 +271,11 @@ impl Gateway {
             .route("/.well-known/oauth-authorization-server", get(authorization_metadata))
             .route("/register", post(register))
             .route("/authorize", get(authorize))
+            .route("/auth/google/callback", get(google_callback))
             .route("/token", post(token))
             .route("/revoke", post(revoke))
             .route("/device", post(device))
-            .route("/device/verify", post(verify_device))
+            .route("/device/verify", get(begin_device_verify).post(verify_device))
             .with_state(self.clone())
     }
 
@@ -268,6 +288,32 @@ impl Gateway {
         let code = secret("code", client_id, challenge);
         self.state.lock().map_err(|_| ProtocolError::ServerError)?.codes.insert(code.clone(), CodeGrant { client_id: client_id.into(), redirect_uri: redirect_uri.into(), challenge: challenge.into(), resource: resource.into(), owner, expires: now()+60, used: false });
         Ok(code)
+    }
+
+    /// Start a browser authorization transaction. State and nonce are retained
+    /// by the hub and cannot be supplied back as a second, trusted value.
+    pub fn begin_browser_authorization(&self, client_id: &str, redirect_uri: &str, challenge: &str, resource: &str, state: &str, nonce: &str) -> Result<String, ProtocolError> {
+        if client_id != self.config.native_client.client_id
+            || redirect_uri != self.config.native_client.redirect_uri
+            || resource != self.config.resource
+            || challenge.is_empty() || state.is_empty() || nonce.is_empty()
+        { return Err(ProtocolError::InvalidRequest); }
+        let transaction = secret("browser", client_id, state);
+        self.state.lock().map_err(|_| ProtocolError::ServerError)?.browser.insert(transaction.clone(), BrowserTransaction { client_id: client_id.into(), redirect_uri: redirect_uri.into(), challenge: challenge.into(), resource: resource.into(), state: state.into(), nonce: nonce.into(), expires: now()+300 });
+        Ok(transaction)
+    }
+
+    fn browser_nonce(&self, transaction: &str) -> Result<String, ProtocolError> {
+        self.state.lock().map_err(|_| ProtocolError::ServerError)?.browser.get(transaction).map(|transaction| transaction.nonce.clone()).ok_or(ProtocolError::InvalidGrant)
+    }
+
+    /// Finish a browser transaction after the upstream OIDC verifier and
+    /// explicit consent have succeeded.
+    pub fn complete_browser_authorization(&self, transaction: &str, returned_state: &str, claims: &GoogleIdClaims, consent: bool) -> Result<String, ProtocolError> {
+        let transaction_data = self.state.lock().map_err(|_| ProtocolError::ServerError)?.browser.remove(transaction).ok_or(ProtocolError::InvalidGrant)?;
+        if transaction_data.expires < now() || returned_state != transaction_data.state { return Err(ProtocolError::InvalidRequest); }
+        let identity = verify_google_claims(&self.config.google, claims, &transaction_data.nonce).map_err(|_| ProtocolError::AccessDenied)?;
+        self.authorize_code(&transaction_data.client_id, &transaction_data.redirect_uri, &transaction_data.challenge, &transaction_data.resource, identity, consent, returned_state, &transaction_data.state, &claims.nonce, &transaction_data.nonce)
     }
 
     /// Exchange a code using the original redirect and S256 challenge binding.
@@ -288,7 +334,9 @@ impl Gateway {
         if client_id != self.config.native_client.client_id || resource != self.config.resource { return Err(ProtocolError::InvalidRequest); }
         let device_code = secret("device", client_id, resource);
         let user_code = format!("{}-{}", &device_code[0..4], &device_code[4..8]).to_uppercase();
-        self.state.lock().map_err(|_| ProtocolError::ServerError)?.devices.insert(device_code.clone(), DeviceGrant { client_id: client_id.into(), resource: resource.into(), user_code: user_code.clone(), owner: None, expires: now()+600, next_poll: 0, polls: 0, denied: false });
+        let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+        if state.devices.values().filter(|grant| grant.client_id == client_id && grant.expires >= now()).count() >= 5 { return Err(ProtocolError::SlowDown); }
+        state.devices.insert(device_code.clone(), DeviceGrant { client_id: client_id.into(), resource: resource.into(), user_code: user_code.clone(), owner: None, verify_state: None, verify_nonce: None, expires: now()+600, next_poll: 0, polls: 0, verify_attempts: 0, denied: false });
         Ok(DeviceResponse { device_code, user_code, verification_uri: format!("{}/device/verify", self.config.issuer), expires_in: 600, interval: 5 })
     }
 
@@ -298,7 +346,43 @@ impl Gateway {
         let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
         let grant = state.devices.values_mut().find(|grant| grant.user_code == user_code).ok_or(ProtocolError::InvalidGrant)?;
         if grant.expires < now() { return Err(ProtocolError::ExpiredToken); }
+        grant.verify_attempts = grant.verify_attempts.saturating_add(1);
+        if grant.verify_attempts > 5 { return Err(ProtocolError::SlowDown); }
         grant.owner = Some(self.policy.admit(&identity).ok_or(ProtocolError::AccessDenied)?);
+        Ok(())
+    }
+
+    /// Bind a device verification page to server-held state and nonce before
+    /// redirecting the browser to Google.
+    pub fn begin_device_verification(&self, user_code: &str) -> Result<(String, String), ProtocolError> {
+        let state_value = secret("device-state", user_code, &self.config.issuer);
+        let nonce = secret("device-nonce", user_code, &self.config.issuer);
+        let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+        let grant = state.devices.values_mut().find(|grant| grant.user_code == user_code).ok_or(ProtocolError::InvalidGrant)?;
+        if grant.expires < now() { return Err(ProtocolError::ExpiredToken); }
+        grant.verify_state = Some(state_value.clone());
+        grant.verify_nonce = Some(nonce.clone());
+        Ok((state_value, nonce))
+    }
+
+    /// Complete device verification using the server-side Google OIDC adapter.
+    pub fn complete_device_verification(&self, user_code: &str, returned_state: &str, claims: &GoogleIdClaims, consent: bool) -> Result<(), ProtocolError> {
+        let (expected_state, expected_nonce) = {
+            let state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+            let grant = state.devices.values().find(|grant| grant.user_code == user_code).ok_or(ProtocolError::InvalidGrant)?;
+            (grant.verify_state.clone().ok_or(ProtocolError::InvalidRequest)?, grant.verify_nonce.clone().ok_or(ProtocolError::InvalidRequest)?)
+        };
+        if returned_state != expected_state { return Err(ProtocolError::InvalidRequest); }
+        let identity = verify_google_claims(&self.config.google, claims, &expected_nonce).map_err(|_| ProtocolError::AccessDenied)?;
+        self.verify_device(user_code, identity, consent)
+    }
+
+    /// Deny a pending device grant from the browser verification surface.
+    pub fn deny_device(&self, user_code: &str) -> Result<(), ProtocolError> {
+        let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+        let grant = state.devices.values_mut().find(|grant| grant.user_code == user_code).ok_or(ProtocolError::InvalidGrant)?;
+        if grant.expires < now() { return Err(ProtocolError::ExpiredToken); }
+        grant.denied = true;
         Ok(())
     }
 
@@ -330,20 +414,34 @@ impl Gateway {
     /// Rotate a refresh token, rejecting reuse and revoked/expired grants.
     pub fn refresh(&self, refresh_token: &str) -> Result<TokenResponse, ProtocolError> {
         let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
-        let (owner, resource, expires) = {
-            let grant = state.refresh.values_mut().find(|grant| grant.current == refresh_token).ok_or(ProtocolError::InvalidGrant)?;
-            if grant.revoked || grant.expires < now() { return Err(ProtocolError::InvalidGrant); }
-            grant.revoked = true;
-            (grant.owner.clone(), grant.resource.clone(), grant.expires)
+        let (family, owner, resource, expires) = {
+            let family = state.refresh.get(refresh_token).map(|grant| grant.family.clone()).ok_or(ProtocolError::InvalidGrant)?;
+            let (revoked, owner, resource, expires) = {
+                let grant = state.refresh.get_mut(refresh_token).ok_or(ProtocolError::InvalidGrant)?;
+                let revoked = grant.revoked;
+                if !revoked {
+                    if grant.expires < now() { return Err(ProtocolError::InvalidGrant); }
+                    grant.revoked = true;
+                }
+                (revoked, grant.owner.clone(), grant.resource.clone(), grant.expires)
+            };
+            if revoked {
+                for sibling in state.refresh.values_mut().filter(|sibling| sibling.family == family) { sibling.revoked = true; }
+                return Err(ProtocolError::InvalidGrant);
+            }
+            (family, owner, resource, expires)
         };
-        let response = issue_with_expiry(&mut state, owner, &resource, expires);
+        let response = issue_with_family(&mut state, family, owner, &resource, expires);
         Ok(response)
     }
 
     /// Revoke a hub grant; Google tokens are not accepted here.
     pub fn revoke(&self, token: &str) -> Result<(), ProtocolError> {
         let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
-        if let Some(grant) = state.refresh.values_mut().find(|grant| grant.current == token) { grant.revoked = true; return Ok(()); }
+        if let Some(family) = state.refresh.get(token).map(|grant| grant.family.clone()) {
+            for grant in state.refresh.values_mut().filter(|grant| grant.family == family) { grant.revoked = true; }
+            return Ok(())
+        }
         if let Some(grant) = state.access.get_mut(token) { grant.revoked = true; return Ok(()); }
         Err(ProtocolError::InvalidGrant)
     }
@@ -394,8 +492,8 @@ impl Gateway {
 fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs() }
 fn pkce(verifier: &str) -> String { blake3::hash(verifier.as_bytes()).to_hex().to_string() }
 fn secret(kind: &str, a: &str, b: &str) -> String { let sequence = TOKEN_SEQUENCE.fetch_add(1, Ordering::Relaxed); blake3::hash(format!("{kind}:{a}:{b}:{}:{sequence}", now()).as_bytes()).to_hex().to_string() }
-fn issue(state: &mut GatewayState, owner: AdmissionIdentity, resource: &str) -> TokenResponse { issue_with_expiry(state, owner, resource, now()+7*24*60*60) }
-fn issue_with_expiry(state: &mut GatewayState, owner: AdmissionIdentity, resource: &str, grant_expiry: u64) -> TokenResponse { let access = secret("access", owner.owner.id.as_str(), resource); let refresh = secret("refresh", owner.owner.id.as_str(), &access); state.access.insert(access.clone(), AccessGrant { owner: owner.clone(), resource: resource.into(), expires: now()+900, revoked: false }); state.refresh.insert(refresh.clone(), RefreshGrant { owner, resource: resource.into(), expires: grant_expiry, current: refresh.clone(), revoked: false }); TokenResponse { access_token: access, refresh_token: refresh, token_type: "Bearer".into(), expires_in: 900, resource: resource.into() } }
+fn issue(state: &mut GatewayState, owner: AdmissionIdentity, resource: &str) -> TokenResponse { issue_with_family(state, secret("family", owner.owner.id.as_str(), resource), owner, resource, now()+7*24*60*60) }
+fn issue_with_family(state: &mut GatewayState, family: String, owner: AdmissionIdentity, resource: &str, grant_expiry: u64) -> TokenResponse { let access = secret("access", owner.owner.id.as_str(), resource); let refresh = secret("refresh", owner.owner.id.as_str(), &access); state.access.insert(access.clone(), AccessGrant { owner: owner.clone(), resource: resource.into(), expires: now()+900, revoked: false }); state.refresh.insert(refresh.clone(), RefreshGrant { family, owner, resource: resource.into(), expires: grant_expiry, current: refresh.clone(), revoked: false }); TokenResponse { access_token: access, refresh_token: refresh, token_type: "Bearer".into(), expires_in: 900, resource: resource.into() } }
 
 /// OAuth token response issued by the hub, never by Google.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +502,7 @@ pub struct TokenResponse { pub access_token: String, pub refresh_token: String, 
 /// over the token endpoint response; clients must keep it out of user-facing
 /// output and logs.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceResponse { /// Private client-only polling credential. pub device_code: String, /// User-facing verification code. pub user_code: String, pub verification_uri: String, pub expires_in: u64, pub interval: u64 }
 /// Protocol failures map to standard OAuth error names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -411,18 +510,32 @@ pub enum ProtocolError { InvalidRequest, InvalidGrant, AccessDenied, Authorizati
 impl ProtocolError { fn code(self) -> &'static str { match self { Self::InvalidRequest => "invalid_request", Self::InvalidGrant => "invalid_grant", Self::AccessDenied => "access_denied", Self::AuthorizationPending => "authorization_pending", Self::SlowDown => "slow_down", Self::ExpiredToken => "expired_token", Self::ServerError => "server_error" } } }
 impl IntoResponse for ProtocolError { fn into_response(self) -> axum::response::Response { (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": self.code()}))).into_response() } }
 #[derive(Debug, Deserialize)] struct RegisterRequest { client_id: String, redirect_uri: String }
-#[derive(Debug, Deserialize)] struct AuthorizeRequest { client_id: String, redirect_uri: String, code_challenge: String, resource: String, identity: VerifiedIdentity, consent: bool, state: String, expected_state: String, nonce: String, expected_nonce: String }
+#[derive(Debug, Deserialize)] struct AuthorizeQuery { client_id: String, redirect_uri: String, code_challenge: String, resource: String, state: String, nonce: String }
+#[derive(Debug, Deserialize)] struct GoogleCallbackQuery { transaction: String, state: String, code: String, consent: bool }
 #[derive(Debug, Deserialize)] struct TokenRequest { code: Option<String>, device_code: Option<String>, client_id: String, redirect_uri: Option<String>, code_verifier: Option<String>, resource: String }
 #[derive(Debug, Deserialize)] struct DeviceRequest { client_id: String, resource: String }
-#[derive(Debug, Deserialize)] struct VerifyRequest { user_code: String, identity: VerifiedIdentity, consent: bool }
+#[derive(Debug, Deserialize)] struct DeviceVerifyStartQuery { user_code: String }
+#[derive(Debug, Deserialize)] struct VerifyRequest { user_code: String, state: String, code: String, consent: bool }
 #[derive(Debug, Deserialize)] struct RevokeRequest { token: String }
 async fn protected_metadata(State(g): State<Gateway>) -> Json<ProtectedResourceMetadata> { Json(g.config.protected_resource_metadata()) }
 async fn authorization_metadata(State(g): State<Gateway>) -> Json<AuthorizationMetadata> { Json(g.config.metadata()) }
 async fn register(State(g): State<Gateway>, Json(r): Json<RegisterRequest>) -> impl IntoResponse { if r.client_id == g.config.native_client.client_id && r.redirect_uri == g.config.native_client.redirect_uri { Json(serde_json::json!({"client_id":r.client_id,"redirect_uris":[r.redirect_uri]})).into_response() } else { ProtocolError::InvalidRequest.into_response() } }
-async fn authorize(State(g): State<Gateway>, Json(r): Json<AuthorizeRequest>) -> impl IntoResponse { match g.authorize_code(&r.client_id,&r.redirect_uri,&r.code_challenge,&r.resource,r.identity,r.consent,&r.state,&r.expected_state,&r.nonce,&r.expected_nonce) { Ok(code)=>Json(serde_json::json!({"code":code})).into_response(), Err(e)=>e.into_response() } }
+async fn authorize(State(g): State<Gateway>, Query(r): Query<AuthorizeQuery>) -> impl IntoResponse { match g.begin_browser_authorization(&r.client_id,&r.redirect_uri,&r.code_challenge,&r.resource,&r.state,&r.nonce) { Ok(transaction)=>Json(serde_json::json!({"transaction":transaction,"provider":"google","scopes":GOOGLE_SCOPES})).into_response(), Err(e)=>e.into_response() } }
+async fn google_callback(State(g): State<Gateway>, Query(r): Query<GoogleCallbackQuery>) -> impl IntoResponse {
+    let Some(verifier) = g.verifier.as_ref() else { return ProtocolError::ServerError.into_response(); };
+    let nonce = match g.browser_nonce(&r.transaction) { Ok(nonce) => nonce, Err(error) => return error.into_response() };
+    let claims = match verifier.exchange_and_verify(&r.code, &nonce) { Ok(claims) => claims, Err(_) => return ProtocolError::AccessDenied.into_response() };
+    match g.complete_browser_authorization(&r.transaction, &r.state, &claims, r.consent) { Ok(code)=>Json(serde_json::json!({"code":code,"state":r.state})).into_response(), Err(e)=>e.into_response() }
+}
 async fn token(State(g): State<Gateway>, Json(r): Json<TokenRequest>) -> impl IntoResponse { let result = match (r.code, r.device_code) { (Some(code), None) => g.exchange_code(&code, &r.client_id, r.redirect_uri.as_deref().unwrap_or_default(), r.code_verifier.as_deref().unwrap_or_default(), &r.resource), (None, Some(device_code)) => g.poll_device_for_client(&device_code, &r.client_id, &r.resource), _ => Err(ProtocolError::InvalidRequest) }; match result { Ok(v)=>Json(v).into_response(), Err(e)=>e.into_response() } }
 async fn device(State(g): State<Gateway>, Json(r): Json<DeviceRequest>) -> impl IntoResponse { match g.device_authorize(&r.client_id,&r.resource) { Ok(v)=>Json(v).into_response(), Err(e)=>e.into_response() } }
-async fn verify_device(State(g): State<Gateway>, Json(r): Json<VerifyRequest>) -> impl IntoResponse { match g.verify_device(&r.user_code,r.identity,r.consent) { Ok(())=>StatusCode::NO_CONTENT.into_response(), Err(e)=>e.into_response() } }
+async fn begin_device_verify(State(g): State<Gateway>, Query(r): Query<DeviceVerifyStartQuery>) -> impl IntoResponse { match g.begin_device_verification(&r.user_code) { Ok((state, _nonce))=>Json(serde_json::json!({"state":state,"provider":"google","scopes":GOOGLE_SCOPES})).into_response(), Err(e)=>e.into_response() } }
+async fn verify_device(State(g): State<Gateway>, Json(r): Json<VerifyRequest>) -> impl IntoResponse {
+    let Some(verifier) = g.verifier.as_ref() else { return ProtocolError::ServerError.into_response(); };
+    let nonce = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| state.devices.values().find(|grant| grant.user_code == r.user_code).and_then(|grant| grant.verify_nonce.clone()).ok_or(ProtocolError::InvalidGrant)) { Ok(nonce) => nonce, Err(error) => return error.into_response() };
+    let claims = match verifier.exchange_and_verify(&r.code, &nonce) { Ok(claims) => claims, Err(_) => return ProtocolError::AccessDenied.into_response() };
+    match g.complete_device_verification(&r.user_code,&r.state,&claims,r.consent) { Ok(())=>StatusCode::NO_CONTENT.into_response(), Err(e)=>e.into_response() }
+}
 async fn revoke(State(g): State<Gateway>, Json(r): Json<RevokeRequest>) -> impl IntoResponse { match g.revoke(&r.token) { Ok(())=>StatusCode::NO_CONTENT.into_response(), Err(e)=>e.into_response() } }
 
 /// Public metadata shared by protected-resource and authorization-server responses.
@@ -627,6 +740,15 @@ mod tests {
         assert!(verify_google_claims(&config(GatewayMode::LoopbackDemo).google, &claims, "nonce").is_ok());
         claims.email_verified = false;
         assert_eq!(verify_google_claims(&config(GatewayMode::LoopbackDemo).google, &claims, "nonce"), Err(GoogleClaimError::EmailUnverified));
+    }
+
+    #[test]
+    fn browser_transaction_owns_state_and_nonce_until_callback() {
+        let (gateway, _) = gateway();
+        let transaction = gateway.begin_browser_authorization("agentpalace-native", "http://127.0.0.1:49152/callback", &pkce("verifier"), "http://localhost:8080/api", "client-state", "transaction-nonce").expect("transaction");
+        let claims = GoogleIdClaims { iss: "https://accounts.google.com".into(), aud: "google-client".into(), sub: "subject-1".into(), email: "person@example.com".into(), email_verified: true, exp: now() + 60, nonce: "transaction-nonce".into() };
+        assert_eq!(gateway.complete_browser_authorization(&transaction, "wrong-state", &claims, true), Err(ProtocolError::InvalidRequest));
+        assert_eq!(gateway.complete_browser_authorization(&transaction, "client-state", &claims, true), Err(ProtocolError::InvalidGrant));
     }
 
     #[test]
