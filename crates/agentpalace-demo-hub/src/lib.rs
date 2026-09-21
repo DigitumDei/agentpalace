@@ -13,6 +13,9 @@ use agentpalace_core::{AuthenticatedOwner, Issuer, OwnerId, SubjectBinding};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod access;
+pub use access::{AccessAuditRecord, AccessPolicy, AccessPolicyError, AccessRole, AuditActor, GrantCeiling, IdentityBinding, IdentityBindingStore, MembershipEntry, ACCESS_SCHEMA_VERSION, normalize_email};
+
 /// The only upstream scopes accepted by the demo gateway.
 pub const GOOGLE_SCOPES: [&str; 2] = ["openid", "email"];
 

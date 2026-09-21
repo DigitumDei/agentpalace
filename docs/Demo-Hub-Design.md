@@ -361,6 +361,14 @@ normalize domain case; do not collapse dots, plus tags, or aliases. Reject
 duplicates and invalid roles. Changing email requires an explicit admission
 update linked to the same owner, without rewriting historical provenance.
 
+The gateway's durable model uses a closed-schema `AccessPolicy` with schema
+version and revision, and a separate immutable `IdentityBindingStore`. Policy
+loading normalizes and validates every entry before it can be used; malformed,
+unknown-field, duplicate, or invalid-email documents are rejected. Grant
+ceilings and secret-free audit records are separate models, so OAuth tokens,
+Google secrets, and private palace credentials never enter `access.json` or
+its audit representation.
+
 Proposed hub-only endpoints, not existing AgentPalace routes. Public OAuth
 metadata, authorization, token, Google callback, and revocation endpoints are
 also required, including device authorization and verification; use the

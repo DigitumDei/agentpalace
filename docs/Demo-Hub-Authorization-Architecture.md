@@ -73,8 +73,19 @@ resource.
 
 ## Explicit exclusions
 
+The issue #165 access model is now represented by the `agentpalace-demo-hub`
+`access` module. `access.json` is a versioned, closed-schema document of
+normalized editable memberships and revision; immutable owner IDs and
+issuer/subject bindings are serialized by a separate binding-store model.
+Normalization trims only surrounding whitespace and lowercases the domain,
+preserving local-part dots and plus tags. Audit records contain only actor
+category/owner ID, time, revision, and membership before/after values; they
+cannot carry OAuth tokens, Google secrets, or upstream palace credentials.
+The persistence writer must still provide the documented lock, validation,
+fsync, atomic replacement, and fail-closed reload behavior.
+
 This slice does not add REST forwarding, `/mcp`, a memory dashboard, Docker or
-deployment resources, Google Cloud resources, account operations, or issue
-#165 access administration. Offline defaults and the existing bearer-token
-path remain unchanged. The shared palace may be visible to admitted users,
-but provenance never becomes permission or truth by implication.
+deployment resources, Google Cloud resources, or account operations. Offline
+defaults and the existing bearer-token path remain unchanged. The shared
+palace may be visible to admitted users, but provenance never becomes
+permission or truth by implication.
