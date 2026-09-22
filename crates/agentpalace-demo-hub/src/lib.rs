@@ -75,6 +75,8 @@ pub trait GoogleOidcVerifier: Send + Sync {
 pub struct GoogleOidcVerifierAdapter {
     config: GoogleOidcConfig,
     callback_uri: String,
+    token_endpoint: String,
+    jwks_endpoint: String,
     http: reqwest::blocking::Client,
 }
 
@@ -85,20 +87,25 @@ pub struct GoogleOidcVerifierAdapter {
 impl GoogleOidcVerifierAdapter {
     /// Construct an adapter for the configured native/browser callback.
     pub fn new(config: GoogleOidcConfig, callback_uri: impl Into<String>) -> Result<Self, String> {
+        Self::new_with_endpoints(config, callback_uri, "https://oauth2.googleapis.com/token", "https://www.googleapis.com/oauth2/v3/certs")
+    }
+
+    /// Construct an adapter with injectable token and JWKS endpoints for provider fixtures.
+    pub fn new_with_endpoints(config: GoogleOidcConfig, callback_uri: impl Into<String>, token_endpoint: impl Into<String>, jwks_endpoint: impl Into<String>) -> Result<Self, String> {
         if config.issuer.as_str() != "https://accounts.google.com" { return Err("Google issuer must be accounts.google.com".into()); }
-        Ok(Self { config, callback_uri: callback_uri.into(), http: reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none()).build().map_err(|_| "Google OIDC client could not be built".to_owned())? })
+        Ok(Self { config, callback_uri: callback_uri.into(), token_endpoint: token_endpoint.into(), jwks_endpoint: jwks_endpoint.into(), http: reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none()).build().map_err(|_| "Google OIDC client could not be built".to_owned())? })
     }
 }
 
 impl GoogleOidcVerifier for GoogleOidcVerifierAdapter {
     fn exchange_and_verify(&self, authorization_code: &str, expected_nonce: &str) -> Result<GoogleIdClaims, GoogleClaimError> {
-        let token: GoogleTokenResponse = self.http.post("https://oauth2.googleapis.com/token").form(&[
+        let token: GoogleTokenResponse = self.http.post(&self.token_endpoint).form(&[
             ("code", authorization_code), ("client_id", self.config.client_id.as_str()),
             ("client_secret", self.config.client_secret.as_str()), ("redirect_uri", self.callback_uri.as_str()),
             ("grant_type", "authorization_code"),
         ]).send().map_err(|_| GoogleClaimError::Upstream)?.error_for_status().map_err(|_| GoogleClaimError::Upstream)?.json().map_err(|_| GoogleClaimError::Upstream)?;
         let header = decode_header(&token.id_token).map_err(|_| GoogleClaimError::Signature)?;
-        let key = self.http.get("https://www.googleapis.com/oauth2/v3/certs").send().map_err(|_| GoogleClaimError::Upstream)?.error_for_status().map_err(|_| GoogleClaimError::Upstream)?.json::<GoogleJwks>().map_err(|_| GoogleClaimError::Upstream)?.keys.into_iter().find(|key| key.kid == header.kid.clone().unwrap_or_default() && key.kty == "RSA" && key.alg.as_deref().is_none_or(|alg| alg == "RS256")).ok_or(GoogleClaimError::Signature)?;
+        let key = self.http.get(&self.jwks_endpoint).send().map_err(|_| GoogleClaimError::Upstream)?.error_for_status().map_err(|_| GoogleClaimError::Upstream)?.json::<GoogleJwks>().map_err(|_| GoogleClaimError::Upstream)?.keys.into_iter().find(|key| key.kid == header.kid.clone().unwrap_or_default() && key.kty == "RSA" && key.alg.as_deref().is_none_or(|alg| alg == "RS256")).ok_or(GoogleClaimError::Signature)?;
         let decoding_key = DecodingKey::from_rsa_components(&key.n, &key.e).map_err(|_| GoogleClaimError::Signature)?;
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[self.config.issuer.as_str()]);
@@ -348,6 +355,7 @@ impl Gateway {
             .route("/auth/google/device-callback", get(google_device_callback))
             .route("/auth/google/consent", post(google_consent))
             .route("/session", get(session))
+            .route("/connections", get(connections))
             .route("/connections/revoke", post(revoke_connection))
             .route("/token", post(token))
             .route("/revoke", post(revoke))
@@ -414,7 +422,9 @@ impl Gateway {
         let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
         if state.devices.values().filter(|grant| grant.client_id == client_id && grant.expires >= now()).count() >= 5 { return Err(ProtocolError::SlowDown); }
         state.devices.insert(device_code.clone(), DeviceGrant { client_id: client_id.into(), resource: resource.into(), user_code: user_code.clone(), owner: None, verify_state: None, verify_nonce: None, expires: now()+600, next_poll: 0, polls: 0, verify_attempts: 0, denied: false });
-        Ok(DeviceResponse { device_code, user_code, verification_uri: format!("{}/device/verify", self.config.issuer), expires_in: 600, interval: 5 })
+        let mut verification_uri = reqwest::Url::parse(&format!("{}/device/verify", self.config.issuer)).map_err(|_| ProtocolError::ServerError)?;
+        verification_uri.query_pairs_mut().append_pair("user_code", &user_code);
+        Ok(DeviceResponse { device_code, user_code, verification_uri: verification_uri.to_string(), expires_in: 600, interval: 5 })
     }
 
     /// Verify a user code after Google login and explicit consent.
@@ -571,6 +581,14 @@ impl Gateway {
         let session = state.sessions.get(session_id).ok_or(ProtocolError::AccessDenied)?;
         Ok(state.refresh.values().filter(|grant| !grant.revoked && grant.owner.owner.id == session.owner.owner.id).map(|grant| grant.resource.clone()).collect())
     }
+
+    /// Return owner-scoped revocation handles for the browser connection page.
+    pub fn own_connection_handles(&self, session_id: &str) -> Result<Vec<serde_json::Value>, ProtocolError> {
+        let state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+        let session = state.sessions.get(session_id).ok_or(ProtocolError::AccessDenied)?;
+        Ok(state.refresh.values().filter(|grant| !grant.revoked && grant.owner.owner.id == session.owner.owner.id)
+            .map(|grant| serde_json::json!({"resource": grant.resource, "token": grant.current})).collect())
+    }
 }
 
 fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs() }
@@ -720,6 +738,12 @@ async fn session(State(g): State<Gateway>, headers: HeaderMap) -> impl IntoRespo
         Ok(session) => Json(serde_json::json!({"owner": session.owner.owner.id.as_str(), "admin": session.admin})).into_response(),
         Err(e) => e.into_response(),
     }
+}
+
+async fn connections(State(g): State<Gateway>, headers: HeaderMap) -> impl IntoResponse {
+    let Some(cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) else { return ProtocolError::AccessDenied.into_response() };
+    let Some(session_id) = cookie.split(';').find_map(|part| part.trim().strip_prefix("agentpalace_session=")) else { return ProtocolError::AccessDenied.into_response() };
+    match g.own_connection_handles(session_id) { Ok(handles) => Json(handles).into_response(), Err(error) => error.into_response() }
 }
 
 async fn revoke_connection(State(g): State<Gateway>, headers: HeaderMap, Form(r): Form<RevokeRequest>) -> impl IntoResponse {
@@ -996,6 +1020,7 @@ mod tests {
         let _router = gateway.router();
         let device = gateway.device_authorize("agentpalace-native", "http://localhost:8080/api").expect("device");
         assert!(!device.verification_uri.is_empty());
+        assert!(device.verification_uri.contains("user_code="));
         let code = gateway.state.lock().expect("state").devices.keys().next().cloned().expect("private code");
         assert_eq!(gateway.poll_device(&code), Err(ProtocolError::AuthorizationPending));
         assert_eq!(gateway.poll_device(&code), Err(ProtocolError::SlowDown));

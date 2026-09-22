@@ -210,7 +210,7 @@ impl TokenStore for InMemoryTokenStore {
     }
     async fn save(&self, session: OAuthSession) -> Result<(), String> {
         let mut sessions = self.0.lock().await;
-        sessions.retain(|value| !(resource_key(&value.resource) == resource_key(&session.resource) && value.issuer == session.issuer && value.client_id == session.client_id && value.account == session.account));
+        sessions.retain(|value| !(resource_key(&value.resource) == resource_key(&session.resource) && value.issuer == session.issuer && value.client_id == session.client_id && value.account.as_deref() == session.account.as_deref()));
         sessions.push(session);
         Ok(())
     }

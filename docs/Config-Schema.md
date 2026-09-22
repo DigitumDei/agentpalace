@@ -608,8 +608,8 @@ authentication challenge and uses the configured `login_mode` unless the CLI
 override is supplied. `auto` selects browser/callback only when usable,
 otherwise selecting device authorization;
 unattended calls return an authentication-required result instead of opening a browser. The CLI
-uses an owner-only local credential store under the configured AgentPalace home; embedding
-callers may inject a stronger secure `TokenStore`. `allow_in_memory` is the explicit volatile/test mode and
+uses the platform OS credential store (Keychain, Credential Manager, or Secret Service); embedding
+callers may inject another secure `TokenStore`. `allow_in_memory` is the explicit volatile/test mode and
 otherwise storage failures are reported. Subsequent CLI commands load a matching stored grant after
 the remote's protected-resource challenge, so login and use may be separate processes.
 `agentpalace auth logout --remote NAME --issuer ISSUER` clears

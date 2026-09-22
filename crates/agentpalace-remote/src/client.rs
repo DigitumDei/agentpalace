@@ -374,10 +374,16 @@ impl RemoteClient {
         rb: reqwest::RequestBuilder,
         kind: CallKind,
     ) -> Result<T> {
+        let retry = (kind == CallKind::Read).then(|| rb.try_clone()).flatten();
         let (status, bytes, challenge) = self.send_and_read(rb, kind).await?;
 
         if status == reqwest::StatusCode::UNAUTHORIZED {
             if self.oauth.is_some() {
+                if let (Some(retry), Some(resource_metadata)) = (retry, challenge.as_deref())
+                    && self.load_stored_session_from_challenge(resource_metadata).await
+                {
+                    return Box::pin(self.execute(retry, kind)).await;
+                }
                 return Err(RemoteError::AuthenticationRequired {
                     remote: self.name.clone(),
                     action: "run the explicit remote OAuth login command".to_owned(),
@@ -563,6 +569,7 @@ impl RemoteClient {
     /// Revoke and forget the current grant. Local credentials are cleared even when revocation
     /// is unsupported or the issuer is unavailable.
     pub async fn logout(&self, metadata: Option<&crate::AuthorizationServerMetadata>) -> Result<()> {
+        let _guard = self.login_lock.lock().await;
         let current = self.oauth_session.lock().await.take();
         *self.token.lock().await = None;
         if let Some(session) = current {
