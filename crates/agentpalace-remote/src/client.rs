@@ -1629,6 +1629,18 @@ mod tests {
         let client = RemoteClient::new(oauth_endpoint("https://hub.example/api", Arc::new(FailingLoadStore))).unwrap();
         let result = client.load_stored_session_result("https://hub.example/api", "https://issuer.example").await;
         assert!(matches!(result, Err(RemoteError::AuthenticationRequired { .. })));
+        let absent = RemoteClient::new(oauth_endpoint("https://hub.example/api", Arc::new(crate::InMemoryTokenStore::default()))).unwrap();
+        assert_eq!(absent.load_stored_session_result("https://hub.example/api", "https://issuer.example").await.unwrap(), false);
+    }
+
+    #[tokio::test]
+    async fn secure_store_delete_failure_is_distinct_and_needs_no_user_secret() {
+        let store = Arc::new(FailingLoadStore);
+        let client = RemoteClient::new(oauth_endpoint("https://hub.example/api", store)).unwrap();
+        client.commit_session(oauth_session("https://hub.example/api", "https://issuer.example", "fixture-access")).await.unwrap();
+        let result = client.logout(None).await;
+        assert!(matches!(result, Err(RemoteError::AuthenticationRequired { .. })));
+        assert!(client.token.lock().await.is_none(), "local token must be cleared even when backend deletion fails");
     }
 
     #[tokio::test]
@@ -1709,14 +1721,23 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("oauth.json");
         let store = Arc::new(crate::FileTokenStore::new(&path));
+        store.save(oauth_session("https://hub.example/api", "https://issuer.example", "logout-access")).await.unwrap();
+        store.save(oauth_session("https://hub.example/api/", "https://issuer.example", "logout-access-slash")).await.unwrap();
         let client = RemoteClient::new(oauth_endpoint("https://hub.example/api", store.clone())).unwrap();
-        let session = oauth_session("https://hub.example/api", "https://issuer.example", "logout-access");
-        store.save(session).await.unwrap();
+        assert_eq!(client.oauth_resource(), "https://hub.example/api");
         assert!(client.load_stored_session(client.oauth_resource(), "https://issuer.example").await);
         client.logout(None).await.unwrap();
         assert!(store.load("https://hub.example/api", "https://issuer.example", "test-client", Some("test-account")).await.is_none());
+        assert_eq!(store.load("https://hub.example/api/", "https://issuer.example", "test-client", Some("test-account")).await.map(|session| session.access_token), Some("logout-access-slash".into()));
+        let slash_client = RemoteClient::new(oauth_endpoint("https://hub.example/api/", store.clone())).unwrap();
+        assert_eq!(slash_client.oauth_resource(), "https://hub.example/api/");
+        assert!(slash_client.load_stored_session(slash_client.oauth_resource(), "https://issuer.example").await);
+        slash_client.logout(None).await.unwrap();
+        assert!(store.load("https://hub.example/api/", "https://issuer.example", "test-client", Some("test-account")).await.is_none());
         assert!(client.token.lock().await.is_none());
         assert!(client.oauth_session.lock().await.is_none());
+        assert!(slash_client.token.lock().await.is_none());
+        assert!(slash_client.oauth_session.lock().await.is_none());
     }
 
     #[tokio::test]

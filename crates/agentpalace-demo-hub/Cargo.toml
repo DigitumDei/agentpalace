@@ -21,6 +21,7 @@ thiserror.workspace = true
 tokio = { version = "1.48.0", features = ["rt", "rt-multi-thread"] }
 
 [dev-dependencies]
+agentpalace-remote = { path = "../agentpalace-remote" }
 tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "time"] }
 
 [lints]
