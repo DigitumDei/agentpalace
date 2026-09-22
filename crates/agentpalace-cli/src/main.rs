@@ -747,8 +747,8 @@ fn execute_auth(
                 }
             }),
             AuthOperation::Logout(issuer) => {
-                let resource = client.base_url().to_owned();
-                let loaded = client.load_stored_session(&resource, &issuer).await;
+                let resource = client.oauth_resource().to_owned();
+                let loaded = client.load_stored_session_result(&resource, &issuer).await?;
                 client.logout(None).await.map(|_| if loaded { "OAuth session cleared.\n".to_owned() } else { "No matching OAuth session was available; nothing was cleared.\n".to_owned() })
             }
         }
@@ -3221,16 +3221,22 @@ mod tests {
 
         let first = cli_remote_endpoint(&context, &oauth_test_remote(false)).unwrap();
         let first_store = first.oauth.unwrap().token_store.unwrap();
-        let _saved = runtime.block_on(first_store.save(session.clone()));
+        let saved = runtime.block_on(first_store.save(session.clone()));
 
         let second = cli_remote_endpoint(&context, &oauth_test_remote(false)).unwrap();
         let second_store = second.oauth.unwrap().token_store.unwrap();
-        let _loaded = runtime.block_on(second_store.load(
+        let loaded = runtime.block_on(second_store.load_result(
             &session.resource,
             &session.issuer,
             &session.client_id,
             session.account.as_deref(),
         ));
+        match saved {
+            Ok(()) => assert!(loaded.is_ok(), "successful save must not hide load backend outcome"),
+            Err(_) => assert!(loaded.is_err() || loaded.is_ok_and(|value| value.is_none()), "failed save must not fabricate a credential"),
+        }
+        let deleted = runtime.block_on(second_store.clear(&session.resource, &session.issuer, &session.client_id, session.account.as_deref()));
+        assert!(deleted.is_ok() || loaded.is_err(), "deletion outcome must be explicit when the backend is unavailable");
         let path = config_root.join("oauth_tokens.json");
         assert!(!path.exists(), "secure-store outcomes must not create plaintext credentials");
         remove_dir_all_if_exists(&config_root);

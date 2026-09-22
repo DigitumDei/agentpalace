@@ -113,7 +113,9 @@ pub struct OAuthSession {
 }
 
 fn resource_key(raw: &str) -> String {
-    reqwest::Url::parse(raw).map_or_else(|_| raw.to_owned(), |url| url.to_string())
+    // OAuth resource identity is opaque and exact; REST transport normalization
+    // is handled separately by RemoteClient.
+    raw.to_owned()
 }
 
 /// Storage boundary for credentials. Implementations must scope records by all session identity

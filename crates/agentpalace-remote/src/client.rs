@@ -75,8 +75,11 @@ pub struct RemoteClient {
 }
 
 impl RemoteClient {
-    /// Return the normalized resource key used for OAuth session storage.
+    /// Return the slash-normalized REST transport base URL.
     pub fn base_url(&self) -> &str { self.base_url.as_str() }
+
+    /// Return the exact OAuth resource identity supplied by the endpoint.
+    pub fn oauth_resource(&self) -> &str { &self.oauth_resource }
 
     /// Construct a new client from a [`RemoteEndpoint`] descriptor.
     ///
@@ -171,20 +174,29 @@ impl RemoteClient {
         self.execute(self.http.get(url), CallKind::Read).await
     }
 
-    async fn load_stored_session_from_challenge(&self, resource_metadata: &str) -> bool {
+    async fn load_stored_session_from_challenge(&self, resource_metadata: Option<&str>) -> bool {
         let Some(config) = self.oauth.as_ref() else { return false };
-        let resource = reqwest::Url::parse(&self.oauth_resource).map_err(|_| ()).ok();
-        let Some(resource) = resource else { return false };
-        let Ok((protected, metadata)) = crate::discover_metadata(
-            &self.http,
-            resource_metadata,
-            &resource,
-            &self.base_url,
-            config.allow_loopback_demo,
-        ).await else { return false };
-        if !self.load_stored_session(&protected.resource, &metadata.issuer).await { return false; }
-        let expired = self.oauth_session.lock().await.as_ref().and_then(|session| session.expires_at).is_some_and(|expires_at| expires_at <= crate::oauth::now_seconds());
-        if expired { self.refresh(&metadata).await.is_ok() } else { true }
+        let metadata = if let Some(resource_metadata) = resource_metadata {
+            let Some(resource) = reqwest::Url::parse(&self.oauth_resource).ok() else { return false };
+            let Ok((protected, metadata)) = crate::discover_metadata(&self.http, resource_metadata, &resource, &self.base_url, config.allow_loopback_demo).await else { return false };
+            if !self.load_stored_session_result(&protected.resource, &metadata.issuer).await.is_ok_and(|loaded| loaded) { return false; }
+            metadata
+        } else {
+            let Some(session) = self.oauth_session.lock().await.clone() else { return false };
+            let session_issuer = session.issuer.clone();
+            let session_resource = session.resource.clone();
+            let Ok(issuer) = reqwest::Url::parse(&session_issuer) else { return false };
+            let Ok(server_url) = crate::well_known_url(&issuer) else { return false };
+            let Ok(response) = self.http.get(server_url).send().await else { return false };
+            let Ok(response) = response.error_for_status() else { return false };
+            let Ok(server) = response.json::<crate::AuthorizationServerMetadata>().await else { return false };
+            let Ok(resource) = reqwest::Url::parse(&session_resource) else { return false };
+            let protected = crate::ProtectedResourceMetadata { resource: session_resource, authorization_servers: vec![session_issuer] };
+            if crate::validate_metadata(&protected, &server, &resource, &self.base_url, config.allow_loopback_demo).is_err() { return false; }
+            server
+        };
+        // A server rejection can invalidate an access token before local expiry.
+        self.refresh(&metadata).await.is_ok()
     }
 
     /// Ensure the version handshake has been performed, returning a reference
@@ -379,8 +391,8 @@ impl RemoteClient {
 
         if status == reqwest::StatusCode::UNAUTHORIZED {
             if self.oauth.is_some() {
-                if !recovered && let (Some(retry), Some(resource_metadata)) = (retry, challenge.as_deref())
-                    && self.load_stored_session_from_challenge(resource_metadata).await
+                if !recovered && let Some(retry) = retry
+                    && self.load_stored_session_from_challenge(challenge.as_deref()).await
                 {
                     return Box::pin(self.execute_with_retry(retry, kind, true)).await;
                 }
@@ -542,15 +554,18 @@ impl RemoteClient {
     /// Load a previously authorized grant for the exact resource/issuer/client/account tuple.
     /// Returns `false` when the secure store is unavailable or has no matching grant.
     pub async fn load_stored_session(&self, resource: &str, issuer: &str) -> bool {
+        self.load_stored_session_result(resource, issuer).await.unwrap_or(false)
+    }
+
+    /// Load a stored grant while preserving backend failures distinctly from absence.
+    pub async fn load_stored_session_result(&self, resource: &str, issuer: &str) -> Result<bool> {
         let _guard = self.login_lock.lock().await;
-        let Some(config) = self.oauth.as_ref() else { return false };
-        let session = match self.token_store.load_result(resource, issuer, &config.client_id, config.account.as_deref()).await {
-            Ok(Some(session)) => session,
-            Ok(None) | Err(_) => return false,
-        };
+        let Some(config) = self.oauth.as_ref() else { return Ok(false) };
+        let Some(session) = self.token_store.load_result(resource, issuer, &config.client_id, config.account.as_deref()).await
+            .map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })? else { return Ok(false) };
         *self.token.lock().await = Some(session.access_token.clone());
         *self.oauth_session.lock().await = Some(session);
-        true
+        Ok(true)
     }
 
     /// Refresh the current grant once, replacing the access and rotating refresh token together.
@@ -1204,6 +1219,19 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct FailingLoadStore;
+
+    #[async_trait::async_trait]
+    impl crate::TokenStore for FailingLoadStore {
+        async fn load(&self, _resource: &str, _issuer: &str, _client_id: &str, _account: Option<&str>) -> Option<crate::OAuthSession> { None }
+        async fn load_result(&self, _resource: &str, _issuer: &str, _client_id: &str, _account: Option<&str>) -> std::result::Result<Option<crate::OAuthSession>, String> {
+            Err("test backend unavailable".to_owned())
+        }
+        async fn save(&self, _session: crate::OAuthSession) -> std::result::Result<(), String> { Ok(()) }
+        async fn clear(&self, _resource: &str, _issuer: &str, _client_id: &str, _account: Option<&str>) -> std::result::Result<(), String> { Err("test backend deletion failed".to_owned()) }
+    }
+
     async fn spawn_stub(app: axum::Router) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1597,6 +1625,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stored_session_load_reports_backend_failure_distinct_from_absence() {
+        let client = RemoteClient::new(oauth_endpoint("https://hub.example/api", Arc::new(FailingLoadStore))).unwrap();
+        let result = client.load_stored_session_result("https://hub.example/api", "https://issuer.example").await;
+        assert!(matches!(result, Err(RemoteError::AuthenticationRequired { .. })));
+    }
+
+    #[tokio::test]
     async fn oauth_401_challenge_reloads_persistent_session_before_retry() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("oauth.json");
@@ -1616,17 +1651,18 @@ mod tests {
                 let issuer = issuer.clone();
                 move || async move { axum::Json(serde_json::json!({"issuer": issuer.clone(), "authorization_endpoint": format!("{issuer}/authorize"), "token_endpoint": format!("{issuer}/token")})) }
             }))
+            .route("/token", axum::routing::post(|| async {
+                axum::Json(serde_json::json!({"access_token":"refreshed-access","refresh_token":"rotated-refresh","token_type":"Bearer","expires_in":900}))
+            }))
             .route("/v1/info", axum::routing::get({
                 let hits = Arc::clone(&hits);
-                let metadata_url = format!("{resource}.well-known/oauth-protected-resource");
                 move || {
                     let hits = Arc::clone(&hits);
-                    let metadata_url = metadata_url.clone();
                     async move {
                         if hits.fetch_add(1, Ordering::SeqCst) == 0 {
                             (
                                 axum::http::StatusCode::UNAUTHORIZED,
-                                [(axum::http::header::WWW_AUTHENTICATE, format!("Bearer resource_metadata={metadata_url}"))],
+                                [(axum::http::header::WWW_AUTHENTICATE, "Bearer".to_owned())],
                                 "unauthorized",
                             ).into_response()
                         } else {
@@ -1639,9 +1675,10 @@ mod tests {
         let session = oauth_session(&resource, &issuer, "reloaded-access");
         store.save(session).await.unwrap();
         let client = RemoteClient::new(oauth_endpoint(&format!("http://{addr}"), store)).unwrap();
+        assert!(client.load_stored_session(&resource, &issuer).await);
         assert!(client.info().await.is_ok());
         assert_eq!(hits.load(Ordering::SeqCst), 2);
-        assert_eq!(client.token.lock().await.as_deref(), Some("reloaded-access"));
+        assert_eq!(client.token.lock().await.as_deref(), Some("refreshed-access"));
         task.abort();
     }
 
@@ -1656,6 +1693,7 @@ mod tests {
         let app = axum::Router::new()
             .route("/.well-known/oauth-protected-resource", axum::routing::get({ let resource = resource.clone(); let issuer = issuer.clone(); move || async move { axum::Json(serde_json::json!({"resource": resource, "authorization_servers": [issuer]})) } }))
             .route("/.well-known/oauth-authorization-server", axum::routing::get({ let issuer = issuer.clone(); move || { let issuer = issuer.clone(); async move { axum::Json(serde_json::json!({"issuer": issuer.clone(), "authorization_endpoint": format!("{issuer}/authorize"), "token_endpoint": format!("{issuer}/token")})) } } }))
+            .route("/token", axum::routing::post(|| async { axum::Json(serde_json::json!({"access_token":"rotated","refresh_token":"rotated-refresh","token_type":"Bearer","expires_in":900})) }))
             .route("/v1/info", axum::routing::get({ let hits = Arc::clone(&hits); let metadata_url = metadata_url.clone(); move || { let hits = Arc::clone(&hits); let metadata_url = metadata_url.clone(); async move { hits.fetch_add(1, Ordering::SeqCst); (axum::http::StatusCode::UNAUTHORIZED, [(axum::http::header::WWW_AUTHENTICATE, format!("Bearer resource_metadata={metadata_url}"))], "revoked") } } }));
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
         let store = Arc::new(crate::InMemoryTokenStore::default());
@@ -1667,16 +1705,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_clears_the_normalized_resource_record() {
+    async fn logout_clears_the_exact_resource_record_for_both_slash_forms() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("oauth.json");
         let store = Arc::new(crate::FileTokenStore::new(&path));
-        let client = RemoteClient::new(oauth_endpoint("https://hub.example", store.clone())).unwrap();
-        let session = oauth_session("https://hub.example", "https://issuer.example", "logout-access");
+        let client = RemoteClient::new(oauth_endpoint("https://hub.example/api", store.clone())).unwrap();
+        let session = oauth_session("https://hub.example/api", "https://issuer.example", "logout-access");
         store.save(session).await.unwrap();
-        assert!(client.load_stored_session("https://hub.example/", "https://issuer.example").await);
+        assert!(client.load_stored_session(client.oauth_resource(), "https://issuer.example").await);
         client.logout(None).await.unwrap();
-        assert!(store.load("https://hub.example/", "https://issuer.example", "test-client", Some("test-account")).await.is_none());
+        assert!(store.load("https://hub.example/api", "https://issuer.example", "test-client", Some("test-account")).await.is_none());
         assert!(client.token.lock().await.is_none());
         assert!(client.oauth_session.lock().await.is_none());
     }
