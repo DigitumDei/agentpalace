@@ -3359,6 +3359,7 @@ checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
 dependencies = [
  "base64 0.22.1",
  "pem",
+ "ring",
  "serde",
  "serde_json",
  "simple_asn1",
