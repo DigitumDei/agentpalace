@@ -161,24 +161,10 @@ impl RemoteClient {
     /// handshake itself.
     async fn fetch_info(&self) -> Result<InfoResponse> {
         let url = self.url("v1/info")?;
-        let rb = self.http.get(url);
-        // The handshake is a read. A failed handshake therefore degrades to
-        // `Unreachable` for the mutations gated behind it — "before send", never
-        // `UnknownOutcome`.
-        match self.execute(rb, CallKind::Read).await {
-            Err(RemoteError::AuthenticationRequired { resource_metadata: Some(challenge), .. }) if self.oauth.is_some() => {
-                if self.load_stored_session_from_challenge(&challenge).await {
-                    self.execute(self.http.get(self.url("v1/info")?), CallKind::Read).await
-                } else {
-                    Err(RemoteError::AuthenticationRequired {
-                        remote: self.name.clone(),
-                        action: "run the explicit remote OAuth login command".to_owned(),
-                        resource_metadata: Some(challenge),
-                    })
-                }
-            }
-            result => result,
-        }
+        // `execute` owns the single bounded authentication recovery. Keeping
+        // the handshake on that path prevents a failed/revoked credential from
+        // recursively re-entering recovery.
+        self.execute(self.http.get(url), CallKind::Read).await
     }
 
     async fn load_stored_session_from_challenge(&self, resource_metadata: &str) -> bool {
@@ -374,15 +360,24 @@ impl RemoteClient {
         rb: reqwest::RequestBuilder,
         kind: CallKind,
     ) -> Result<T> {
+        self.execute_with_retry(rb, kind, false).await
+    }
+
+    async fn execute_with_retry<T: serde::de::DeserializeOwned>(
+        &self,
+        rb: reqwest::RequestBuilder,
+        kind: CallKind,
+        recovered: bool,
+    ) -> Result<T> {
         let retry = (kind == CallKind::Read).then(|| rb.try_clone()).flatten();
         let (status, bytes, challenge) = self.send_and_read(rb, kind).await?;
 
         if status == reqwest::StatusCode::UNAUTHORIZED {
             if self.oauth.is_some() {
-                if let (Some(retry), Some(resource_metadata)) = (retry, challenge.as_deref())
+                if !recovered && let (Some(retry), Some(resource_metadata)) = (retry, challenge.as_deref())
                     && self.load_stored_session_from_challenge(resource_metadata).await
                 {
-                    return Box::pin(self.execute(retry, kind)).await;
+                    return Box::pin(self.execute_with_retry(retry, kind, true)).await;
                 }
                 return Err(RemoteError::AuthenticationRequired {
                     remote: self.name.clone(),
@@ -487,7 +482,7 @@ impl RemoteClient {
             return Ok(());
         }
         let mut session = crate::browser_login(&self.http, metadata, config, resource).await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
-        session.resource = self.base_url.to_string();
+        session.resource = resource.to_owned();
         self.commit_session(session).await
     }
 
@@ -525,7 +520,7 @@ impl RemoteClient {
         }
         let mut session = crate::device_login(&self.http, metadata, config, resource).await
             .map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: None })?;
-        session.resource = self.base_url.to_string();
+        session.resource = resource.to_owned();
         self.commit_session(session).await
     }
 
@@ -542,6 +537,7 @@ impl RemoteClient {
     /// Load a previously authorized grant for the exact resource/issuer/client/account tuple.
     /// Returns `false` when the secure store is unavailable or has no matching grant.
     pub async fn load_stored_session(&self, resource: &str, issuer: &str) -> bool {
+        let _guard = self.login_lock.lock().await;
         let Some(config) = self.oauth.as_ref() else { return false };
         let Some(session) = self.token_store.load(resource, issuer, &config.client_id, config.account.as_deref()).await else { return false };
         *self.token.lock().await = Some(session.access_token.clone());
@@ -1638,6 +1634,27 @@ mod tests {
         assert!(client.info().await.is_ok());
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         assert_eq!(client.token.lock().await.as_deref(), Some("reloaded-access"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn revoked_session_recovery_is_bounded_to_one_retry() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let resource = format!("http://{addr}/");
+        let issuer = format!("http://{addr}");
+        let metadata_url = format!("{resource}.well-known/oauth-protected-resource");
+        let app = axum::Router::new()
+            .route("/.well-known/oauth-protected-resource", axum::routing::get({ let resource = resource.clone(); let issuer = issuer.clone(); move || async move { axum::Json(serde_json::json!({"resource": resource, "authorization_servers": [issuer]})) } }))
+            .route("/.well-known/oauth-authorization-server", axum::routing::get({ let issuer = issuer.clone(); move || { let issuer = issuer.clone(); async move { axum::Json(serde_json::json!({"issuer": issuer.clone(), "authorization_endpoint": format!("{issuer}/authorize"), "token_endpoint": format!("{issuer}/token")})) } } }))
+            .route("/v1/info", axum::routing::get({ let hits = Arc::clone(&hits); let metadata_url = metadata_url.clone(); move || { let hits = Arc::clone(&hits); let metadata_url = metadata_url.clone(); async move { hits.fetch_add(1, Ordering::SeqCst); (axum::http::StatusCode::UNAUTHORIZED, [(axum::http::header::WWW_AUTHENTICATE, format!("Bearer resource_metadata={metadata_url}"))], "revoked") } } }));
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let store = Arc::new(crate::InMemoryTokenStore::default());
+        store.save(oauth_session(&resource, &issuer, "revoked")).await.unwrap();
+        let client = RemoteClient::new(oauth_endpoint(&format!("http://{addr}"), store)).unwrap();
+        assert!(client.info().await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "a revoked session must not recurse beyond one recovered retry");
         task.abort();
     }
 
