@@ -11,7 +11,9 @@ agentpalace-core = { path = "../agentpalace-core" }
 axum = { version = "0.8", default-features = true }
 base64 = "0.22.1"
 blake3.workspace = true
+jsonwebtoken = "9.3.1"
 rand = "0.9.2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10.9"

@@ -8,9 +8,10 @@
 
 use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
-use axum::{extract::{Form, Query, State}, http::StatusCode, response::IntoResponse, routing::{get, post}, Json, Router};
+use axum::{extract::{Form, Query, State}, http::{header, HeaderMap, StatusCode}, response::{IntoResponse, Redirect}, routing::{get, post}, Json, Router};
 use agentpalace_core::{AuthenticatedOwner, Issuer, OwnerId, SubjectBinding};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -65,6 +66,46 @@ pub trait GoogleOidcVerifier: Send + Sync {
     fn exchange_and_verify(&self, authorization_code: &str, expected_nonce: &str) -> Result<GoogleIdClaims, GoogleClaimError>;
 }
 
+/// Maintained Google OIDC/JWKS verifier used by the hosted hub. It exchanges the
+/// authorization code server-side and verifies the returned ID token signature
+/// and standard claims before the gateway applies its admission policy.
+#[derive(Debug, Clone)]
+pub struct GoogleOidcVerifierAdapter {
+    config: GoogleOidcConfig,
+    callback_uri: String,
+    http: reqwest::blocking::Client,
+}
+
+#[derive(Debug, Deserialize)] struct GoogleTokenResponse { id_token: String }
+#[derive(Debug, Deserialize)] struct GoogleJwks { keys: Vec<GoogleJwk> }
+#[derive(Debug, Deserialize)] struct GoogleJwk { kid: String, kty: String, n: String, e: String, alg: Option<String> }
+
+impl GoogleOidcVerifierAdapter {
+    /// Construct an adapter for the configured native/browser callback.
+    pub fn new(config: GoogleOidcConfig, callback_uri: impl Into<String>) -> Result<Self, String> {
+        if config.issuer.as_str() != "https://accounts.google.com" { return Err("Google issuer must be accounts.google.com".into()); }
+        Ok(Self { config, callback_uri: callback_uri.into(), http: reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none()).build().map_err(|_| "Google OIDC client could not be built".to_owned())? })
+    }
+}
+
+impl GoogleOidcVerifier for GoogleOidcVerifierAdapter {
+    fn exchange_and_verify(&self, authorization_code: &str, expected_nonce: &str) -> Result<GoogleIdClaims, GoogleClaimError> {
+        let token: GoogleTokenResponse = self.http.post("https://oauth2.googleapis.com/token").form(&[
+            ("code", authorization_code), ("client_id", self.config.client_id.as_str()),
+            ("client_secret", self.config.client_secret.as_str()), ("redirect_uri", self.callback_uri.as_str()),
+            ("grant_type", "authorization_code"),
+        ]).send().map_err(|_| GoogleClaimError::Upstream)?.error_for_status().map_err(|_| GoogleClaimError::Upstream)?.json().map_err(|_| GoogleClaimError::Upstream)?;
+        let header = decode_header(&token.id_token).map_err(|_| GoogleClaimError::Signature)?;
+        let key = self.http.get("https://www.googleapis.com/oauth2/v3/certs").send().map_err(|_| GoogleClaimError::Upstream)?.error_for_status().map_err(|_| GoogleClaimError::Upstream)?.json::<GoogleJwks>().map_err(|_| GoogleClaimError::Upstream)?.keys.into_iter().find(|key| key.kid == header.kid.clone().unwrap_or_default() && key.kty == "RSA" && key.alg.as_deref().is_none_or(|alg| alg == "RS256")).ok_or(GoogleClaimError::Signature)?;
+        let decoding_key = DecodingKey::from_rsa_components(&key.n, &key.e).map_err(|_| GoogleClaimError::Signature)?;
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_issuer(&[self.config.issuer.as_str()]);
+        validation.set_audience(&[self.config.client_id.as_str()]);
+        let data = decode::<GoogleIdClaims>(&token.id_token, &decoding_key, &validation).map_err(|_| GoogleClaimError::Signature)?;
+        verify_google_claims(&self.config, &data.claims, expected_nonce)
+    }
+}
+
 /// Validate the security claims which are independent of a particular
 /// admission list. Signature verification is intentionally supplied by the
 /// maintained `openidconnect` adapter at the boundary; an unverified decode
@@ -100,6 +141,12 @@ pub enum GoogleClaimError {
     /// Required immutable identity claims were absent.
     #[error("Google subject or email is missing")]
     MissingSubject,
+    /// The upstream token or JWKS response was not valid.
+    #[error("Google upstream assertion could not be verified")]
+    Upstream,
+    /// The ID-token signature or key was invalid.
+    #[error("Google ID-token signature is invalid")]
+    Signature,
 }
 
 /// A registered public native client. It has no client secret by design.
@@ -239,7 +286,7 @@ pub struct Gateway {
 }
 
 #[derive(Default)]
-struct GatewayState { codes: BTreeMap<String, CodeGrant>, browser: BTreeMap<String, BrowserTransaction>, devices: BTreeMap<String, DeviceGrant>, refresh: BTreeMap<String, RefreshGrant>, access: BTreeMap<String, AccessGrant>, sessions: BTreeMap<String, BrowserSession> }
+struct GatewayState { codes: BTreeMap<String, CodeGrant>, browser: BTreeMap<String, BrowserTransaction>, pending_browser: BTreeMap<String, GoogleIdClaims>, devices: BTreeMap<String, DeviceGrant>, refresh: BTreeMap<String, RefreshGrant>, access: BTreeMap<String, AccessGrant>, sessions: BTreeMap<String, BrowserSession> }
 
 /// A hub browser session. The CSRF secret is never serialized or returned.
 #[derive(Debug, Clone)]
@@ -250,6 +297,8 @@ pub struct BrowserSession {
     pub csrf: String,
     /// Last successful upstream authentication.
     pub authenticated_at: u64,
+    /// Whether this session completed the administrator re-authentication boundary.
+    pub admin: bool,
 }
 
 /// A deliberately small role ceiling for agents acting through an owner grant.
@@ -293,6 +342,9 @@ impl Gateway {
             .route("/register", post(register))
             .route("/authorize", get(authorize))
             .route("/auth/google/callback", get(google_callback))
+            .route("/auth/google/consent", post(google_consent))
+            .route("/session", get(session))
+            .route("/connections/revoke", post(revoke_connection))
             .route("/token", post(token))
             .route("/revoke", post(revoke))
             .route("/device", post(device))
@@ -479,7 +531,14 @@ impl Gateway {
     /// Create a browser session after a successful Google transaction.
     pub fn create_session(&self, session_id: &str, owner: AdmissionIdentity, csrf: &str) -> Result<(), ProtocolError> {
         if session_id.is_empty() || csrf.is_empty() { return Err(ProtocolError::InvalidRequest); }
-        self.state.lock().map_err(|_| ProtocolError::ServerError)?.sessions.insert(session_id.into(), BrowserSession { owner, csrf: csrf.into(), authenticated_at: now() });
+        self.state.lock().map_err(|_| ProtocolError::ServerError)?.sessions.insert(session_id.into(), BrowserSession { owner, csrf: csrf.into(), authenticated_at: now(), admin: false });
+        Ok(())
+    }
+
+    /// Create a session which has explicitly completed the recent administrator auth step.
+    pub fn create_admin_session(&self, session_id: &str, owner: AdmissionIdentity, csrf: &str) -> Result<(), ProtocolError> {
+        if session_id.is_empty() || csrf.is_empty() { return Err(ProtocolError::InvalidRequest); }
+        self.state.lock().map_err(|_| ProtocolError::ServerError)?.sessions.insert(session_id.into(), BrowserSession { owner, csrf: csrf.into(), authenticated_at: now(), admin: true });
         Ok(())
     }
 
@@ -489,8 +548,8 @@ impl Gateway {
         let session = state.sessions.get(session_id).ok_or(ProtocolError::AccessDenied)?;
         if session.csrf != csrf { return Err(ProtocolError::InvalidRequest); }
         let owner = session.owner.owner.id.clone();
-        let grant = state.refresh.values_mut().find(|grant| grant.current == token && grant.owner.owner.id == owner).ok_or(ProtocolError::InvalidGrant)?;
-        grant.revoked = true;
+        let family = state.refresh.values().find(|grant| grant.current == token && grant.owner.owner.id == owner).map(|grant| grant.family.clone()).ok_or(ProtocolError::InvalidGrant)?;
+        revoke_family(&mut state, &family);
         Ok(())
     }
 
@@ -498,7 +557,7 @@ impl Gateway {
     pub fn require_recent_auth(&self, session_id: &str, max_age: Duration) -> Result<AdmissionIdentity, ProtocolError> {
         let state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
         let session = state.sessions.get(session_id).ok_or(ProtocolError::AccessDenied)?;
-        if now().saturating_sub(session.authenticated_at) > max_age.as_secs() { return Err(ProtocolError::AccessDenied); }
+        if !session.admin || now().saturating_sub(session.authenticated_at) > max_age.as_secs() { return Err(ProtocolError::AccessDenied); }
         Ok(session.owner.clone())
     }
 
@@ -544,21 +603,63 @@ impl ProtocolError { fn code(self) -> &'static str { match self { Self::InvalidR
 impl IntoResponse for ProtocolError { fn into_response(self) -> axum::response::Response { (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": self.code()}))).into_response() } }
 #[derive(Debug, Deserialize)] struct RegisterRequest { client_id: String, redirect_uri: String }
 #[derive(Debug, Deserialize)] struct AuthorizeQuery { client_id: String, redirect_uri: String, code_challenge: String, resource: String, state: String, #[serde(default)] nonce: Option<String> }
-#[derive(Debug, Deserialize)] struct GoogleCallbackQuery { transaction: String, state: String, code: String, consent: bool }
+#[derive(Debug, Deserialize)] struct GoogleCallbackQuery { #[serde(rename = "state", alias = "transaction")] transaction: String, code: String, #[serde(default)] consent: bool }
 #[derive(Debug, Deserialize)] struct TokenRequest { grant_type: String, code: Option<String>, device_code: Option<String>, refresh_token: Option<String>, client_id: String, redirect_uri: Option<String>, code_verifier: Option<String>, resource: String }
 #[derive(Debug, Deserialize)] struct DeviceRequest { client_id: String, resource: String }
 #[derive(Debug, Deserialize)] struct DeviceVerifyStartQuery { user_code: String }
 #[derive(Debug, Deserialize)] struct VerifyRequest { user_code: String, state: String, code: String, consent: bool }
 #[derive(Debug, Deserialize)] struct RevokeRequest { token: String }
+#[derive(Debug, Deserialize)] struct ConsentRequest { transaction: String }
 async fn protected_metadata(State(g): State<Gateway>) -> Json<ProtectedResourceMetadata> { Json(g.config.protected_resource_metadata()) }
 async fn authorization_metadata(State(g): State<Gateway>) -> Json<AuthorizationMetadata> { Json(g.config.metadata()) }
 async fn register(State(g): State<Gateway>, Json(r): Json<RegisterRequest>) -> impl IntoResponse { if r.client_id == g.config.native_client.client_id && r.redirect_uri == g.config.native_client.redirect_uri { Json(serde_json::json!({"client_id":r.client_id,"redirect_uris":[r.redirect_uri]})).into_response() } else { ProtocolError::InvalidRequest.into_response() } }
-async fn authorize(State(g): State<Gateway>, Query(r): Query<AuthorizeQuery>) -> impl IntoResponse { let nonce = r.nonce.unwrap_or_else(|| secret("nonce", &r.client_id, &r.state)); match g.begin_browser_authorization(&r.client_id,&r.redirect_uri,&r.code_challenge,&r.resource,&r.state,&nonce) { Ok(transaction)=>Json(serde_json::json!({"transaction":transaction,"provider":"google","scopes":GOOGLE_SCOPES})).into_response(), Err(e)=>e.into_response() } }
+async fn authorize(State(g): State<Gateway>, Query(r): Query<AuthorizeQuery>) -> impl IntoResponse {
+    let nonce = r.nonce.unwrap_or_else(|| secret("nonce", &r.client_id, &r.state));
+    match g.begin_browser_authorization(&r.client_id,&r.redirect_uri,&r.code_challenge,&r.resource,&r.state,&nonce) {
+        Ok(transaction) => {
+            let mut url = reqwest::Url::parse("https://accounts.google.com/o/oauth2/v2/auth").expect("constant Google endpoint");
+            url.query_pairs_mut().append_pair("response_type", "code").append_pair("client_id", &g.config.google.client_id)
+                .append_pair("redirect_uri", &format!("{}/auth/google/callback", g.config.issuer))
+                .append_pair("scope", &GOOGLE_SCOPES.join(" ")).append_pair("state", &transaction).append_pair("nonce", &nonce);
+            let owner = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| state.codes.get(&code).map(|grant| grant.owner.clone()).ok_or(ProtocolError::InvalidGrant)) { Ok(owner)=>owner, Err(error)=>return error.into_response() };
+            let session_id = secret("session", &client_state, &code);
+            let csrf = secret("csrf", &session_id, &client_state);
+            if let Err(error) = g.create_session(&session_id, owner, &csrf) { return error.into_response(); }
+            let mut response = Redirect::temporary(url.as_str()).into_response();
+            if let Ok(value) = format!("agentpalace_session={session_id}; HttpOnly; SameSite=Lax; Path=/").parse() { response.headers_mut().append(header::SET_COOKIE, value); }
+            if let Ok(value) = format!("agentpalace_csrf={csrf}; SameSite=Lax; Path=/").parse() { response.headers_mut().append(header::SET_COOKIE, value); }
+            response
+        }
+        Err(e)=>e.into_response()
+    }
+}
 async fn google_callback(State(g): State<Gateway>, Query(r): Query<GoogleCallbackQuery>) -> impl IntoResponse {
     let Some(verifier) = g.verifier.as_ref() else { return ProtocolError::ServerError.into_response(); };
-    let nonce = match g.browser_nonce(&r.transaction) { Ok(nonce) => nonce, Err(error) => return error.into_response() };
+    let (nonce, client_state, redirect_uri) = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| state.browser.get(&r.transaction).map(|t| (t.nonce.clone(), t.state.clone(), t.redirect_uri.clone())).ok_or(ProtocolError::InvalidGrant)) { Ok(values)=>values, Err(error)=>return error.into_response() };
     let claims = match verifier.exchange_and_verify(&r.code, &nonce) { Ok(claims) => claims, Err(_) => return ProtocolError::AccessDenied.into_response() };
-    match g.complete_browser_authorization(&r.transaction, &r.state, &claims, r.consent) { Ok(code)=>Json(serde_json::json!({"code":code,"state":r.state})).into_response(), Err(e)=>e.into_response() }
+    if !r.consent {
+        if let Ok(mut state) = g.state.lock() { state.pending_browser.insert(r.transaction.clone(), claims); }
+        return (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], format!("<form method=post action=\"/auth/google/consent\"><input type=hidden name=\"transaction\" value=\"{}\"><button type=submit>Continue</button></form>", r.transaction)).into_response();
+    }
+    match g.complete_browser_authorization(&r.transaction, &client_state, &claims, r.consent) {
+        Ok(code) => {
+            let mut url = match reqwest::Url::parse(&redirect_uri) { Ok(url)=>url, Err(_)=>return ProtocolError::InvalidRequest.into_response() };
+            url.query_pairs_mut().append_pair("code", &code).append_pair("state", &client_state);
+            Redirect::temporary(url.as_str()).into_response()
+        }
+        Err(e)=>e.into_response()
+    }
+}
+async fn google_consent(State(g): State<Gateway>, Form(r): Form<ConsentRequest>) -> impl IntoResponse {
+    let (claims, client_state, redirect_uri) = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|mut state| {
+        let claims = state.pending_browser.remove(&r.transaction).ok_or(ProtocolError::InvalidGrant)?;
+        let transaction = state.browser.get(&r.transaction).ok_or(ProtocolError::InvalidGrant)?;
+        Ok((claims, transaction.state.clone(), transaction.redirect_uri.clone()))
+    }) { Ok(values)=>values, Err(error)=>return error.into_response() };
+    match g.complete_browser_authorization(&r.transaction, &client_state, &claims, true) {
+        Ok(code) => { let mut url = match reqwest::Url::parse(&redirect_uri) { Ok(url)=>url, Err(_)=>return ProtocolError::InvalidRequest.into_response() }; url.query_pairs_mut().append_pair("code", &code).append_pair("state", &client_state); let owner = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| state.codes.get(&code).map(|grant| grant.owner.clone()).ok_or(ProtocolError::InvalidGrant)) { Ok(owner)=>owner, Err(error)=>return error.into_response() }; let session_id = secret("session", &client_state, &code); let csrf = secret("csrf", &session_id, &client_state); if let Err(error) = g.create_session(&session_id, owner, &csrf) { return error.into_response(); } let mut response = Redirect::temporary(url.as_str()).into_response(); if let Ok(value) = format!("agentpalace_session={session_id}; HttpOnly; SameSite=Lax; Path=/").parse() { response.headers_mut().append(header::SET_COOKIE, value); } if let Ok(value) = format!("agentpalace_csrf={csrf}; SameSite=Lax; Path=/").parse() { response.headers_mut().append(header::SET_COOKIE, value); } response }
+        Err(error)=>error.into_response(),
+    }
 }
 async fn token(State(g): State<Gateway>, Form(r): Form<TokenRequest>) -> impl IntoResponse { let result = match r.grant_type.as_str() { "authorization_code" => r.code.map_or(Err(ProtocolError::InvalidRequest), |code| g.exchange_code(&code, &r.client_id, r.redirect_uri.as_deref().unwrap_or_default(), r.code_verifier.as_deref().unwrap_or_default(), &r.resource)), "urn:ietf:params:oauth:grant-type:device_code" => r.device_code.map_or(Err(ProtocolError::InvalidRequest), |device_code| g.poll_device_for_client(&device_code, &r.client_id, &r.resource)), "refresh_token" => r.refresh_token.map_or(Err(ProtocolError::InvalidRequest), |token| g.refresh(&token)), _ => Err(ProtocolError::InvalidRequest) }; match result { Ok(v)=>Json(v).into_response(), Err(e)=>e.into_response() } }
 async fn device(State(g): State<Gateway>, Form(r): Form<DeviceRequest>) -> impl IntoResponse { match g.device_authorize(&r.client_id,&r.resource) { Ok(v)=>Json(v).into_response(), Err(e)=>e.into_response() } }
@@ -570,6 +671,22 @@ async fn verify_device(State(g): State<Gateway>, Json(r): Json<VerifyRequest>) -
     match g.complete_device_verification(&r.user_code,&r.state,&claims,r.consent) { Ok(())=>StatusCode::NO_CONTENT.into_response(), Err(e)=>e.into_response() }
 }
 async fn revoke(State(g): State<Gateway>, Form(r): Form<RevokeRequest>) -> impl IntoResponse { match g.revoke(&r.token) { Ok(())=>StatusCode::NO_CONTENT.into_response(), Err(e)=>e.into_response() } }
+
+async fn session(State(g): State<Gateway>, headers: HeaderMap) -> impl IntoResponse {
+    let Some(cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) else { return ProtocolError::AccessDenied.into_response() };
+    let Some(session_id) = cookie.split(';').find_map(|part| part.trim().strip_prefix("agentpalace_session=")) else { return ProtocolError::AccessDenied.into_response() };
+    match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| state.sessions.get(session_id).cloned().ok_or(ProtocolError::AccessDenied)) {
+        Ok(session) => Json(serde_json::json!({"owner": session.owner.owner.id.as_str(), "admin": session.admin})).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn revoke_connection(State(g): State<Gateway>, headers: HeaderMap, Form(r): Form<RevokeRequest>) -> impl IntoResponse {
+    let Some(cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) else { return ProtocolError::AccessDenied.into_response() };
+    let Some(session_id) = cookie.split(';').find_map(|part| part.trim().strip_prefix("agentpalace_session=")) else { return ProtocolError::AccessDenied.into_response() };
+    let csrf = headers.get("x-csrf-token").and_then(|v| v.to_str().ok()).or_else(|| cookie.split(';').find_map(|part| part.trim().strip_prefix("agentpalace_csrf="))).unwrap_or_default();
+    match g.revoke_own_grant(session_id, csrf, &r.token) { Ok(())=>StatusCode::NO_CONTENT.into_response(), Err(e)=>e.into_response() }
+}
 
 /// Public metadata shared by protected-resource and authorization-server responses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -802,8 +919,10 @@ mod tests {
     fn browser_session_requires_csrf_and_recent_auth() {
         let (gateway, identity) = gateway();
         let owner = gateway.policy.admit(&identity).expect("admission");
-        gateway.create_session("s", owner, "csrf").expect("session");
-        assert_eq!(gateway.require_recent_auth("s", Duration::from_secs(60)).expect("recent").owner.id.as_str(), "owner-1");
+        gateway.create_session("s", owner.clone(), "csrf").expect("session");
+        assert_eq!(gateway.require_recent_auth("s", Duration::from_secs(60)), Err(ProtocolError::AccessDenied));
+        gateway.create_admin_session("admin", owner, "admin-csrf").expect("admin session");
+        assert_eq!(gateway.require_recent_auth("admin", Duration::from_secs(60)).expect("recent").owner.id.as_str(), "owner-1");
         assert_eq!(gateway.revoke_own_grant("s", "wrong", "token"), Err(ProtocolError::InvalidRequest));
     }
 

@@ -136,6 +136,39 @@ pub struct InMemoryTokenStore(Mutex<Option<OAuthSession>>);
 #[derive(Debug, Default)]
 pub struct UnavailableTokenStore;
 
+/// Credential store backed by the platform keychain (Keychain, Credential
+/// Manager, or Secret Service). Keychain errors are surfaced; no file fallback
+/// is attempted.
+#[derive(Debug, Clone)]
+pub struct KeyringTokenStore { service: String }
+
+impl KeyringTokenStore {
+    pub fn new(service: impl Into<String>) -> Self { Self { service: service.into() } }
+    fn entry(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Result<keyring::Entry, String> {
+        let key = format!("{}\n{}\n{}\n{}", resource_key(resource), issuer, client_id, account.unwrap_or_default());
+        let digest = Sha256::digest(key.as_bytes());
+        keyring::Entry::new(&self.service, &URL_SAFE_NO_PAD.encode(digest)).map_err(|_| "platform secure credential storage is unavailable".to_owned())
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenStore for KeyringTokenStore {
+    async fn load(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Option<OAuthSession> {
+        let entry = self.entry(resource, issuer, client_id, account).ok()?;
+        tokio::task::spawn_blocking(move || entry.get_password().ok().and_then(|value| serde_json::from_str(&value).ok())).await.ok().flatten()
+    }
+    async fn save(&self, session: OAuthSession) -> Result<(), String> {
+        let entry = self.entry(&session.resource, &session.issuer, &session.client_id, session.account.as_deref())?;
+        let value = serde_json::to_string(&session).map_err(|_| "secure credential could not be encoded".to_owned())?;
+        tokio::task::spawn_blocking(move || entry.set_password(&value).map_err(|_| "platform secure credential storage is unavailable".to_owned())).await.map_err(|_| "secure credential operation failed".to_owned())??;
+        Ok(())
+    }
+    async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Result<(), String> {
+        let entry = self.entry(resource, issuer, client_id, account)?;
+        tokio::task::spawn_blocking(move || match entry.delete_credential() { Ok(()) => Ok(()), Err(_) => Ok(()) }).await.map_err(|_| "secure credential operation failed".to_owned())?
+    }
+}
+
 /// A local persistent store for CLI/native clients. The file is created with owner-only
 /// permissions where the platform supports them and is never included in config or output.
 /// Applications with a stronger OS credential facility should inject that facility instead.

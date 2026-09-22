@@ -26,7 +26,7 @@ use agentpalace_ingest::{
     prepare_project_batch_with_config, project_branch_source_prefix,
     project_canonical_source_prefix, project_root_relative, wing_kind_source_prefix,
 };
-use agentpalace_remote::{FileTokenStore, InMemoryTokenStore, OAuthConfig, RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
+use agentpalace_remote::{InMemoryTokenStore, KeyringTokenStore, OAuthConfig, RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, UnavailableTokenStore};
 use agentpalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
 use agentpalace_server::{TokenRegistry, build_router};
 use agentpalace_storage::{
@@ -2700,8 +2700,12 @@ fn cli_oauth_store(
     if allow_in_memory {
         return Ok(Arc::new(InMemoryTokenStore::default()));
     }
-    let paths = ConfigLoader::init_default(context.config_base_dir.as_deref())?;
-    Ok(Arc::new(FileTokenStore::new(paths.base_dir.join("oauth_tokens.json"))))
+    let _ = ConfigLoader::init_default(context.config_base_dir.as_deref())?;
+    if cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux")) {
+        Ok(Arc::new(KeyringTokenStore::new("agentpalace/oauth")))
+    } else {
+        Ok(Arc::new(UnavailableTokenStore))
+    }
 }
 
 /// Build the one CLI-owned endpoint shape used by every CLI `RemoteClient` path.
@@ -3216,7 +3220,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_endpoint_uses_owner_only_store_across_process_boundaries() {
+    fn cli_endpoint_reports_unavailable_secure_store_instead_of_plaintext() {
         let config_root = temp_config_root("oauth-store");
         let context = CliContext::for_tests(config_root.clone());
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -3224,7 +3228,7 @@ mod tests {
 
         let first = cli_remote_endpoint(&context, &oauth_test_remote(false)).unwrap();
         let first_store = first.oauth.unwrap().token_store.unwrap();
-        runtime.block_on(first_store.save(session.clone())).unwrap();
+        let saved = runtime.block_on(first_store.save(session.clone())).is_ok();
 
         let second = cli_remote_endpoint(&context, &oauth_test_remote(false)).unwrap();
         let second_store = second.oauth.unwrap().token_store.unwrap();
@@ -3234,19 +3238,9 @@ mod tests {
             &session.client_id,
             session.account.as_deref(),
         ));
-        let loaded = loaded.expect("persistent CLI store should reload the saved session");
-        assert_eq!(loaded.access_token, session.access_token);
-        assert_eq!(loaded.refresh_token, session.refresh_token);
-        assert_eq!(loaded.expires_at, session.expires_at);
-        assert_eq!(loaded.resource, session.resource);
-        assert_eq!(loaded.issuer, session.issuer);
-        assert_eq!(loaded.client_id, session.client_id);
-        assert_eq!(loaded.account, session.account);
-
         let path = config_root.join("oauth_tokens.json");
-        assert!(path.is_file(), "persistent CLI store should create its credential file");
-        #[cfg(unix)]
-        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(loaded.is_some(), saved);
+        assert!(!path.exists(), "unavailable secure store must not create plaintext credentials");
         remove_dir_all_if_exists(&config_root);
     }
 
