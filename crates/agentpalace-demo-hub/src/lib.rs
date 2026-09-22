@@ -275,9 +275,9 @@ impl AdmissionPolicy for DenyAllAdmission {
 #[derive(Debug, Clone)]
 struct CodeGrant { client_id: String, redirect_uri: String, challenge: String, resource: String, owner: AdmissionIdentity, expires: u64, used: bool }
 #[derive(Debug, Clone)]
-struct BrowserTransaction { client_id: String, redirect_uri: String, challenge: String, resource: String, state: String, nonce: String, csrf: String, expires: u64 }
+struct BrowserTransaction { client_id: String, redirect_uri: String, challenge: String, resource: String, state: String, nonce: String, csrf: String, browser_id: String, expires: u64 }
 #[derive(Debug, Clone)]
-struct DeviceGrant { client_id: String, resource: String, user_code: String, owner: Option<AdmissionIdentity>, verify_state: Option<String>, verify_nonce: Option<String>, verify_csrf: String, expires: u64, next_poll: u64, polls: u32, verify_attempts: u32, denied: bool }
+struct DeviceGrant { client_id: String, resource: String, user_code: String, owner: Option<AdmissionIdentity>, verify_state: Option<String>, verify_nonce: Option<String>, verify_csrf: String, browser_id: Option<String>, expires: u64, next_poll: u64, poll_interval: u64, polls: u32, verify_attempts: u32, denied: bool }
 #[derive(Debug, Clone)]
 struct RefreshGrant { family: String, owner: AdmissionIdentity, resource: String, expires: u64, current: String, revoked: bool }
 #[derive(Debug, Clone)]
@@ -385,7 +385,7 @@ impl Gateway {
         { return Err(ProtocolError::InvalidRequest); }
         let transaction = secret("browser", client_id, state);
         let csrf = secret("browser-csrf", &transaction, state);
-        self.state.lock().map_err(|_| ProtocolError::ServerError)?.browser.insert(transaction.clone(), BrowserTransaction { client_id: client_id.into(), redirect_uri: redirect_uri.into(), challenge: challenge.into(), resource: resource.into(), state: state.into(), nonce: nonce.into(), csrf, expires: now()+300 });
+        self.state.lock().map_err(|_| ProtocolError::ServerError)?.browser.insert(transaction.clone(), BrowserTransaction { client_id: client_id.into(), redirect_uri: redirect_uri.into(), challenge: challenge.into(), resource: resource.into(), state: state.into(), nonce: nonce.into(), csrf, browser_id: secret("browser-id", &transaction, state), expires: now()+300 });
         Ok(transaction)
     }
 
@@ -422,7 +422,7 @@ impl Gateway {
         let user_code = format!("{}-{}", &device_code[0..4], &device_code[4..8]).to_uppercase();
         let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
         if state.devices.values().filter(|grant| grant.client_id == client_id && grant.expires >= now()).count() >= 5 { return Err(ProtocolError::SlowDown); }
-        state.devices.insert(device_code.clone(), DeviceGrant { client_id: client_id.into(), resource: resource.into(), user_code: user_code.clone(), owner: None, verify_state: None, verify_nonce: None, verify_csrf: secret("device-csrf", &device_code, &user_code), expires: now()+600, next_poll: 0, polls: 0, verify_attempts: 0, denied: false });
+        state.devices.insert(device_code.clone(), DeviceGrant { client_id: client_id.into(), resource: resource.into(), user_code: user_code.clone(), owner: None, verify_state: None, verify_nonce: None, verify_csrf: secret("device-csrf", &device_code, &user_code), browser_id: None, expires: now()+600, next_poll: 0, poll_interval: 5, polls: 0, verify_attempts: 0, denied: false });
         let mut verification_uri = reqwest::Url::parse(&format!("{}/device/verify", self.config.issuer)).map_err(|_| ProtocolError::ServerError)?;
         verification_uri.query_pairs_mut().append_pair("user_code", &user_code);
         Ok(DeviceResponse { device_code, user_code, verification_uri: verification_uri.to_string(), expires_in: 600, interval: 5 })
@@ -450,6 +450,7 @@ impl Gateway {
         if grant.expires < now() { return Err(ProtocolError::ExpiredToken); }
         grant.verify_state = Some(state_value.clone());
         grant.verify_nonce = Some(nonce.clone());
+        grant.browser_id = Some(secret("device-browser-id", user_code, &state_value));
         Ok((state_value, nonce))
     }
 
@@ -482,8 +483,8 @@ impl Gateway {
         if grant.expires < timestamp { return Err(ProtocolError::ExpiredToken); }
         if grant.denied { return Err(ProtocolError::AccessDenied); }
         grant.polls = grant.polls.saturating_add(1);
-        if grant.next_poll >= timestamp { return Err(ProtocolError::SlowDown); }
-        grant.next_poll = timestamp + 5;
+        if timestamp < grant.next_poll { grant.poll_interval = grant.poll_interval.saturating_add(5); grant.next_poll = timestamp + grant.poll_interval; return Err(ProtocolError::SlowDown); }
+        grant.next_poll = timestamp + grant.poll_interval;
         let owner = grant.owner.clone().ok_or(ProtocolError::AuthorizationPending)?;
         let resource = grant.resource.clone();
         state.devices.remove(device_code);
@@ -629,7 +630,7 @@ impl IntoResponse for ProtocolError { fn into_response(self) -> axum::response::
 #[derive(Debug, Deserialize)] struct RegisterRequest { client_id: String, redirect_uri: String }
 #[derive(Debug, Deserialize)] struct AuthorizeQuery { client_id: String, redirect_uri: String, code_challenge: String, resource: String, state: String, #[serde(default)] nonce: Option<String> }
 #[derive(Debug, Deserialize)] struct GoogleCallbackQuery { #[serde(rename = "state", alias = "transaction")] transaction: String, #[serde(default)] code: Option<String>, #[serde(default)] error: Option<String> }
-#[derive(Debug, Deserialize)] struct GoogleDeviceCallbackQuery { state: String, code: String }
+#[derive(Debug, Deserialize)] struct GoogleDeviceCallbackQuery { state: String, #[serde(default)] code: Option<String>, #[serde(default)] error: Option<String> }
 #[derive(Debug, Deserialize)] struct TokenRequest { grant_type: String, code: Option<String>, device_code: Option<String>, refresh_token: Option<String>, client_id: String, redirect_uri: Option<String>, code_verifier: Option<String>, resource: String }
 #[derive(Debug, Deserialize)] struct DeviceRequest { client_id: String, resource: String }
 #[derive(Debug, Deserialize)] struct DeviceVerifyStartQuery { user_code: Option<String> }
@@ -638,6 +639,8 @@ impl IntoResponse for ProtocolError { fn into_response(self) -> axum::response::
 #[derive(Debug, Deserialize)] struct ConsentRequest { transaction: String, csrf_token: String, #[serde(default)] consent: bool }
 #[derive(Debug, Deserialize)] struct DeviceConsentRequest { user_code: String, state: String, csrf_token: String, #[serde(default)] consent: bool }
 async fn protected_metadata(State(g): State<Gateway>) -> Json<ProtectedResourceMetadata> { Json(g.config.protected_resource_metadata()) }
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> { headers.get(header::COOKIE).and_then(|value| value.to_str().ok()).and_then(|cookies| cookies.split(';').find_map(|part| part.trim().strip_prefix(&format!("{name}=")).map(str::to_owned))) }
+fn transaction_browser_id(g: &Gateway, transaction: &str) -> Option<String> { g.state.lock().ok().and_then(|state| state.browser.get(transaction).map(|value| value.browser_id.clone())) }
 async fn authorization_metadata(State(g): State<Gateway>) -> Json<AuthorizationMetadata> { Json(g.config.metadata()) }
 async fn register(State(g): State<Gateway>, Json(r): Json<RegisterRequest>) -> impl IntoResponse { if r.client_id == g.config.native_client.client_id && r.redirect_uri == g.config.native_client.redirect_uri { Json(serde_json::json!({"client_id":r.client_id,"redirect_uris":[r.redirect_uri]})).into_response() } else { ProtocolError::InvalidRequest.into_response() } }
 async fn authorize(State(g): State<Gateway>, Query(r): Query<AuthorizeQuery>) -> impl IntoResponse {
@@ -648,12 +651,16 @@ async fn authorize(State(g): State<Gateway>, Query(r): Query<AuthorizeQuery>) ->
             url.query_pairs_mut().append_pair("response_type", "code").append_pair("client_id", &g.config.google.client_id)
                 .append_pair("redirect_uri", &format!("{}/auth/google/callback", g.config.issuer))
                 .append_pair("scope", &GOOGLE_SCOPES.join(" ")).append_pair("state", &transaction).append_pair("nonce", &nonce);
-            Redirect::temporary(url.as_str()).into_response()
+            let browser_id = transaction_browser_id(&g, &transaction).unwrap_or_default();
+            let mut response = Redirect::temporary(url.as_str()).into_response();
+            if let Ok(value) = format!("agentpalace_browser={browser_id}; HttpOnly; SameSite=Lax; Path=/").parse() { response.headers_mut().append(header::SET_COOKIE, value); }
+            response
         }
         Err(e)=>e.into_response()
     }
 }
-async fn google_callback(State(g): State<Gateway>, Query(r): Query<GoogleCallbackQuery>) -> impl IntoResponse {
+async fn google_callback(State(g): State<Gateway>, headers: HeaderMap, Query(r): Query<GoogleCallbackQuery>) -> impl IntoResponse {
+    if cookie_value(&headers, "agentpalace_browser") != transaction_browser_id(&g, &r.transaction) { return ProtocolError::AccessDenied.into_response(); }
     if let Some(error) = r.error {
         let (client_state, redirect_uri) = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| state.browser.get(&r.transaction).map(|t| (t.state.clone(), t.redirect_uri.clone())).ok_or(ProtocolError::InvalidGrant)) { Ok(values)=>values, Err(error)=>return error.into_response() };
         if let Ok(mut state) = g.state.lock() { state.browser.remove(&r.transaction); }
@@ -669,7 +676,8 @@ async fn google_callback(State(g): State<Gateway>, Query(r): Query<GoogleCallbac
     let csrf = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| state.browser.get(&r.transaction).map(|t| t.csrf.clone()).ok_or(ProtocolError::InvalidGrant)) { Ok(csrf) => csrf, Err(error) => return error.into_response() };
     (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], format!("<form method=post action=\"/auth/google/consent\"><input type=hidden name=\"transaction\" value=\"{}\"><input type=hidden name=\"csrf_token\" value=\"{}\"><button name=\"consent\" value=\"true\" type=submit>Continue</button><button name=\"consent\" value=\"false\" type=submit>Deny</button></form>", r.transaction, csrf)).into_response()
 }
-async fn google_consent(State(g): State<Gateway>, Form(r): Form<ConsentRequest>) -> impl IntoResponse {
+async fn google_consent(State(g): State<Gateway>, headers: HeaderMap, Form(r): Form<ConsentRequest>) -> impl IntoResponse {
+    if cookie_value(&headers, "agentpalace_browser") != transaction_browser_id(&g, &r.transaction) { return ProtocolError::AccessDenied.into_response(); }
     let (claims, client_state, redirect_uri) = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|mut state| {
         let (transaction_csrf, client_state, redirect_uri) = state.browser.get(&r.transaction)
             .map(|transaction| (transaction.csrf.clone(), transaction.state.clone(), transaction.redirect_uri.clone()))
@@ -704,15 +712,22 @@ async fn begin_device_verify(State(g): State<Gateway>, Query(r): Query<DeviceVer
                 .append_pair("scope", &GOOGLE_SCOPES.join(" "))
                 .append_pair("state", &state)
                 .append_pair("nonce", &nonce);
-            Redirect::temporary(url.as_str()).into_response()
+            let browser_id = g.state.lock().ok().and_then(|state| state.devices.values().find(|grant| grant.user_code == user_code).and_then(|grant| grant.browser_id.clone())).unwrap_or_default();
+            let mut response = Redirect::temporary(url.as_str()).into_response();
+            if let Ok(value) = format!("agentpalace_device_browser={browser_id}; HttpOnly; SameSite=Lax; Path=/").parse() { response.headers_mut().append(header::SET_COOKIE, value); }
+            response
         }
         Err(e) => e.into_response(),
     }
 }
-async fn google_device_callback(State(g): State<Gateway>, Query(r): Query<GoogleDeviceCallbackQuery>) -> impl IntoResponse {
+async fn google_device_callback(State(g): State<Gateway>, headers: HeaderMap, Query(r): Query<GoogleDeviceCallbackQuery>) -> impl IntoResponse {
+    if r.error.as_deref() == Some("access_denied") {
+        let user_code = g.state.lock().ok().and_then(|state| state.devices.values().find(|grant| grant.verify_state.as_deref() == Some(r.state.as_str()) && grant.browser_id.as_deref() == cookie_value(&headers, "agentpalace_device_browser").as_deref()).map(|grant| grant.user_code.clone()));
+        return match user_code { Some(user_code) => match g.deny_device(&user_code) { Ok(()) => StatusCode::NO_CONTENT.into_response(), Err(error) => error.into_response() }, None => ProtocolError::InvalidGrant.into_response() };
+    }
     let Some(verifier) = g.verifier.as_ref() else { return ProtocolError::ServerError.into_response(); };
     let user_code = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| {
-        state.devices.values().find(|grant| grant.verify_state.as_deref() == Some(r.state.as_str())).map(|grant| grant.user_code.clone()).ok_or(ProtocolError::InvalidGrant)
+        state.devices.values().find(|grant| grant.verify_state.as_deref() == Some(r.state.as_str()) && grant.browser_id.as_deref() == cookie_value(&headers, "agentpalace_device_browser").as_deref()).map(|grant| grant.user_code.clone()).ok_or(ProtocolError::InvalidGrant)
     }) {
         Ok(user_code) => user_code,
         Err(error) => return error.into_response(),
@@ -723,7 +738,8 @@ async fn google_device_callback(State(g): State<Gateway>, Query(r): Query<Google
         Ok(nonce) => nonce,
         Err(error) => return error.into_response(),
     };
-    let claims = match verify_upstream(verifier.clone(), r.code, nonce, format!("{}/auth/google/device-callback", g.config.issuer)).await {
+    let Some(code) = r.code else { return ProtocolError::InvalidRequest.into_response(); };
+    let claims = match verify_upstream(verifier.clone(), code, nonce, format!("{}/auth/google/device-callback", g.config.issuer)).await {
         Ok(claims) => claims,
         Err(_) => return ProtocolError::AccessDenied.into_response(),
     };
@@ -731,9 +747,10 @@ async fn google_device_callback(State(g): State<Gateway>, Query(r): Query<Google
     let csrf = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| state.devices.values().find(|grant| grant.user_code == user_code).map(|grant| grant.verify_csrf.clone()).ok_or(ProtocolError::InvalidGrant)) { Ok(csrf) => csrf, Err(error) => return error.into_response() };
     (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], format!("<form method=post action=\"/auth/google/device-consent\"><input type=hidden name=\"user_code\" value=\"{}\"><input type=hidden name=\"state\" value=\"{}\"><input type=hidden name=\"csrf_token\" value=\"{}\"><button name=\"consent\" value=\"true\" type=submit>Approve</button><button name=\"consent\" value=\"false\" type=submit>Deny</button></form>", user_code, r.state, csrf)).into_response()
 }
-async fn google_device_consent(State(g): State<Gateway>, Form(r): Form<DeviceConsentRequest>) -> impl IntoResponse {
+async fn google_device_consent(State(g): State<Gateway>, headers: HeaderMap, Form(r): Form<DeviceConsentRequest>) -> impl IntoResponse {
     let csrf_ok = g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| state.devices.values().find(|grant| grant.user_code == r.user_code).map(|grant| grant.verify_csrf == r.csrf_token).ok_or(ProtocolError::InvalidGrant));
-    if !matches!(csrf_ok, Ok(true)) { return ProtocolError::InvalidRequest.into_response(); }
+    let browser_ok = g.state.lock().ok().is_some_and(|state| state.devices.values().any(|grant| grant.user_code == r.user_code && grant.verify_state.as_deref() == Some(r.state.as_str()) && grant.browser_id.as_deref() == cookie_value(&headers, "agentpalace_device_browser").as_deref()));
+    if !matches!(csrf_ok, Ok(true)) || !browser_ok { return ProtocolError::InvalidRequest.into_response(); }
     let claims = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|mut state| state.pending_device.remove(&r.state).ok_or(ProtocolError::InvalidGrant)) {
         Ok(claims) => claims,
         Err(error) => return error.into_response(),
@@ -744,9 +761,10 @@ async fn google_device_consent(State(g): State<Gateway>, Form(r): Form<DeviceCon
     let result = g.complete_device_verification(&r.user_code, &r.state, &claims, true);
     match result { Ok(()) => (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], "Device authorization approved; you may close this window.").into_response(), Err(error) => error.into_response() }
 }
-async fn verify_device(State(g): State<Gateway>, Json(r): Json<VerifyRequest>) -> impl IntoResponse {
+async fn verify_device(State(g): State<Gateway>, headers: HeaderMap, Json(r): Json<VerifyRequest>) -> impl IntoResponse {
     let csrf_ok = g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| state.devices.values().find(|grant| grant.user_code == r.user_code).map(|grant| grant.verify_csrf == r.csrf_token).ok_or(ProtocolError::InvalidGrant));
-    if !matches!(csrf_ok, Ok(true)) { return ProtocolError::InvalidRequest.into_response(); }
+    let transaction_ok = g.state.lock().ok().is_some_and(|state| state.devices.values().any(|grant| grant.user_code == r.user_code && grant.verify_state.as_deref() == Some(r.state.as_str()) && grant.browser_id.as_deref() == cookie_value(&headers, "agentpalace_device_browser").as_deref()));
+    if !matches!(csrf_ok, Ok(true)) || !transaction_ok { return ProtocolError::InvalidRequest.into_response(); }
     if !r.consent { return match g.deny_device(&r.user_code) { Ok(()) => StatusCode::NO_CONTENT.into_response(), Err(error) => error.into_response() }; }
     let Some(verifier) = g.verifier.as_ref() else { return ProtocolError::ServerError.into_response(); };
     let nonce = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| state.devices.values().find(|grant| grant.user_code == r.user_code).and_then(|grant| grant.verify_nonce.clone()).ok_or(ProtocolError::InvalidGrant)) { Ok(nonce) => nonce, Err(error) => return error.into_response() };

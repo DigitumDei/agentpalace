@@ -19,10 +19,9 @@ PKCE flow; `device` uses RFC 8628 device authorization when the issuer advertise
 browser/callback path when usable and otherwise selects device authorization.
 The mode is selected once per foreground login, so automatic selection does not
 repeatedly launch a browser after the callback path is known to be unavailable.
-The default configured mode is `auto`. The CLI stores grants in an owner-only
-file under the AgentPalace config home (embedding callers can provide a stronger
-secure token store), or only in memory when `allow_in_memory` is explicitly
-enabled. Background and MCP requests never
+The default configured mode is `auto`. The CLI stores grants through the
+platform OS credential store, or only in memory when `allow_in_memory` is
+explicitly enabled. Background and MCP requests never
 open a browser; they return an actionable authentication-required result.
 `auth logout --remote <NAME> --issuer <ISSUER>` clears the matching locally stored grant. Credentials and
 tokens are never command-line arguments or config values.

@@ -113,9 +113,7 @@ pub struct OAuthSession {
 }
 
 fn resource_key(raw: &str) -> String {
-    let Ok(mut url) = reqwest::Url::parse(raw) else { return raw.to_owned() };
-    if !url.path().ends_with('/') { url.set_path(&format!("{}/", url.path())); }
-    url.to_string()
+    reqwest::Url::parse(raw).map_or_else(|_| raw.to_owned(), |url| url.to_string())
 }
 
 /// Storage boundary for credentials. Implementations must scope records by all session identity
@@ -123,6 +121,10 @@ fn resource_key(raw: &str) -> String {
 #[async_trait::async_trait]
 pub trait TokenStore: Send + Sync + std::fmt::Debug {
     async fn load(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Option<OAuthSession>;
+    /// Load while distinguishing an absent credential from a backend failure.
+    async fn load_result(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Result<Option<OAuthSession>, String> {
+        Ok(self.load(resource, issuer, client_id, account).await)
+    }
     async fn save(&self, session: OAuthSession) -> Result<(), String>;
     async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Result<(), String>;
 }
@@ -156,6 +158,14 @@ impl TokenStore for KeyringTokenStore {
     async fn load(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Option<OAuthSession> {
         let entry = self.entry(resource, issuer, client_id, account).ok()?;
         tokio::task::spawn_blocking(move || entry.get_password().ok().and_then(|value| serde_json::from_str(&value).ok())).await.ok().flatten()
+    }
+    async fn load_result(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Result<Option<OAuthSession>, String> {
+        let entry = self.entry(resource, issuer, client_id, account)?;
+        tokio::task::spawn_blocking(move || match entry.get_password() {
+            Ok(value) => serde_json::from_str(&value).map(Some).map_err(|_| "secure credential was malformed".to_owned()),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(_) => Err("platform secure credential storage is unavailable".to_owned()),
+        }).await.map_err(|_| "secure credential operation failed".to_owned())?
     }
     async fn save(&self, session: OAuthSession) -> Result<(), String> {
         let entry = self.entry(&session.resource, &session.issuer, &session.client_id, session.account.as_deref())?;
@@ -682,6 +692,17 @@ mod tests {
         store.save(second).await.expect("second issuer");
         assert_eq!(store.load("https://resource", "https://issuer-a", "client", None).await.map(|s| s.access_token), Some("a".to_owned()));
         assert_eq!(store.load("https://resource", "https://issuer-b", "client", None).await.map(|s| s.access_token), Some("b".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn stores_preserve_distinct_path_resource_identities() {
+        let store = InMemoryTokenStore::default();
+        let first = OAuthSession { access_token: "a".to_owned(), refresh_token: None, expires_at: None, resource: "https://resource/api".to_owned(), issuer: "https://issuer".to_owned(), client_id: "client".to_owned(), account: None };
+        let second = OAuthSession { access_token: "b".to_owned(), resource: "https://resource/api/".to_owned(), ..first.clone() };
+        store.save(first).await.expect("first resource");
+        store.save(second).await.expect("second resource");
+        assert_eq!(store.load("https://resource/api", "https://issuer", "client", None).await.map(|s| s.access_token), Some("a".to_owned()));
+        assert_eq!(store.load("https://resource/api/", "https://issuer", "client", None).await.map(|s| s.access_token), Some("b".to_owned()));
     }
 
     #[tokio::test]

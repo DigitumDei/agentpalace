@@ -56,6 +56,8 @@ pub struct RemoteClient {
     name: String,
     /// Base URL, normalised to end with `'/'` so [`reqwest::Url::join`] works correctly.
     base_url: reqwest::Url,
+    /// Exact OAuth resource identity, kept separate from the slash-terminated transport base.
+    oauth_resource: String,
     /// Optional bearer token sent on every authenticated request.
     token: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
     oauth: Option<crate::OAuthConfig>,
@@ -91,6 +93,7 @@ impl RemoteClient {
                 remote: endpoint.name.clone(),
                 message: format!("cannot parse base URL `{raw_url}`: {e}"),
             })?;
+        let oauth_resource = base_url.to_string();
 
         // Normalize: ensure the path ends with '/' so that Url::join with a
         // relative path (e.g. "v1/info") appends rather than replaces the last
@@ -120,6 +123,7 @@ impl RemoteClient {
         Ok(Self {
             name: endpoint.name,
             base_url,
+            oauth_resource,
             token: std::sync::Arc::new(tokio::sync::Mutex::new(endpoint.token)),
             oauth: endpoint.oauth,
             oauth_session: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -169,12 +173,13 @@ impl RemoteClient {
 
     async fn load_stored_session_from_challenge(&self, resource_metadata: &str) -> bool {
         let Some(config) = self.oauth.as_ref() else { return false };
-        let resource = self.base_url.clone();
+        let resource = reqwest::Url::parse(&self.oauth_resource).map_err(|_| ()).ok();
+        let Some(resource) = resource else { return false };
         let Ok((protected, metadata)) = crate::discover_metadata(
             &self.http,
             resource_metadata,
             &resource,
-            &resource,
+            &self.base_url,
             config.allow_loopback_demo,
         ).await else { return false };
         if !self.load_stored_session(&protected.resource, &metadata.issuer).await { return false; }
@@ -497,8 +502,8 @@ impl RemoteClient {
     /// optional foreground override, otherwise the configured login mode.
     pub async fn login_from_challenge_with_mode(&self, resource_metadata: &str, mode: Option<agentpalace_config::OAuthLoginMode>) -> Result<()> {
         let config = self.oauth.as_ref().ok_or_else(|| RemoteError::InvalidConfig { remote: self.name.clone(), message: "OAuth login requested for a bearer-token remote".to_owned() })?;
-        let resource = self.base_url.clone();
-        let (protected, metadata) = crate::discover_metadata(&self.http, resource_metadata, &resource, &resource, config.allow_loopback_demo)
+        let resource = match reqwest::Url::parse(&self.oauth_resource) { Ok(value) => value, Err(_) => return Err(RemoteError::InvalidConfig { remote: self.name.clone(), message: "invalid OAuth resource".to_owned() }) };
+        let (protected, metadata) = crate::discover_metadata(&self.http, resource_metadata, &resource, &self.base_url, config.allow_loopback_demo)
             .await.map_err(|message| RemoteError::AuthenticationRequired { remote: self.name.clone(), action: message, resource_metadata: Some(resource_metadata.to_owned()) })?;
         match crate::select_login_mode(mode.unwrap_or(config.login_mode), crate::browser_callback_usable()) {
             agentpalace_config::OAuthLoginMode::Browser => self.login(&metadata, &protected.resource).await,
@@ -539,7 +544,10 @@ impl RemoteClient {
     pub async fn load_stored_session(&self, resource: &str, issuer: &str) -> bool {
         let _guard = self.login_lock.lock().await;
         let Some(config) = self.oauth.as_ref() else { return false };
-        let Some(session) = self.token_store.load(resource, issuer, &config.client_id, config.account.as_deref()).await else { return false };
+        let session = match self.token_store.load_result(resource, issuer, &config.client_id, config.account.as_deref()).await {
+            Ok(Some(session)) => session,
+            Ok(None) | Err(_) => return false,
+        };
         *self.token.lock().await = Some(session.access_token.clone());
         *self.oauth_session.lock().await = Some(session);
         true

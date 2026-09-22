@@ -28,9 +28,9 @@ excluded from serialized output.
 | HTTP routing and middleware | Axum 0.8 with Tokio | Route inventory, HTTPS/loopback rule, no `/mcp` or broad REST forwarding |
 | OAuth authorization-code/device protocol | Axum form handlers with RFC 8252 PKCE and RFC 8628 state machines | One-time code binding, consent, resource/client checks, polling limits and error semantics |
 | Google OIDC discovery and ID-token validation | `reqwest` plus `jsonwebtoken` in `GoogleOidcVerifierAdapter`, injected through `GoogleOidcVerifier` | Google token exchange, JWKS signature, issuer/audience/expiry/verified-email checks, server-held state and nonce, and no Google token admission |
-| Hub JWT signing/key rotation | `jsonwebtoken` with a server-side key ring | Hub issuer/resource claims, 15-minute access lifetime, seven-day grant ceiling, key rotation and revocation |
+| Opaque hub grant handles | Cryptographically random in-memory handles | Hub issuer/resource binding, 15-minute access lifetime, seven-day grant ceiling, rotation and revocation; JWT signing/key rotation is not claimed |
 | Browser sessions and CSRF | Axum cookie/session routes | Secure cookie policy, CSRF on mutations, recent-auth admin boundary and own-connection filtering |
-| Durable grants, admissions, and revocation | Existing SQLite/Rusqlite storage boundary | Immutable owner/issuer/subject binding, email-change handling, refresh reuse detection and fail-closed admission policy |
+| In-memory grants, admissions, and revocation | `GatewayState` maps owned by the gateway | Immutable owner/issuer/subject binding, email-change handling, refresh reuse detection and fail-closed admission policy; durable SQLite storage is not claimed |
 
 The selected libraries provide maintained protocol primitives; they do not
 decide AgentPalace's authorization. The gateway code remains responsible for
