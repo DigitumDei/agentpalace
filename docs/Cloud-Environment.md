@@ -39,7 +39,7 @@ extra target triples, so give the box headroom rather than the minimum.
 ## System packages
 
 ```
-build-essential ca-certificates curl git libssl-dev pkg-config protobuf-compiler
+build-essential ca-certificates curl git libdbus-1-dev libssl-dev pkg-config protobuf-compiler
 ```
 
 Three of these are load-bearing in ways the crate names don't advertise:
@@ -52,6 +52,8 @@ Three of these are load-bearing in ways the crate names don't advertise:
   `Cargo.lock`), so it links the system OpenSSL through `pkg-config`. A minimal image that
   ships only the OpenSSL runtime has neither the headers nor the `.pc` file, and neither
   `build-essential` nor `pkg-config` supplies them.
+- **`libdbus-1-dev`** — the Linux-native persistent keyring backend links `dbus-1` through
+  `pkg-config`; without its headers and `dbus-1.pc`, remote/CLI builds fail in `libdbus-sys`.
 
 ## Toolchain
 
