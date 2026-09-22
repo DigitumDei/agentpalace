@@ -26,10 +26,10 @@ excluded from serialized output.
 | Concern | Selected component | Boundary owned by AgentPalace |
 |---|---|---|
 | HTTP routing and middleware | Axum 0.8 with Tokio | Route inventory, HTTPS/loopback rule, no `/mcp` or broad REST forwarding |
-| OAuth authorization-code/device protocol | `oauth2` maintained Rust implementation, with RFC 8252 PKCE and RFC 8628 handlers | One-time code binding, consent, resource/client checks, polling limits and error semantics |
-| Google OIDC discovery and ID-token validation | `openidconnect` maintained Rust implementation, injected through `GoogleOidcVerifier` | Exact issuer/audience/expiry/signature/verified-email checks, server-held state and nonce, and no Google token admission |
+| OAuth authorization-code/device protocol | Axum form handlers with RFC 8252 PKCE and RFC 8628 state machines | One-time code binding, consent, resource/client checks, polling limits and error semantics |
+| Google OIDC discovery and ID-token validation | `reqwest` plus `jsonwebtoken` in `GoogleOidcVerifierAdapter`, injected through `GoogleOidcVerifier` | Google token exchange, JWKS signature, issuer/audience/expiry/verified-email checks, server-held state and nonce, and no Google token admission |
 | Hub JWT signing/key rotation | `jsonwebtoken` with a server-side key ring | Hub issuer/resource claims, 15-minute access lifetime, seven-day grant ceiling, key rotation and revocation |
-| Browser sessions and CSRF | `tower-sessions` plus Axum middleware | Secure cookie policy, CSRF on mutations, recent-auth admin boundary and own-connection filtering |
+| Browser sessions and CSRF | Axum cookie/session routes | Secure cookie policy, CSRF on mutations, recent-auth admin boundary and own-connection filtering |
 | Durable grants, admissions, and revocation | Existing SQLite/Rusqlite storage boundary | Immutable owner/issuer/subject binding, email-change handling, refresh reuse detection and fail-closed admission policy |
 
 The selected libraries provide maintained protocol primitives; they do not
@@ -66,8 +66,10 @@ atomically before deployment:
 The HTTP `/authorize` handler creates a server-held browser transaction; it does
 not accept an identity object or caller-supplied expected state/nonce. The
 configured OIDC adapter exchanges the Google authorization code and validates
-the returned ID token at `/auth/google/callback`, after which the gateway
-consumes the transaction and returns a hub authorization code. A Google ID
+the returned ID token at `/auth/google/callback` (or
+`/auth/google/device-callback` for RFC 8628 verification), after which the
+gateway consumes the transaction and returns a hub authorization code or marks
+the device grant approved. A Google ID
 token or access token is never accepted by `/token` or by the protected
 resource.
 

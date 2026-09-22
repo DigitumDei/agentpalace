@@ -33,6 +33,12 @@ Register this exact proposed authorized redirect URI:
 http://localhost:8080/auth/google/callback
 ~~~
 
+Also register the device-verification callback used by headless clients:
+
+~~~text
+http://localhost:8080/auth/google/device-callback
+~~~
+
 Save the client ID and client secret privately. Google supports localhost HTTP
 redirects for testing; the registered scheme, host, port, and path must match
 the gateway's callback.
@@ -62,7 +68,7 @@ credentials or a maintainer-owned account):
 | Google client secret | From that application; local secret, never committed |
 | Initial admin email | The Google account you will use to test |
 | Local hub origin | http://localhost:8080 |
-| Google callback | http://localhost:8080/auth/google/callback |
+| Google callback | http://localhost:8080/auth/google/callback and http://localhost:8080/auth/google/device-callback |
 
 Bootstrap the initial admin into the editable allowlist once. For role testing,
 add your other test emails as write or readonly. Google's app/test-user settings

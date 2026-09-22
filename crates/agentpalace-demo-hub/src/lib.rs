@@ -343,6 +343,7 @@ impl Gateway {
             .route("/register", post(register))
             .route("/authorize", get(authorize))
             .route("/auth/google/callback", get(google_callback))
+            .route("/auth/google/device-callback", get(google_device_callback))
             .route("/auth/google/consent", post(google_consent))
             .route("/session", get(session))
             .route("/connections/revoke", post(revoke_connection))
@@ -605,6 +606,7 @@ impl IntoResponse for ProtocolError { fn into_response(self) -> axum::response::
 #[derive(Debug, Deserialize)] struct RegisterRequest { client_id: String, redirect_uri: String }
 #[derive(Debug, Deserialize)] struct AuthorizeQuery { client_id: String, redirect_uri: String, code_challenge: String, resource: String, state: String, #[serde(default)] nonce: Option<String> }
 #[derive(Debug, Deserialize)] struct GoogleCallbackQuery { #[serde(rename = "state", alias = "transaction")] transaction: String, code: String, #[serde(default)] consent: bool }
+#[derive(Debug, Deserialize)] struct GoogleDeviceCallbackQuery { state: String, code: String }
 #[derive(Debug, Deserialize)] struct TokenRequest { grant_type: String, code: Option<String>, device_code: Option<String>, refresh_token: Option<String>, client_id: String, redirect_uri: Option<String>, code_verifier: Option<String>, resource: String }
 #[derive(Debug, Deserialize)] struct DeviceRequest { client_id: String, resource: String }
 #[derive(Debug, Deserialize)] struct DeviceVerifyStartQuery { user_code: String }
@@ -657,7 +659,45 @@ async fn google_consent(State(g): State<Gateway>, Form(r): Form<ConsentRequest>)
 }
 async fn token(State(g): State<Gateway>, Form(r): Form<TokenRequest>) -> impl IntoResponse { let result = match r.grant_type.as_str() { "authorization_code" => r.code.map_or(Err(ProtocolError::InvalidRequest), |code| g.exchange_code(&code, &r.client_id, r.redirect_uri.as_deref().unwrap_or_default(), r.code_verifier.as_deref().unwrap_or_default(), &r.resource)), "urn:ietf:params:oauth:grant-type:device_code" => r.device_code.map_or(Err(ProtocolError::InvalidRequest), |device_code| g.poll_device_for_client(&device_code, &r.client_id, &r.resource)), "refresh_token" => { if r.client_id != g.config.native_client.client_id || r.resource != g.config.resource { Err(ProtocolError::InvalidGrant) } else { r.refresh_token.map_or(Err(ProtocolError::InvalidRequest), |token| g.refresh(&token)) } }, _ => Err(ProtocolError::InvalidRequest) }; match result { Ok(v)=>Json(v).into_response(), Err(e)=>e.into_response() } }
 async fn device(State(g): State<Gateway>, Form(r): Form<DeviceRequest>) -> impl IntoResponse { match g.device_authorize(&r.client_id,&r.resource) { Ok(v)=>Json(v).into_response(), Err(e)=>e.into_response() } }
-async fn begin_device_verify(State(g): State<Gateway>, Query(r): Query<DeviceVerifyStartQuery>) -> impl IntoResponse { match g.begin_device_verification(&r.user_code) { Ok((state, _nonce))=>Json(serde_json::json!({"state":state,"provider":"google","scopes":GOOGLE_SCOPES})).into_response(), Err(e)=>e.into_response() } }
+async fn begin_device_verify(State(g): State<Gateway>, Query(r): Query<DeviceVerifyStartQuery>) -> impl IntoResponse {
+    match g.begin_device_verification(&r.user_code) {
+        Ok((state, nonce)) => {
+            let mut url = reqwest::Url::parse("https://accounts.google.com/o/oauth2/v2/auth").expect("constant Google endpoint");
+            url.query_pairs_mut()
+                .append_pair("response_type", "code")
+                .append_pair("client_id", &g.config.google.client_id)
+                .append_pair("redirect_uri", &format!("{}/auth/google/device-callback", g.config.issuer))
+                .append_pair("scope", &GOOGLE_SCOPES.join(" "))
+                .append_pair("state", &state)
+                .append_pair("nonce", &nonce);
+            Redirect::temporary(url.as_str()).into_response()
+        }
+        Err(e) => e.into_response(),
+    }
+}
+async fn google_device_callback(State(g): State<Gateway>, Query(r): Query<GoogleDeviceCallbackQuery>) -> impl IntoResponse {
+    let Some(verifier) = g.verifier.as_ref() else { return ProtocolError::ServerError.into_response(); };
+    let user_code = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| {
+        state.devices.values().find(|grant| grant.verify_state.as_deref() == Some(r.state.as_str())).map(|grant| grant.user_code.clone()).ok_or(ProtocolError::InvalidGrant)
+    }) {
+        Ok(user_code) => user_code,
+        Err(error) => return error.into_response(),
+    };
+    let nonce = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| {
+        state.devices.values().find(|grant| grant.user_code == user_code).and_then(|grant| grant.verify_nonce.clone()).ok_or(ProtocolError::InvalidGrant)
+    }) {
+        Ok(nonce) => nonce,
+        Err(error) => return error.into_response(),
+    };
+    let claims = match verifier.exchange_and_verify(&r.code, &nonce) {
+        Ok(claims) => claims,
+        Err(_) => return ProtocolError::AccessDenied.into_response(),
+    };
+    match g.complete_device_verification(&user_code, &r.state, &claims, true) {
+        Ok(()) => (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], "Device authorization approved; you may close this window.").into_response(),
+        Err(error) => error.into_response(),
+    }
+}
 async fn verify_device(State(g): State<Gateway>, Json(r): Json<VerifyRequest>) -> impl IntoResponse {
     let Some(verifier) = g.verifier.as_ref() else { return ProtocolError::ServerError.into_response(); };
     let nonce = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| state.devices.values().find(|grant| grant.user_code == r.user_code).and_then(|grant| grant.verify_nonce.clone()).ok_or(ProtocolError::InvalidGrant)) { Ok(nonce) => nonce, Err(error) => return error.into_response() };
