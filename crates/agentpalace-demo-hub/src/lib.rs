@@ -655,7 +655,7 @@ async fn google_consent(State(g): State<Gateway>, Form(r): Form<ConsentRequest>)
         Err(error)=>error.into_response(),
     }
 }
-async fn token(State(g): State<Gateway>, Form(r): Form<TokenRequest>) -> impl IntoResponse { let result = match r.grant_type.as_str() { "authorization_code" => r.code.map_or(Err(ProtocolError::InvalidRequest), |code| g.exchange_code(&code, &r.client_id, r.redirect_uri.as_deref().unwrap_or_default(), r.code_verifier.as_deref().unwrap_or_default(), &r.resource)), "urn:ietf:params:oauth:grant-type:device_code" => r.device_code.map_or(Err(ProtocolError::InvalidRequest), |device_code| g.poll_device_for_client(&device_code, &r.client_id, &r.resource)), "refresh_token" => r.refresh_token.map_or(Err(ProtocolError::InvalidRequest), |token| g.refresh(&token)), _ => Err(ProtocolError::InvalidRequest) }; match result { Ok(v)=>Json(v).into_response(), Err(e)=>e.into_response() } }
+async fn token(State(g): State<Gateway>, Form(r): Form<TokenRequest>) -> impl IntoResponse { let result = match r.grant_type.as_str() { "authorization_code" => r.code.map_or(Err(ProtocolError::InvalidRequest), |code| g.exchange_code(&code, &r.client_id, r.redirect_uri.as_deref().unwrap_or_default(), r.code_verifier.as_deref().unwrap_or_default(), &r.resource)), "urn:ietf:params:oauth:grant-type:device_code" => r.device_code.map_or(Err(ProtocolError::InvalidRequest), |device_code| g.poll_device_for_client(&device_code, &r.client_id, &r.resource)), "refresh_token" => { if r.client_id != g.config.native_client.client_id || r.resource != g.config.resource { Err(ProtocolError::InvalidGrant) } else { r.refresh_token.map_or(Err(ProtocolError::InvalidRequest), |token| g.refresh(&token)) } }, _ => Err(ProtocolError::InvalidRequest) }; match result { Ok(v)=>Json(v).into_response(), Err(e)=>e.into_response() } }
 async fn device(State(g): State<Gateway>, Form(r): Form<DeviceRequest>) -> impl IntoResponse { match g.device_authorize(&r.client_id,&r.resource) { Ok(v)=>Json(v).into_response(), Err(e)=>e.into_response() } }
 async fn begin_device_verify(State(g): State<Gateway>, Query(r): Query<DeviceVerifyStartQuery>) -> impl IntoResponse { match g.begin_device_verification(&r.user_code) { Ok((state, _nonce))=>Json(serde_json::json!({"state":state,"provider":"google","scopes":GOOGLE_SCOPES})).into_response(), Err(e)=>e.into_response() } }
 async fn verify_device(State(g): State<Gateway>, Json(r): Json<VerifyRequest>) -> impl IntoResponse {
@@ -880,6 +880,19 @@ mod tests {
         assert!(gateway.authorize_rest(&rotated.access_token, "http://localhost:8080/api").is_err());
         gateway.revoke(&rotated.refresh_token).expect("revoke");
         assert_eq!(gateway.refresh(&rotated.refresh_token), Err(ProtocolError::InvalidGrant));
+    }
+
+    #[tokio::test]
+    async fn refresh_wire_binding_rejects_wrong_client_or_resource() {
+        let (gateway, identity) = gateway();
+        let code = gateway.authorize_code("agentpalace-native", "http://127.0.0.1:49152/callback", &pkce("v"), "http://localhost:8080/api", identity, true, "state", "state", "nonce", "nonce").expect("code");
+        let grant = gateway.exchange_code(&code, "agentpalace-native", "http://127.0.0.1:49152/callback", "v", "http://localhost:8080/api").expect("token");
+        let wrong_client = token(State(gateway.clone()), Form(TokenRequest { grant_type: "refresh_token".into(), code: None, device_code: None, refresh_token: Some(grant.refresh_token.clone()), client_id: "another-client".into(), redirect_uri: None, code_verifier: None, resource: "http://localhost:8080/api".into() })).into_response();
+        assert_eq!(wrong_client.status(), StatusCode::BAD_REQUEST);
+        let wrong_resource = token(State(gateway.clone()), Form(TokenRequest { grant_type: "refresh_token".into(), code: None, device_code: None, refresh_token: Some(grant.refresh_token.clone()), client_id: "agentpalace-native".into(), redirect_uri: None, code_verifier: None, resource: "http://localhost:8080/other".into() })).into_response();
+        assert_eq!(wrong_resource.status(), StatusCode::BAD_REQUEST);
+        let valid = token(State(gateway), Form(TokenRequest { grant_type: "refresh_token".into(), code: None, device_code: None, refresh_token: Some(grant.refresh_token), client_id: "agentpalace-native".into(), redirect_uri: None, code_verifier: None, resource: "http://localhost:8080/api".into() })).into_response();
+        assert_eq!(valid.status(), StatusCode::OK);
     }
 
     #[test]
