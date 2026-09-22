@@ -51,11 +51,13 @@ Both desktop and device-code login use this same gateway-to-Google web login;
 do not create a Google TV/device client.
 
 The proposed gateway uses server-side redirects, so browser JavaScript origins
-are not needed for this flow. The hosting binary injects a maintained OIDC
-verifier into the gateway; the callback exchanges Google's authorization code
-server-side and validates the returned signature, issuer,
-audience, expiry, verified-email flag, state, and nonce before any hub code is
-issued. If implementation changes that, update this guide to match before use.
+are not needed for this flow. The gateway's `GoogleOidcVerifierAdapter` (wired
+in by the hosting layer, which is not yet packaged) exchanges Google's
+authorization code server-side at the callback that received it and validates
+the returned ID token's RS256 signature against Google's published keys, plus
+its issuer, audience, expiry, verified-email flag, and nonce, after the hub has
+checked state; only then is a hub code issued. If implementation changes that,
+update this guide to match before use.
 
 ## 3. Supply the tester's local settings
 

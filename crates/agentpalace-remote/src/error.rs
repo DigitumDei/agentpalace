@@ -33,6 +33,18 @@ pub enum RemoteError {
         /// RFC 9728 metadata URL from the challenge, if present.
         resource_metadata: Option<String>,
     },
+    /// The local OAuth credential store failed. Distinct from "no credential" (which surfaces
+    /// as [`Self::AuthenticationRequired`]) so callers can tell a missing login from a broken,
+    /// locked, or corrupt secure store.
+    #[error("remote `{remote}` credential store {kind}: {message}")]
+    CredentialStore {
+        /// Name of the remote palace.
+        remote: String,
+        /// Failure classification.
+        kind: crate::TokenStoreErrorKind,
+        /// Safe description with no credential material.
+        message: String,
+    },
     /// The remote speaks an incompatible federation API version.
     #[error("remote `{remote}` speaks federation api v{theirs}, this client speaks v{ours}")]
     VersionSkew {
@@ -143,7 +155,7 @@ impl RemoteError {
     /// - it may have been applied but went unconfirmed, or
     /// - the remote returned a transient rejection ([`is_transient_http_status`]).
     ///
-    /// `Unauthorized`, `VersionSkew`, `CapabilityMissing`, `InvalidConfig`,
+    /// `Unauthorized`, `AuthenticationRequired`, `CredentialStore`, `VersionSkew`, `CapabilityMissing`, `InvalidConfig`,
     /// `InvalidResponse`, and ordinary (authoritative) `RemoteRejected` statuses
     /// are not retryable.
     pub fn is_retryable(&self) -> bool {

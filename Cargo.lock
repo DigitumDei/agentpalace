@@ -82,6 +82,8 @@ name = "agentpalace-demo-hub"
 version = "0.1.0"
 dependencies = [
  "agentpalace-core",
+ "agentpalace-remote",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "blake3",
@@ -5390,7 +5392,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
- "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

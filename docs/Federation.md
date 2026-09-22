@@ -51,8 +51,8 @@ it all locally for dev testing.
   array of human-readable strings and a machine-actionable `degradations` array
   whose entries carry `code` (`"remote_read_degraded"`), `remote`, `kind` (e.g.
   `search`, `kg_query`, `kg_timeline`, `kg_stats`), `error`, and a
-  `classification` (e.g. `unreachable`, `unauthorized`, `rejected`,
-  `unknown_outcome`). A write to a down remote (`write: remote`) is an explicit
+  `classification` (e.g. `unreachable`, `unauthorized`,
+  `authentication_required`, `credential_store`, `rejected`, `unknown_outcome`). A write to a down remote (`write: remote`) is an explicit
   error with **no silent local fallback**. The `write: both` target is the
   exception: the local write must succeed first, and a remote failure is reported
   as a `replication` field on the response without aborting the operation or
@@ -84,10 +84,29 @@ and advertised issuer to match, and rejects endpoint changes or non-HTTPS URLs. 
 only for an explicitly opted-in exact loopback demo origin; the native callback is loopback-only.
 PKCE uses S256 and callback state is mandatory. Credentials must be supplied by a secure
 `TokenStore` passed through the OAuth configuration; the included in-memory store is an explicit
-volatile/test choice. Store keys include resource, issuer, client ID, and optional account. If
-secure storage is unavailable or a save fails, login reports the persistence error but keeps the
-fresh grant only in the initiating process; a later process can use it only after storage succeeds.
+volatile/test choice. Store keys include resource, issuer, client ID, and optional account. The
+resource is the remote's configured URL exactly (only URL syntax normalization such as host case
+applies), so `/api` and `/api/` are distinct grants; the REST transport's slash-terminated base URL
+is never used as a credential key. Store operations report absence separately from failure, and
+failures are classified as unavailable, corrupt, or backend; they surface as
+`RemoteError::CredentialStore` (MCP classification `credential_store`), never as "not signed in". If
+a save fails, login reports the persistence error but keeps the fresh grant only in the initiating
+process; a later process can use it only after storage succeeds.
 No token is placed in ordinary config, MCP output, logs, command arguments, or URLs.
+
+When a read is rejected with `401`, the client attempts one bounded recovery and then retries the
+read once; a second `401` is reported without further recovery. Recovery trusts only context the
+process already validated: the challenge's `resource_metadata` if it passes full discovery,
+otherwise the metadata retained from an earlier discovery, otherwise the issuer of the grant in
+use. The persistent store is authoritative — a grant rotated by another process is adopted without
+refreshing, a grant removed by another process is forgotten, and a grant the server rejects before
+its local expiry is refreshed once. An authoritative refresh rejection (for example a reused or
+revoked refresh token) removes the grant; an unreachable issuer does not. A token within 30 seconds
+of expiry is refreshed before a request is sent. Mutations rejected with `401` are never replayed
+or used to trigger recovery. `RemoteClient::logout` revokes the grant where the issuer advertises
+RFC 7009 revocation and deletes the stored record; recovery already in flight when logout runs is
+abandoned, and background recovery never reloads a stored grant after logout until an explicit
+login or `load_stored_session`, so a slow reload cannot resurrect a signed-out session.
 
 ## Part 1 — Running a server (the hub)
 

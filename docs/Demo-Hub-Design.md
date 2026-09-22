@@ -1,9 +1,11 @@
 # Demo hub design
 
-Status: implementation in progress, 2026-09-21. The gateway protocol slice is
-implemented in `agentpalace-demo-hub`; durable deployment storage and the live
-Google JWKS adapter remain hosting-layer work. The demo has not shipped
-and AgentPalace is not ready for 1.0.
+Status: implementation in progress, 2026-09-22. The gateway protocol slice,
+including the Google ID-token verifier adapter, is implemented in
+`agentpalace-demo-hub` and exercised end to end against a mock provider. The
+hosting binary does not yet start a listener, grants are held in memory, and
+no live Google sign-in has been verified. The demo has not shipped and
+AgentPalace is not ready for 1.0.
 
 A tester supplies their own Google OAuth credentials and admin email, starts
 the Docker example, and connects a local palace. Public hosting, retention,
@@ -238,11 +240,14 @@ resource/permission ceiling. Never ask users to approve unsolicited codes.
 Reuse the same token storage, refresh, revocation, and retry rules for both
 flows. Tokens belong to the initiating Linux/WSL process, not the browser's
 Windows account. Device login does not imply a Linux credential store is
-available: retain the explicit secure-store/in-memory behavior below. The
+available: retain the explicit secure-store/in-memory behavior below.
 The CLI and background federation use the platform OS credential store; embedding
 applications may inject another secure backend. If that backend is unavailable,
-the operation reports the unavailable outcome. `allow_in_memory` remains an
-explicit volatile outcome and is never selected implicitly.
+the operation reports the unavailable outcome (distinct from a corrupt record,
+a backend failure, or no stored grant). `allow_in_memory` remains an explicit
+volatile outcome and is never selected implicitly. The implemented client
+retries only reads after recovery, once; a mutation rejected with 401 is
+reported and never replayed.
 
 ### Tokens, permissions, and retries
 

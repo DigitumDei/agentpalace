@@ -32,18 +32,25 @@ mod client;
 mod error;
 mod oauth;
 
-pub use client::RemoteClient;
-pub use error::{RemoteError, Result};
 pub use agentpalace_config::OAuthLoginMode;
-pub use oauth::{authorization_url, browser_callback_usable, browser_login, device_login, discover_metadata, new_pkce_pair, new_state,
-    refresh, revoke, select_login_mode, validate_callback_state, validate_metadata,
-    validate_oauth_url, well_known_url, AuthorizationServerMetadata, InMemoryTokenStore,
-    FileTokenStore, KeyringTokenStore, OAuthConfig, OAuthSession,
-    ProtectedResourceMetadata, SharedTokenStore, TokenStore, UnavailableTokenStore};
+pub use client::RemoteClient;
+pub use client::{LogoutOutcome, RevocationOutcome};
+pub use error::{RemoteError, Result};
+pub use oauth::{
+    AuthorizationServerMetadata, ClearOutcome, FileTokenStore, InMemoryTokenStore,
+    KeyringTokenStore, LoginInteraction, OAuthConfig, OAuthSession, ProtectedResourceMetadata,
+    SharedTokenStore, SystemLoginInteraction, TokenEndpointFailure, TokenStore, TokenStoreError,
+    TokenStoreErrorKind, UnavailableTokenStore, authorization_url, browser_callback_usable,
+    browser_login, device_login, discover_metadata, fetch_authorization_server_metadata,
+    new_pkce_pair, new_state, refresh, resource_key, revoke, select_login_mode,
+    validate_callback_state, validate_metadata, validate_oauth_url, well_known_url,
+};
 
 /// Construct the shared secure credential backend used by foreground and background clients.
 pub fn configured_token_store(allow_in_memory: bool) -> SharedTokenStore {
-    if allow_in_memory { return std::sync::Arc::new(InMemoryTokenStore::default()); }
+    if allow_in_memory {
+        return std::sync::Arc::new(InMemoryTokenStore::default());
+    }
     if cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux")) {
         std::sync::Arc::new(KeyringTokenStore::new("agentpalace/oauth"))
     } else {
@@ -142,7 +149,13 @@ impl RemoteEndpoint {
         config: OAuthConfig,
         timeout: std::time::Duration,
     ) -> Self {
-        Self { name: name.into(), base_url: base_url.into(), token: None, oauth: Some(config), timeout }
+        Self {
+            name: name.into(),
+            base_url: base_url.into(),
+            token: None,
+            oauth: Some(config),
+            timeout,
+        }
     }
 }
 
