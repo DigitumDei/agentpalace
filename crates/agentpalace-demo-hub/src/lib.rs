@@ -39,7 +39,6 @@ pub struct GoogleOidcConfig {
 /// checked its signature against Google's JWKS.  The gateway never accepts an
 /// access token in this position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GoogleIdClaims {
     /// OIDC issuer.
     pub iss: String,
@@ -55,6 +54,9 @@ pub struct GoogleIdClaims {
     pub exp: u64,
     /// OIDC nonce bound to the browser transaction.
     pub nonce: String,
+    /// Additional standard OIDC claims such as `iat`.
+    #[serde(flatten)]
+    pub additional: BTreeMap<String, serde_json::Value>,
 }
 
 /// Boundary for a maintained OIDC implementation (for example
@@ -611,7 +613,7 @@ impl IntoResponse for ProtocolError { fn into_response(self) -> axum::response::
 #[derive(Debug, Deserialize)] struct DeviceRequest { client_id: String, resource: String }
 #[derive(Debug, Deserialize)] struct DeviceVerifyStartQuery { user_code: String }
 #[derive(Debug, Deserialize)] struct VerifyRequest { user_code: String, state: String, code: String, consent: bool }
-#[derive(Debug, Deserialize)] struct RevokeRequest { token: String }
+#[derive(Debug, Deserialize)] struct RevokeRequest { token: String, #[serde(default)] csrf_token: Option<String> }
 #[derive(Debug, Deserialize)] struct ConsentRequest { transaction: String }
 async fn protected_metadata(State(g): State<Gateway>) -> Json<ProtectedResourceMetadata> { Json(g.config.protected_resource_metadata()) }
 async fn authorization_metadata(State(g): State<Gateway>) -> Json<AuthorizationMetadata> { Json(g.config.metadata()) }
@@ -632,7 +634,7 @@ async fn authorize(State(g): State<Gateway>, Query(r): Query<AuthorizeQuery>) ->
 async fn google_callback(State(g): State<Gateway>, Query(r): Query<GoogleCallbackQuery>) -> impl IntoResponse {
     let Some(verifier) = g.verifier.as_ref() else { return ProtocolError::ServerError.into_response(); };
     let (nonce, client_state, redirect_uri) = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| state.browser.get(&r.transaction).map(|t| (t.nonce.clone(), t.state.clone(), t.redirect_uri.clone())).ok_or(ProtocolError::InvalidGrant)) { Ok(values)=>values, Err(error)=>return error.into_response() };
-    let claims = match verifier.exchange_and_verify(&r.code, &nonce) { Ok(claims) => claims, Err(_) => return ProtocolError::AccessDenied.into_response() };
+    let claims = match verify_upstream(verifier.clone(), r.code, nonce).await { Ok(claims) => claims, Err(_) => return ProtocolError::AccessDenied.into_response() };
     if !r.consent {
         if let Ok(mut state) = g.state.lock() { state.pending_browser.insert(r.transaction.clone(), claims); }
         return (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], format!("<form method=post action=\"/auth/google/consent\"><input type=hidden name=\"transaction\" value=\"{}\"><button type=submit>Continue</button></form>", r.transaction)).into_response();
@@ -690,7 +692,7 @@ async fn google_device_callback(State(g): State<Gateway>, Query(r): Query<Google
         Ok(nonce) => nonce,
         Err(error) => return error.into_response(),
     };
-    let claims = match verifier.exchange_and_verify(&r.code, &nonce) {
+    let claims = match verify_upstream(verifier.clone(), r.code, nonce).await {
         Ok(claims) => claims,
         Err(_) => return ProtocolError::AccessDenied.into_response(),
     };
@@ -702,10 +704,14 @@ async fn google_device_callback(State(g): State<Gateway>, Query(r): Query<Google
 async fn verify_device(State(g): State<Gateway>, Json(r): Json<VerifyRequest>) -> impl IntoResponse {
     let Some(verifier) = g.verifier.as_ref() else { return ProtocolError::ServerError.into_response(); };
     let nonce = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| state.devices.values().find(|grant| grant.user_code == r.user_code).and_then(|grant| grant.verify_nonce.clone()).ok_or(ProtocolError::InvalidGrant)) { Ok(nonce) => nonce, Err(error) => return error.into_response() };
-    let claims = match verifier.exchange_and_verify(&r.code, &nonce) { Ok(claims) => claims, Err(_) => return ProtocolError::AccessDenied.into_response() };
+    let claims = match verify_upstream(verifier.clone(), r.code, nonce).await { Ok(claims) => claims, Err(_) => return ProtocolError::AccessDenied.into_response() };
     match g.complete_device_verification(&r.user_code,&r.state,&claims,r.consent) { Ok(())=>StatusCode::NO_CONTENT.into_response(), Err(e)=>e.into_response() }
 }
 async fn revoke(State(g): State<Gateway>, Form(r): Form<RevokeRequest>) -> impl IntoResponse { match g.revoke(&r.token) { Ok(())=>StatusCode::NO_CONTENT.into_response(), Err(e)=>e.into_response() } }
+
+async fn verify_upstream(verifier: Arc<dyn GoogleOidcVerifier>, code: String, nonce: String) -> Result<GoogleIdClaims, GoogleClaimError> {
+    tokio::task::spawn_blocking(move || verifier.exchange_and_verify(&code, &nonce)).await.map_err(|_| GoogleClaimError::Upstream)?
+}
 
 async fn session(State(g): State<Gateway>, headers: HeaderMap) -> impl IntoResponse {
     let Some(cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) else { return ProtocolError::AccessDenied.into_response() };
@@ -719,7 +725,7 @@ async fn session(State(g): State<Gateway>, headers: HeaderMap) -> impl IntoRespo
 async fn revoke_connection(State(g): State<Gateway>, headers: HeaderMap, Form(r): Form<RevokeRequest>) -> impl IntoResponse {
     let Some(cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) else { return ProtocolError::AccessDenied.into_response() };
     let Some(session_id) = cookie.split(';').find_map(|part| part.trim().strip_prefix("agentpalace_session=")) else { return ProtocolError::AccessDenied.into_response() };
-    let csrf = headers.get("x-csrf-token").and_then(|v| v.to_str().ok()).or_else(|| cookie.split(';').find_map(|part| part.trim().strip_prefix("agentpalace_csrf="))).unwrap_or_default();
+    let csrf = headers.get("x-csrf-token").and_then(|v| v.to_str().ok()).or_else(|| r.csrf_token.as_deref()).unwrap_or_default();
     match g.revoke_own_grant(session_id, csrf, &r.token) { Ok(())=>StatusCode::NO_CONTENT.into_response(), Err(e)=>e.into_response() }
 }
 
@@ -946,17 +952,27 @@ mod tests {
         let token = gateway.exchange_code(&code, "agentpalace-native", "http://127.0.0.1:49152/callback", "v", "http://localhost:8080/api").expect("token");
         assert!(gateway.authorize_rest(&token.access_token, "wrong-resource").is_err());
         assert_eq!(gateway.authorize_rest(&token.access_token, "http://localhost:8080/api").expect("hub token").owner.id.as_str(), "owner-1");
-        let mut claims = GoogleIdClaims { iss: "https://accounts.google.com".into(), aud: "google-client".into(), sub: "subject-1".into(), email: "person@example.com".into(), email_verified: true, exp: now() + 60, nonce: "nonce".into() };
+        let mut claims = GoogleIdClaims { iss: "https://accounts.google.com".into(), aud: "google-client".into(), sub: "subject-1".into(), email: "person@example.com".into(), email_verified: true, exp: now() + 60, nonce: "nonce".into(), additional: BTreeMap::new() };
         assert!(verify_google_claims(&config(GatewayMode::LoopbackDemo).google, &claims, "nonce").is_ok());
         claims.email_verified = false;
         assert_eq!(verify_google_claims(&config(GatewayMode::LoopbackDemo).google, &claims, "nonce"), Err(GoogleClaimError::EmailUnverified));
     }
 
     #[test]
+    fn google_claims_accept_standard_additional_fields() {
+        let claims: GoogleIdClaims = serde_json::from_value(serde_json::json!({
+            "iss": "https://accounts.google.com", "aud": "google-client", "sub": "subject-1",
+            "email": "person@example.com", "email_verified": true, "exp": now() + 60,
+            "iat": now(), "nonce": "nonce"
+        })).expect("standard OIDC claims");
+        assert!(claims.additional.contains_key("iat"));
+    }
+
+    #[test]
     fn browser_transaction_owns_state_and_nonce_until_callback() {
         let (gateway, _) = gateway();
         let transaction = gateway.begin_browser_authorization("agentpalace-native", "http://127.0.0.1:49152/callback", &pkce("verifier"), "http://localhost:8080/api", "client-state", "transaction-nonce").expect("transaction");
-        let claims = GoogleIdClaims { iss: "https://accounts.google.com".into(), aud: "google-client".into(), sub: "subject-1".into(), email: "person@example.com".into(), email_verified: true, exp: now() + 60, nonce: "transaction-nonce".into() };
+        let claims = GoogleIdClaims { iss: "https://accounts.google.com".into(), aud: "google-client".into(), sub: "subject-1".into(), email: "person@example.com".into(), email_verified: true, exp: now() + 60, nonce: "transaction-nonce".into(), additional: BTreeMap::new() };
         assert_eq!(gateway.complete_browser_authorization(&transaction, "wrong-state", &claims, true), Err(ProtocolError::InvalidRequest));
         assert_eq!(gateway.complete_browser_authorization(&transaction, "client-state", &claims, true), Err(ProtocolError::InvalidGrant));
     }

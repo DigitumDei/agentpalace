@@ -129,7 +129,7 @@ pub trait TokenStore: Send + Sync + std::fmt::Debug {
 
 /// Explicit volatile credential storage for offline/test use.
 #[derive(Debug, Default)]
-pub struct InMemoryTokenStore(Mutex<Option<OAuthSession>>);
+pub struct InMemoryTokenStore(Mutex<Vec<OAuthSession>>);
 
 /// A store used when the host has no configured OS credential backend. It makes the failure
 /// explicit instead of silently persisting tokens in a config file or process arguments.
@@ -165,7 +165,10 @@ impl TokenStore for KeyringTokenStore {
     }
     async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Result<(), String> {
         let entry = self.entry(resource, issuer, client_id, account)?;
-        tokio::task::spawn_blocking(move || match entry.delete_credential() { Ok(()) => Ok(()), Err(_) => Ok(()) }).await.map_err(|_| "secure credential operation failed".to_owned())?
+        tokio::task::spawn_blocking(move || match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err("platform secure credential could not be deleted".to_owned()),
+        }).await.map_err(|_| "secure credential operation failed".to_owned())?
     }
 }
 
@@ -203,18 +206,16 @@ impl TokenStore for UnavailableTokenStore {
 #[async_trait::async_trait]
 impl TokenStore for InMemoryTokenStore {
     async fn load(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Option<OAuthSession> {
-        let value = self.0.lock().await.clone()?;
-        (resource_key(&value.resource) == resource_key(resource) && value.issuer == issuer && value.client_id == client_id && value.account.as_deref() == account).then_some(value)
+        self.0.lock().await.iter().find(|value| resource_key(&value.resource) == resource_key(resource) && value.issuer == issuer && value.client_id == client_id && value.account.as_deref() == account).cloned()
     }
     async fn save(&self, session: OAuthSession) -> Result<(), String> {
-        *self.0.lock().await = Some(session);
+        let mut sessions = self.0.lock().await;
+        sessions.retain(|value| !(resource_key(&value.resource) == resource_key(&session.resource) && value.issuer == session.issuer && value.client_id == session.client_id && value.account == session.account));
+        sessions.push(session);
         Ok(())
     }
     async fn clear(&self, resource: &str, issuer: &str, client_id: &str, account: Option<&str>) -> Result<(), String> {
-        let mut guard = self.0.lock().await;
-        if guard.as_ref().is_some_and(|s| resource_key(&s.resource) == resource_key(resource) && s.issuer == issuer && s.client_id == client_id && s.account.as_deref() == account) {
-            *guard = None;
-        }
+        self.0.lock().await.retain(|s| !(resource_key(&s.resource) == resource_key(resource) && s.issuer == issuer && s.client_id == client_id && s.account.as_deref() == account));
         Ok(())
     }
 }
@@ -670,6 +671,17 @@ mod tests {
         assert!(store.load("https://resource", "https://issuer", "client", None).await.is_some());
         assert!(store.load("https://other", "https://issuer", "client", None).await.is_none());
         assert!(UnavailableTokenStore.save(session).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn volatile_store_retains_distinct_issuer_sessions() {
+        let store = InMemoryTokenStore::default();
+        let first = OAuthSession { access_token: "a".to_owned(), refresh_token: None, expires_at: None, resource: "https://resource".to_owned(), issuer: "https://issuer-a".to_owned(), client_id: "client".to_owned(), account: None };
+        let second = OAuthSession { access_token: "b".to_owned(), issuer: "https://issuer-b".to_owned(), ..first.clone() };
+        store.save(first).await.expect("first issuer");
+        store.save(second).await.expect("second issuer");
+        assert_eq!(store.load("https://resource", "https://issuer-a", "client", None).await.map(|s| s.access_token), Some("a".to_owned()));
+        assert_eq!(store.load("https://resource", "https://issuer-b", "client", None).await.map(|s| s.access_token), Some("b".to_owned()));
     }
 
     #[tokio::test]

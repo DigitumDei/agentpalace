@@ -26,7 +26,7 @@ use agentpalace_ingest::{
     prepare_project_batch_with_config, project_branch_source_prefix,
     project_canonical_source_prefix, project_root_relative, wing_kind_source_prefix,
 };
-use agentpalace_remote::{InMemoryTokenStore, KeyringTokenStore, OAuthConfig, RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, UnavailableTokenStore};
+use agentpalace_remote::{configured_token_store, OAuthConfig, RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
 use agentpalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
 use agentpalace_server::{TokenRegistry, build_router};
 use agentpalace_storage::{
@@ -2697,15 +2697,8 @@ fn cli_oauth_store(
     context: &CliContext,
     allow_in_memory: bool,
 ) -> Result<agentpalace_remote::SharedTokenStore, agentpalace_core::AgentPalaceError> {
-    if allow_in_memory {
-        return Ok(Arc::new(InMemoryTokenStore::default()));
-    }
     let _ = ConfigLoader::init_default(context.config_base_dir.as_deref())?;
-    if cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux")) {
-        Ok(Arc::new(KeyringTokenStore::new("agentpalace/oauth")))
-    } else {
-        Ok(Arc::new(UnavailableTokenStore))
-    }
+    Ok(configured_token_store(allow_in_memory))
 }
 
 /// Build the one CLI-owned endpoint shape used by every CLI `RemoteClient` path.

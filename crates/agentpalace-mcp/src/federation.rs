@@ -13,7 +13,7 @@ use agentpalace_federation::{
     NewTaskResultRequest, RemoteDrawerResult, TaskLeaseRequest, TransitionTaskRequest,
 };
 use agentpalace_remote::{
-    OAuthConfig, RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, RemoteRevisionedWrite,
+    configured_token_store, OAuthConfig, RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, RemoteRevisionedWrite,
 };
 use agentpalace_storage::UNSCOPED_WING;
 use serde_json::{Value, json};
@@ -50,7 +50,7 @@ impl FederationRouter {
                     allow_in_memory: oauth.allow_in_memory,
                     allow_loopback_demo: oauth.allow_loopback_demo,
                     login_mode: oauth.login_mode,
-                    token_store: None,
+                    token_store: Some(configured_token_store(oauth.allow_in_memory)),
                     login_timeout_seconds: oauth.login_timeout_seconds,
                 }),
                 timeout: remote.timeout,

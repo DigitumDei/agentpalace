@@ -41,6 +41,16 @@ pub use oauth::{authorization_url, browser_callback_usable, browser_login, devic
     FileTokenStore, KeyringTokenStore, OAuthConfig, OAuthSession,
     ProtectedResourceMetadata, SharedTokenStore, TokenStore, UnavailableTokenStore};
 
+/// Construct the shared secure credential backend used by foreground and background clients.
+pub fn configured_token_store(allow_in_memory: bool) -> SharedTokenStore {
+    if allow_in_memory { return std::sync::Arc::new(InMemoryTokenStore::default()); }
+    if cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux")) {
+        std::sync::Arc::new(KeyringTokenStore::new("agentpalace/oauth"))
+    } else {
+        std::sync::Arc::new(UnavailableTokenStore)
+    }
+}
+
 use agentpalace_federation::{
     AckMessageRequest, AddDrawerRequest, AddDrawerResponse, ChangesQuery, ChangesResponse,
     CheckDuplicateRequest, CheckDuplicateResponse, CoordinationArtifactDto,
