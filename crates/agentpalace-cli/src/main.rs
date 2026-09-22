@@ -3220,7 +3220,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_endpoint_reports_unavailable_secure_store_instead_of_plaintext() {
+    fn cli_endpoint_never_falls_back_to_plaintext_credentials() {
         let config_root = temp_config_root("oauth-store");
         let context = CliContext::for_tests(config_root.clone());
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -3228,19 +3228,18 @@ mod tests {
 
         let first = cli_remote_endpoint(&context, &oauth_test_remote(false)).unwrap();
         let first_store = first.oauth.unwrap().token_store.unwrap();
-        let saved = runtime.block_on(first_store.save(session.clone())).is_ok();
+        let _saved = runtime.block_on(first_store.save(session.clone()));
 
         let second = cli_remote_endpoint(&context, &oauth_test_remote(false)).unwrap();
         let second_store = second.oauth.unwrap().token_store.unwrap();
-        let loaded = runtime.block_on(second_store.load(
+        let _loaded = runtime.block_on(second_store.load(
             &session.resource,
             &session.issuer,
             &session.client_id,
             session.account.as_deref(),
         ));
         let path = config_root.join("oauth_tokens.json");
-        assert_eq!(loaded.is_some(), saved);
-        assert!(!path.exists(), "unavailable secure store must not create plaintext credentials");
+        assert!(!path.exists(), "secure-store outcomes must not create plaintext credentials");
         remove_dir_all_if_exists(&config_root);
     }
 

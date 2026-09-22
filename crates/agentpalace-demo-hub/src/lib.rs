@@ -102,7 +102,8 @@ impl GoogleOidcVerifier for GoogleOidcVerifierAdapter {
         validation.set_issuer(&[self.config.issuer.as_str()]);
         validation.set_audience(&[self.config.client_id.as_str()]);
         let data = decode::<GoogleIdClaims>(&token.id_token, &decoding_key, &validation).map_err(|_| GoogleClaimError::Signature)?;
-        verify_google_claims(&self.config, &data.claims, expected_nonce)
+        verify_google_claims(&self.config, &data.claims, expected_nonce)?;
+        Ok(data.claims)
     }
 }
 
@@ -621,14 +622,7 @@ async fn authorize(State(g): State<Gateway>, Query(r): Query<AuthorizeQuery>) ->
             url.query_pairs_mut().append_pair("response_type", "code").append_pair("client_id", &g.config.google.client_id)
                 .append_pair("redirect_uri", &format!("{}/auth/google/callback", g.config.issuer))
                 .append_pair("scope", &GOOGLE_SCOPES.join(" ")).append_pair("state", &transaction).append_pair("nonce", &nonce);
-            let owner = match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| state.codes.get(&code).map(|grant| grant.owner.clone()).ok_or(ProtocolError::InvalidGrant)) { Ok(owner)=>owner, Err(error)=>return error.into_response() };
-            let session_id = secret("session", &client_state, &code);
-            let csrf = secret("csrf", &session_id, &client_state);
-            if let Err(error) = g.create_session(&session_id, owner, &csrf) { return error.into_response(); }
-            let mut response = Redirect::temporary(url.as_str()).into_response();
-            if let Ok(value) = format!("agentpalace_session={session_id}; HttpOnly; SameSite=Lax; Path=/").parse() { response.headers_mut().append(header::SET_COOKIE, value); }
-            if let Ok(value) = format!("agentpalace_csrf={csrf}; SameSite=Lax; Path=/").parse() { response.headers_mut().append(header::SET_COOKIE, value); }
-            response
+            Redirect::temporary(url.as_str()).into_response()
         }
         Err(e)=>e.into_response()
     }
