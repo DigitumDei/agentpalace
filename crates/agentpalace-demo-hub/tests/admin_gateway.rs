@@ -162,6 +162,11 @@ async fn admin_api_requires_recent_google_session_csrf_and_current_etag() {
     let stale = client.delete(&writer_url).header(header::COOKIE, &cookies)
         .header("x-csrf-token", &csrf).header(header::IF_MATCH, &etag).send().await.expect("integration test setup");
     assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+    let no_csrf_put = client.put(&writer_url).header(header::COOKIE, &cookies)
+        .header(header::IF_MATCH, &new_etag)
+        .json(&AccessEntry { role: AccessRole::Readonly, enabled: true, mailbox_proven: false })
+        .send().await.expect("integration test setup");
+    assert_eq!(no_csrf_put.status(), StatusCode::FORBIDDEN);
     let no_csrf = client.delete(&writer_url).header(header::COOKIE, &cookies)
         .header(header::IF_MATCH, &new_etag).send().await.expect("integration test setup");
     assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
@@ -320,6 +325,11 @@ async fn public_gateway_forwarding_is_closed_authenticated_and_owner_scoped() {
     ).expect("integration test setup");
     let token = gateway.exchange_code(&code, "agentpalace-native", "http://127.0.0.1:43127/callback", verifier, &resource).expect("integration test setup").access_token;
     let writer_token = issue_token(&gateway, "writer@gmail.com", "writer-subject", &resource);
+    let admin = access.resolve(&verified(EMAIL, "immutable-admin-subject"))
+        .expect("resolve bootstrap admin")
+        .expect("enabled bootstrap admin");
+    gateway.create_admin_session("hard-delete-admin-session", admin.admission, "valid-session-csrf")
+        .expect("create recent admin session");
     tokio::spawn(async move { axum::serve(listener, gateway.router()).await.expect("integration test setup"); });
     let client = reqwest::Client::builder().redirect(Policy::none()).build().expect("integration test setup");
 
@@ -342,6 +352,11 @@ async fn public_gateway_forwarding_is_closed_authenticated_and_owner_scoped() {
     assert_eq!(spoof_header.status(), StatusCode::BAD_REQUEST);
     let spoof_body = client.post(format!("{base}/v1/drawers")).bearer_auth(&writer_token).json(&json!({"owner_id":"victim"})).send().await.expect("integration test setup");
     assert_eq!(spoof_body.status(), StatusCode::BAD_REQUEST);
+    let no_csrf_hard_delete = client.delete(format!("{base}/v1/drawers/test-id"))
+        .header(header::COOKIE, "agentpalace_session=hard-delete-admin-session")
+        .send().await.expect("integration test setup");
+    assert_eq!(no_csrf_hard_delete.status(), StatusCode::FORBIDDEN);
+    assert_eq!(seen.lock().expect("integration test setup").len(), 1, "missing-CSRF hard delete never reaches the private engine");
     let readonly_mutation = client.post(format!("{base}/v1/drawers")).bearer_auth(&token).json(&json!({"text":"not written"})).send().await.expect("integration test setup");
     assert_eq!(readonly_mutation.status(), StatusCode::FORBIDDEN);
     assert_eq!(seen.lock().expect("integration test setup").len(), 1, "denied requests never reach the private engine");

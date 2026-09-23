@@ -406,6 +406,12 @@ flush it, call `fsync`, then atomically replace `access.json` and sync the paren
 directory before releasing the lock. Never edit `bindings.json` to change a
 role. Missing, unreadable, or malformed policy denies protected requests.
 Manual file edits are operator events and must not be attributed to Google.
+The complete policy file, including its full-snapshot audit chain, is capped at
+4 MiB, matching the fail-closed read limit. An edit whose serialized result
+would reach that limit is rejected before atomic replacement, preserving the
+last valid policy; operators should plan edits while there is room for another
+full before/after snapshot. Audit rotation is future work before this demo
+policy is used for long-lived production administration.
 
 Admin-only hard deletion remains the proposed demo default, not a confirmed
 user decision. It requires a recent admin browser session and CSRF token;

@@ -22,6 +22,8 @@ use thiserror::Error;
 
 use crate::{AdmissionIdentity, VerifiedIdentity};
 
+const MAX_POLICY_FILE_BYTES: usize = 4 * 1024 * 1024;
+
 /// A user's effective hub role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -655,10 +657,10 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, AccessPolicyError> {
     let mut bytes = Vec::new();
     File::open(path)
         .map_err(AccessPolicyError::Storage)?
-        .take(4 * 1024 * 1024)
+        .take(MAX_POLICY_FILE_BYTES as u64)
         .read_to_end(&mut bytes)
         .map_err(AccessPolicyError::Storage)?;
-    if bytes.len() >= 4 * 1024 * 1024 {
+    if bytes.len() >= MAX_POLICY_FILE_BYTES {
         return Err(AccessPolicyError::Invalid("policy file is too large".into()));
     }
     Ok(bytes)
@@ -747,6 +749,9 @@ fn write_json_atomic<T: Serialize + serde::de::DeserializeOwned>(
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(AccessPolicyError::Storage)?;
     let bytes = serde_json::to_vec_pretty(value).map_err(json_storage)?;
+    if bytes.len() >= MAX_POLICY_FILE_BYTES {
+        return Err(AccessPolicyError::Invalid("policy file exceeds the 4 MiB limit".into()));
+    }
     let mut file = tempfile::NamedTempFile::new_in(parent).map_err(AccessPolicyError::Storage)?;
     file.write_all(&bytes)
         .and_then(|_| file.as_file().sync_all())
@@ -967,6 +972,70 @@ mod tests {
             store.replace(initial.revision, "admin@gmail.com", users),
             Err(AccessPolicyError::RevisionConflict { .. })
         ));
+    }
+
+    #[test]
+    fn policy_write_over_limit_preserves_the_prior_readable_snapshot() {
+        let dir = TestDir::new();
+        let (policy_path, bindings_path, audit_path) = dir.paths();
+        let (policy, replacement_users) = (1_000usize..=30_000)
+            .step_by(500)
+            .find_map(|count| {
+                let mut users = BTreeMap::new();
+                users.insert("admin@gmail.com".into(), entry(AccessRole::Admin, true));
+                for index in 0..count {
+                    users.insert(
+                        format!("tester{index:05}@example.org"),
+                        entry(AccessRole::Readonly, true),
+                    );
+                }
+                let users_value = serde_json::to_value(&users).expect("serialize initial users");
+                let policy = PolicyFile {
+                    format: 1,
+                    revision: 1,
+                    users: users.clone(),
+                    audit: vec![AuditEntry {
+                        actor: "bootstrap".into(),
+                        occurred_at: timestamp(),
+                        action: "bootstrap_admin_created".into(),
+                        before: serde_json::Value::Null,
+                        after: users_value.clone(),
+                    }],
+                };
+                let current_bytes =
+                    serde_json::to_vec_pretty(&policy).expect("serialize initial policy");
+                let mut replacement_users = users.clone();
+                replacement_users
+                    .insert("new-reader@gmail.com".into(), entry(AccessRole::Readonly, true));
+                let mut candidate = policy.clone();
+                candidate.revision += 1;
+                candidate.users = replacement_users.clone();
+                candidate.audit.push(AuditEntry {
+                    actor: "admin@gmail.com".into(),
+                    occurred_at: timestamp(),
+                    action: "policy_replaced".into(),
+                    before: users_value,
+                    after: serde_json::to_value(&replacement_users)
+                        .expect("serialize replacement users"),
+                });
+                let candidate_bytes =
+                    serde_json::to_vec_pretty(&candidate).expect("serialize candidate policy");
+                (current_bytes.len() < MAX_POLICY_FILE_BYTES
+                    && candidate_bytes.len() >= MAX_POLICY_FILE_BYTES)
+                    .then_some((policy, replacement_users))
+            })
+            .expect("find a valid near-limit policy");
+
+        let prior_bytes = serde_json::to_vec_pretty(&policy).expect("serialize prior policy");
+        fs::write(&policy_path, &prior_bytes).expect("write near-limit policy");
+        let store = AccessPolicyStore::open(policy_path.clone(), bindings_path, audit_path, None)
+            .expect("open near-limit policy");
+        assert!(matches!(
+            store.replace(1, "admin@gmail.com", replacement_users),
+            Err(AccessPolicyError::Invalid(message)) if message.contains("4 MiB")
+        ));
+        assert_eq!(fs::read(&policy_path).expect("read prior policy"), prior_bytes);
+        assert_eq!(store.snapshot().expect("prior policy remains readable").revision, 1);
     }
 
     #[test]

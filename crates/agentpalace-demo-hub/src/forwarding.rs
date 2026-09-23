@@ -149,6 +149,9 @@ impl Forwarder {
         if owner.owner_id.trim().is_empty() || owner.upstream_token.trim().is_empty() {
             return Err(ForwardError::InvalidOwner);
         }
+        if !request.path_and_query.starts_with('/') || request.path_and_query.starts_with("//") {
+            return Err(ForwardError::UnsupportedRoute);
+        }
         let operation = route_operation(&request.method, &request.path_and_query)
             .ok_or(ForwardError::UnsupportedRoute)?;
         if !owner.role.permits(operation) {
@@ -159,8 +162,11 @@ impl Forwarder {
 
         let url = self
             .origin
-            .join(request.path_and_query.trim_start_matches('/'))
+            .join(&request.path_and_query)
             .map_err(|_| ForwardError::UnsupportedRoute)?;
+        if !same_origin(&self.origin, &url) {
+            return Err(ForwardError::UnsupportedRoute);
+        }
         let mut upstream =
             self.client.request(request.method, url).bearer_auth(&owner.upstream_token);
         // Preserve only representation negotiation and idempotency/receipt
@@ -317,6 +323,12 @@ fn route_operation(method: &Method, path_query: &str) -> Option<Operation> {
         return Some(Operation::Delete);
     }
     None
+}
+
+fn same_origin(configured: &reqwest::Url, target: &reqwest::Url) -> bool {
+    configured.scheme() == target.scheme()
+        && configured.host_str() == target.host_str()
+        && configured.port_or_known_default() == target.port_or_known_default()
 }
 
 fn is_private_origin(url: &reqwest::Url) -> bool {
@@ -595,6 +607,58 @@ mod tests {
                 .map(|op| matches!(op, Operation::CoordinationWrite)),
             Some(true)
         );
+    }
+    #[tokio::test]
+    async fn malformed_absolute_style_route_cannot_redirect_owner_token() {
+        use axum::{Router, extract::State, routing::any};
+        use std::sync::{Arc, Mutex};
+        type Captured = Arc<Mutex<Vec<String>>>;
+        async fn capture(State(rows): State<Captured>, headers: HeaderMap) -> StatusCode {
+            let auth = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            rows.lock().expect("capture lock available").push(auth);
+            StatusCode::OK
+        }
+
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().fallback(any(capture)).with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind configured-origin test server");
+        let address = listener.local_addr().expect("read configured-origin address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve configured-origin test server");
+        });
+        let forwarder =
+            Forwarder::new(&format!("http://{address}")).expect("configure private origin");
+        let owner = AuthorizedOwner {
+            owner_id: "owner-test".into(),
+            upstream_token: "must-not-leak".into(),
+            role: DemoRole::Readonly,
+        };
+        let attack_path = "https:/v1/drawers/y";
+        assert!(route_operation(&Method::GET, attack_path).is_some());
+        let attacker_url =
+            reqwest::Url::parse("https://v1/drawers/y").expect("parse transformed attacker origin");
+        assert!(!same_origin(&forwarder.origin, &attacker_url));
+
+        let result = forwarder
+            .forward(
+                &owner,
+                ForwardRequest {
+                    method: Method::GET,
+                    path_and_query: attack_path.into(),
+                    headers: HeaderMap::new(),
+                    body: Vec::new(),
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(ForwardError::UnsupportedRoute)));
+        assert!(captured.lock().expect("capture lock available").is_empty());
+        server.abort();
     }
     #[tokio::test]
     async fn forwards_private_owner_credentials_and_preserves_ingest_and_coordination_retry_fields()

@@ -1746,10 +1746,15 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
             .find_map(|part| part.trim().strip_prefix(&format!("{name}=")).map(str::to_owned))
     })
 }
+enum AdminCsrf {
+    Required(Option<String>),
+    ReadOnly,
+}
+
 fn admin_actor(
     g: &Gateway,
     headers: &HeaderMap,
-    csrf: Option<&str>,
+    csrf: AdminCsrf,
 ) -> Result<(String, AdmissionIdentity, String), ProtocolError> {
     let session_id = cookie_value(headers, "agentpalace_session").ok_or(ProtocolError::AccessDenied)?;
     let owner = g.require_recent_auth(&session_id, Duration::from_secs(300))?;
@@ -1760,8 +1765,10 @@ fn admin_actor(
     let session_csrf = g.state.lock().map_err(|_| ProtocolError::ServerError)?
         .sessions.get(&session_id).map(|session| session.csrf.clone())
         .ok_or(ProtocolError::AccessDenied)?;
-    if csrf.is_some_and(|value| value != session_csrf) {
-        return Err(ProtocolError::InvalidRequest);
+    match csrf {
+        AdminCsrf::Required(Some(value)) if value == session_csrf => {}
+        AdminCsrf::Required(_) => return Err(ProtocolError::InvalidRequest),
+        AdminCsrf::ReadOnly => {}
     }
     Ok((session_id, owner, session_csrf))
 }
@@ -1807,9 +1814,8 @@ async fn forward_rest(State(g): State<Gateway>, request: Request) -> Response {
     let mut headers = request.headers().clone();
     let (owner, role) = if method == axum::http::Method::DELETE {
         if g.hard_delete_policy == HardDeletePolicy::Disabled { return StatusCode::FORBIDDEN.into_response(); }
-        let csrf = headers.get("x-csrf-token").and_then(|value| value.to_str().ok());
-        if csrf.is_none() { return StatusCode::FORBIDDEN.into_response(); }
-        match admin_actor(&g, &headers, csrf) {
+        let csrf = headers.get("x-csrf-token").and_then(|value| value.to_str().ok()).map(str::to_owned);
+        match admin_actor(&g, &headers, AdminCsrf::Required(csrf)) {
             Ok((_, owner, _)) => (owner, DemoRole::Admin),
             Err(error) => return response_for_admin_error(error),
         }
@@ -1871,7 +1877,7 @@ async fn forward_rest(State(g): State<Gateway>, request: Request) -> Response {
 }
 
 async fn get_access(State(g): State<Gateway>, headers: HeaderMap) -> Response {
-    let (_, owner, csrf) = match admin_actor(&g, &headers, None) {
+    let (_, owner, csrf) = match admin_actor(&g, &headers, AdminCsrf::ReadOnly) {
         Ok(value) => value,
         Err(error) => return response_for_admin_error(error),
     };
@@ -1894,10 +1900,9 @@ async fn get_access(State(g): State<Gateway>, headers: HeaderMap) -> Response {
 }
 
 async fn put_access(State(g): State<Gateway>, Path(email): Path<String>, headers: HeaderMap, Json(entry): Json<AccessEntry>) -> Response {
-    let csrf = headers.get("x-csrf-token").and_then(|value| value.to_str().ok());
-    let (_, owner, _) = match admin_actor(&g, &headers, csrf) {
-        Ok(value) if csrf.is_some() => value,
-        Ok(_) => return StatusCode::FORBIDDEN.into_response(),
+    let csrf = headers.get("x-csrf-token").and_then(|value| value.to_str().ok()).map(str::to_owned);
+    let (_, owner, _) = match admin_actor(&g, &headers, AdminCsrf::Required(csrf)) {
+        Ok(value) => value,
         Err(error) => return response_for_admin_error(error),
     };
     let revision = match if_match_revision(&headers) { Ok(value) => value, Err(response) => return response };
@@ -1920,10 +1925,9 @@ async fn put_access(State(g): State<Gateway>, Path(email): Path<String>, headers
 }
 
 async fn delete_access(State(g): State<Gateway>, Path(email): Path<String>, headers: HeaderMap) -> Response {
-    let csrf = headers.get("x-csrf-token").and_then(|value| value.to_str().ok());
-    let (_, owner, _) = match admin_actor(&g, &headers, csrf) {
-        Ok(value) if csrf.is_some() => value,
-        Ok(_) => return StatusCode::FORBIDDEN.into_response(),
+    let csrf = headers.get("x-csrf-token").and_then(|value| value.to_str().ok()).map(str::to_owned);
+    let (_, owner, _) = match admin_actor(&g, &headers, AdminCsrf::Required(csrf)) {
+        Ok(value) => value,
         Err(error) => return response_for_admin_error(error),
     };
     let revision = match if_match_revision(&headers) { Ok(value) => value, Err(response) => return response };
