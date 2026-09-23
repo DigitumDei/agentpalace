@@ -646,11 +646,10 @@ async fn device_verify(
     let (code, _) = idp.authorize(&google, account);
     let callback =
         browser.get(&format!("{hub}/auth/google/device-callback?state={state}&code={code}")).await;
-    assert_eq!(
-        callback.status(),
-        StatusCode::OK,
-        "a verified sign-in shows the device consent page"
-    );
+    if callback.status() != StatusCode::OK {
+        // The hub refused the upstream assertion before showing consent.
+        return callback.status();
+    }
     let page = callback.text().await.expect("device consent page");
     let consent = if decision == Decision::Approve { "true" } else { "false" };
     browser
@@ -743,6 +742,16 @@ impl LoginInteraction for ScriptedUser {
     fn show_device_code(&self, verification_uri: &str, user_code: &str) {
         let _ = self.device_prompts.send((verification_uri.to_owned(), user_code.to_owned()));
     }
+}
+
+/// Wait for the client's device prompt, failing fast if device authorization never started.
+async fn next_prompt(
+    prompts: &mut tokio::sync::mpsc::UnboundedReceiver<(String, String)>,
+) -> (String, String) {
+    tokio::time::timeout(Duration::from_secs(15), prompts.recv())
+        .await
+        .expect("the client never showed a device prompt")
+        .expect("device prompt channel")
 }
 
 fn client_for(
@@ -862,7 +871,7 @@ async fn browser_and_device_verification_exchange_upstream_codes_at_distinct_red
             client.login_from_challenge_with_mode(&metadata, Some(OAuthLoginMode::Device)).await
         })
     };
-    let (verification_uri, _) = prompts.recv().await.expect("device prompt");
+    let (verification_uri, _) = next_prompt(&mut prompts).await;
     let phone = Browser::new();
     assert_eq!(
         device_verify(
@@ -1068,7 +1077,7 @@ async fn device_login_polls_while_pending_then_completes_after_browser_approval(
             client.login_from_challenge_with_mode(&metadata, Some(OAuthLoginMode::Device)).await
         })
     };
-    let (verification_uri, user_code) = prompts.recv().await.expect("device prompt");
+    let (verification_uri, user_code) = next_prompt(&mut prompts).await;
     assert_eq!(query(&verification_uri, "user_code").as_deref(), Some(user_code.as_str()));
     assert!(user_code.len() == 9 && user_code.as_bytes()[4] == b'-', "{user_code}");
 
@@ -1108,6 +1117,10 @@ async fn device_refusals_end_polling_with_a_denial() {
         (Account::owner(), Decision::Deny),
         (Account::owner(), Decision::UpstreamDenied),
         (Account::named("stranger"), Decision::Approve),
+        // ID tokens that fail verification at the device callback end the grant, too.
+        (Account::owner().signed(Signing::UnpublishedKey), Decision::Approve),
+        (Account::owner().claim("email_verified", serde_json::json!(false)), Decision::Approve),
+        (Account::owner().claim("nonce", serde_json::json!("replayed-nonce")), Decision::Approve),
     ] {
         let store: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::default());
         let (user, mut prompts) = ScriptedUser::new(&idp, &hub, account.clone(), decision);
@@ -1120,7 +1133,7 @@ async fn device_refusals_end_polling_with_a_denial() {
                 client.login_from_challenge_with_mode(&metadata, Some(OAuthLoginMode::Device)).await
             })
         };
-        let (verification_uri, _) = prompts.recv().await.expect("device prompt");
+        let (verification_uri, _) = next_prompt(&mut prompts).await;
         let final_status = device_verify(
             &Browser::new(),
             &idp,
@@ -1140,6 +1153,62 @@ async fn device_refusals_end_polling_with_a_denial() {
         assert!(error.to_string().contains("denied"), "{decision:?}/{}: {error}", account.sub);
         assert!(stored(store.as_ref(), &hub.resource, &hub.base).await.is_none());
     }
+}
+
+#[tokio::test]
+async fn json_device_verification_denies_on_rejected_tokens_but_retries_upstream_outages() {
+    let idp = Idp::start().await;
+    let hub = Hub::start(&idp, "/api", FAST_DEVICE).await;
+    let grant = hub.raw_device_grant().await;
+    let device_code = grant["device_code"].as_str().expect("device code");
+    let user_code = grant["user_code"].as_str().expect("user code");
+    let browser = Browser::new();
+    let google = location(&browser.get(grant["verification_uri"].as_str().expect("URI")).await);
+    let state = query(&google, "state").expect("device verification state");
+    // A verified sign-in yields the page carrying the CSRF value the JSON path also requires.
+    let (code, _) = idp.authorize(&google, Account::owner());
+    let page = browser
+        .get(&hub.url(&format!("/auth/google/device-callback?state={state}&code={code}")))
+        .await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let csrf = form_value(&page.text().await.expect("device consent page"), "csrf_token");
+    let verify = |code: String| {
+        let (browser, hub, state, csrf, user_code) =
+            (Arc::clone(&browser), hub.clone(), state.clone(), csrf.clone(), user_code.to_owned());
+        async move {
+            let cookie = format!(
+                "agentpalace_device_browser={}",
+                browser.cookie("agentpalace_device_browser").expect("binding cookie")
+            );
+            let response = reqwest::Client::new()
+                .post(hub.url("/device/verify"))
+                .header(header::COOKIE, cookie)
+                .json(&serde_json::json!({"user_code": user_code, "state": state, "code": code, "consent": true, "csrf_token": csrf}))
+                .send()
+                .await
+                .expect("JSON device verification");
+            oauth_error(response).await
+        }
+    };
+
+    // An upstream outage is retryable and leaves the grant pending.
+    idp.state().token_down = true;
+    let (retry_code, _) = idp.authorize(&google, Account::owner());
+    assert_eq!(
+        verify(retry_code).await,
+        (StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable".to_owned())
+    );
+    assert_eq!(hub.raw_device_poll(device_code).await.1, "authorization_pending");
+    idp.state().token_down = false;
+
+    // A token that fails verification ends the grant: the polling client is told immediately.
+    let (bad_code, _) = idp.authorize(&google, Account::owner().signed(Signing::UnpublishedKey));
+    assert_eq!(verify(bad_code).await, (StatusCode::BAD_REQUEST, "access_denied".to_owned()));
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert_eq!(
+        hub.raw_device_poll(device_code).await,
+        (StatusCode::BAD_REQUEST, "access_denied".to_owned())
+    );
 }
 
 #[tokio::test]
@@ -1275,7 +1344,7 @@ async fn device_expiry_and_client_cancellation_store_no_credential() {
             .await
             .expect_err("unapproved device login");
         assert!(error.to_string().contains("expired"), "{error}");
-        let (verification_uri, _) = prompts.recv().await.expect("device prompt");
+        let (verification_uri, _) = next_prompt(&mut prompts).await;
         if hub.base == long_hub.base {
             // Approval after the client stopped polling cannot deliver a credential to it.
             assert_eq!(
@@ -1625,18 +1694,25 @@ async fn upstream_exchange_and_network_failures_fail_closed() {
 #[tokio::test]
 async fn browser_binding_cookies_are_secure_outside_loopback_demo_mode() {
     let idp = Idp::start().await;
-    for (mode, issuer, secure) in [(GatewayMode::Secure, "https://hub.example", true), (GatewayMode::LoopbackDemo, "http://127.0.0.1:8080", false)] {
+    for (mode, issuer, secure) in [
+        (GatewayMode::Secure, "https://hub.example", true),
+        (GatewayMode::LoopbackDemo, "http://127.0.0.1:8080", false),
+    ] {
         let config = GatewayConfig {
             issuer: issuer.to_owned(),
             resource: format!("{issuer}/api"),
             mode,
             google: idp.google(),
-            native_client: NativeClient { client_id: NATIVE_CLIENT_ID.to_owned(), redirect_uri: "http://127.0.0.1:49152/callback".to_owned() },
+            native_client: NativeClient {
+                client_id: NATIVE_CLIENT_ID.to_owned(),
+                redirect_uri: "http://127.0.0.1:49152/callback".to_owned(),
+            },
         };
         let gateway = Gateway::new(config, Arc::new(AllowSubjects)).expect("gateway configuration");
         let (listener, base) = bind().await;
         serve(listener, gateway.router());
-        let mut authorize = reqwest::Url::parse(&format!("{base}/authorize")).expect("authorize URL");
+        let mut authorize =
+            reqwest::Url::parse(&format!("{base}/authorize")).expect("authorize URL");
         authorize
             .query_pairs_mut()
             .append_pair("client_id", NATIVE_CLIENT_ID)
@@ -1645,8 +1721,16 @@ async fn browser_binding_cookies_are_secure_outside_loopback_demo_mode() {
             .append_pair("state", "state")
             .append_pair("resource", &format!("{issuer}/api"));
         let response = Browser::new().get(authorize.as_str()).await;
-        let cookie = response.headers().get(header::SET_COOKIE).and_then(|value| value.to_str().ok()).expect("binding cookie").to_owned();
-        assert!(cookie.starts_with("agentpalace_browser=") && cookie.contains("HttpOnly"), "{cookie}");
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("binding cookie")
+            .to_owned();
+        assert!(
+            cookie.starts_with("agentpalace_browser=") && cookie.contains("HttpOnly"),
+            "{cookie}"
+        );
         assert_eq!(cookie.contains("; Secure"), secure, "{mode:?}: {cookie}");
     }
 }

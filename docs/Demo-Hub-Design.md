@@ -245,9 +245,10 @@ The CLI and background federation use the platform OS credential store; embeddin
 applications may inject another secure backend. If that backend is unavailable,
 the operation reports the unavailable outcome (distinct from a corrupt record,
 a backend failure, or no stored grant). `allow_in_memory` remains an explicit
-volatile outcome and is never selected implicitly. The implemented client
-retries only reads after recovery, once; a mutation rejected with 401 is
-reported and never replayed.
+volatile outcome and is never selected implicitly. After recovering from a
+definite 401, the implemented client re-sends the identical request once —
+reads and mutations alike, a mutation keeping its operation ID and body — and
+never replays a mutation whose outcome is unknown.
 
 ### Tokens, permissions, and retries
 

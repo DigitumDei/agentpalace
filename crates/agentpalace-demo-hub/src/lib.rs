@@ -760,10 +760,17 @@ impl Gateway {
         }
         let device_code = secret("device", client_id, resource);
         let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+        // Only grants still awaiting a decision count toward the per-client cap; denied or
+        // approved grants must not lock other users out of device login until they expire.
         if state
             .devices
             .values()
-            .filter(|grant| grant.client_id == client_id && grant.expires >= now())
+            .filter(|grant| {
+                grant.client_id == client_id
+                    && grant.expires >= now()
+                    && !grant.denied
+                    && grant.owner.is_none()
+            })
             .count()
             >= 5
         {
@@ -892,9 +899,30 @@ impl Gateway {
         if returned_state != expected_state {
             return Err(ProtocolError::InvalidRequest);
         }
-        let identity = verify_google_claims(&self.config.google, claims, &expected_nonce)
-            .map_err(|_| ProtocolError::AccessDenied)?;
+        let identity = match verify_google_claims(&self.config.google, claims, &expected_nonce) {
+            Ok(identity) => identity,
+            Err(error) => return Err(self.fail_device_verification(user_code, error)),
+        };
         self.verify_device(user_code, identity, consent)
+    }
+
+    /// Classify an upstream verification failure for a device grant. A terminal failure (bad
+    /// signature, issuer, audience, expiry, nonce, unverified email, missing subject) denies the
+    /// grant so the polling client's next poll returns `access_denied` instead of
+    /// `authorization_pending` until expiry. An unreachable or failed upstream exchange
+    /// (`GoogleClaimError::Upstream`) leaves the grant pending and is reported as retryable.
+    pub fn fail_device_verification(
+        &self,
+        user_code: &str,
+        error: GoogleClaimError,
+    ) -> ProtocolError {
+        if error == GoogleClaimError::Upstream {
+            return ProtocolError::TemporarilyUnavailable;
+        }
+        match self.deny_device(user_code) {
+            Ok(()) => ProtocolError::AccessDenied,
+            Err(error) => error,
+        }
     }
 
     /// Deny a pending device grant from the browser verification surface.
@@ -1242,6 +1270,9 @@ pub enum ProtocolError {
     ExpiredToken,
     /// `server_error`: internal failure.
     ServerError,
+    /// `temporarily_unavailable`: the upstream identity provider could not be reached or did
+    /// not complete the exchange; retrying may succeed. Answered with HTTP 503.
+    TemporarilyUnavailable,
 }
 impl ProtocolError {
     fn code(self) -> &'static str {
@@ -1253,12 +1284,17 @@ impl ProtocolError {
             Self::SlowDown => "slow_down",
             Self::ExpiredToken => "expired_token",
             Self::ServerError => "server_error",
+            Self::TemporarilyUnavailable => "temporarily_unavailable",
         }
     }
 }
 impl IntoResponse for ProtocolError {
     fn into_response(self) -> axum::response::Response {
-        (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": self.code()}))).into_response()
+        let status = match self {
+            Self::TemporarilyUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        (status, Json(serde_json::json!({"error": self.code()}))).into_response()
     }
 }
 #[derive(Debug, Deserialize)]
@@ -1446,6 +1482,9 @@ async fn google_callback(
     .await
     {
         Ok(claims) => claims,
+        Err(GoogleClaimError::Upstream) => {
+            return end_browser_transaction(&g, &r.transaction, "temporarily_unavailable");
+        }
         Err(_) => return end_browser_transaction(&g, &r.transaction, "access_denied"),
     };
     if let Ok(mut state) = g.state.lock() {
@@ -1723,7 +1762,7 @@ async fn google_device_callback(
     .await
     {
         Ok(claims) => claims,
-        Err(_) => return ProtocolError::AccessDenied.into_response(),
+        Err(error) => return g.fail_device_verification(&user_code, error).into_response(),
     };
     if let Ok(mut state) = g.state.lock() {
         state.pending_device.insert(r.state.clone(), claims);
@@ -1847,7 +1886,7 @@ async fn verify_device(
     .await
     {
         Ok(claims) => claims,
-        Err(_) => return ProtocolError::AccessDenied.into_response(),
+        Err(error) => return g.fail_device_verification(&r.user_code, error).into_response(),
     };
     match g.complete_device_verification(&r.user_code, &r.state, &claims, r.consent) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -2515,6 +2554,27 @@ mod tests {
         gateway.revoke_own_grant("s", "csrf", &token.access_token).expect("owner revoke");
         assert!(gateway.authorize_rest(&token.access_token, "http://localhost:8080/api").is_err());
         assert!(gateway.refresh(&token.refresh_token).is_err());
+    }
+
+    #[test]
+    fn decided_device_grants_do_not_consume_the_pending_cap() {
+        let (gateway, _) = gateway();
+        let pending: Vec<_> = (0..5)
+            .map(|_| {
+                gateway
+                    .device_authorize("agentpalace-native", "http://localhost:8080/api")
+                    .expect("device")
+            })
+            .collect();
+        assert!(matches!(
+            gateway.device_authorize("agentpalace-native", "http://localhost:8080/api"),
+            Err(ProtocolError::SlowDown)
+        ));
+        gateway.deny_device(&pending[0].user_code).expect("deny");
+        assert!(
+            gateway.device_authorize("agentpalace-native", "http://localhost:8080/api").is_ok()
+        );
+        assert_eq!(gateway.poll_device(&pending[0].device_code), Err(ProtocolError::AccessDenied));
     }
 
     #[test]

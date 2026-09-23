@@ -49,7 +49,8 @@ atomically before deployment:
 
 * authorization codes bound to client, redirect, S256 challenge, owner,
   resource, and consent, then consumed once and expired quickly;
-* RFC 8628 device grants that are expiring, rate-limited, client-bound, and
+* RFC 8628 device grants that are expiring, client-bound, rate-limited to five
+  undecided grants per client (denied or approved grants do not count), and
   return `authorization_pending`, `slow_down` (adding five seconds to the
   interval), `access_denied`, and `expired_token`. The user code is drawn
   independently of the private device code from an unambiguous consonant
@@ -80,10 +81,17 @@ resource.
 Refusals always reach the waiting native client. In the browser flow, an
 upstream cancellation, an ID token that fails verification, a declined consent,
 or an identity the admission policy refuses ends the transaction and redirects
-to the client's loopback callback with `error=access_denied` (any other
-upstream error becomes `server_error`). In the device flow, a declined consent,
-an upstream cancellation, or a refused identity marks the grant denied, so the
-next poll returns `access_denied` instead of waiting for expiry.
+to the client's loopback callback with `error=access_denied`. If Google cannot
+be reached or does not complete the code exchange, the redirect carries
+`error=temporarily_unavailable` instead (any other upstream error becomes
+`server_error`). In the device flow — through the browser callback or the JSON
+`POST /device/verify` path — a declined consent, an upstream cancellation, an ID
+token that fails verification (signature, issuer, audience, expiry, nonce,
+verified email, or subject), or a refused identity marks the grant denied, so the
+next poll returns `access_denied` instead of `authorization_pending` until
+expiry. An unreachable or failed upstream exchange instead answers the browser
+with HTTP 503 `temporarily_unavailable` and leaves the grant pending, so the
+user can retry verification.
 
 ## Open scope decisions
 
@@ -117,7 +125,9 @@ for browser sign-in and device verification; declined, cancelled, unadmitted,
 unverified-email, and forged-signature logins reaching the client as denials;
 stolen callbacks and consent forms, forged CSRF, consent replay, and hub code
 exchange with a wrong redirect, wrong PKCE verifier, or replayed code; device
-pending-then-approval, denials, mixed browser/transaction attempts that leave
+pending-then-approval, denials (including ID tokens rejected at the device
+callback or the JSON verification path, while an upstream outage stays
+retryable), mixed browser/transaction attempts that leave
 unrelated grants untouched, `slow_down` and expiry, and client cancellation;
 refresh rotation, reuse detection that revokes the family including issued
 access tokens, logout revocation, bounded recovery of a server-rejected but

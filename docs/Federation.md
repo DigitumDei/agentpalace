@@ -94,16 +94,20 @@ a save fails, login reports the persistence error but keeps the fresh grant only
 process; a later process can use it only after storage succeeds.
 No token is placed in ordinary config, MCP output, logs, command arguments, or URLs.
 
-When a read is rejected with `401`, the client attempts one bounded recovery and then retries the
-read once; a second `401` is reported without further recovery. Recovery trusts only context the
+When a request — read or mutation — is answered with `401`, the client attempts one bounded
+recovery and then re-sends the identical request once; a second `401` is reported without further
+recovery. A `401` is a complete, authoritative response: the credential was rejected before
+anything executed, so the replay carries the same method, URL, and body (and therefore the same
+mutation `operation_id`) without risk of applying a write twice. Recovery trusts only context the
 process already validated: the challenge's `resource_metadata` if it passes full discovery,
 otherwise the metadata retained from an earlier discovery, otherwise the issuer of the grant in
 use. The persistent store is authoritative — a grant rotated by another process is adopted without
 refreshing, a grant removed by another process is forgotten, and a grant the server rejects before
 its local expiry is refreshed once. An authoritative refresh rejection (for example a reused or
 revoked refresh token) removes the grant; an unreachable issuer does not. A token within 30 seconds
-of expiry is refreshed before a request is sent. Mutations rejected with `401` are never replayed
-or used to trigger recovery. `RemoteClient::logout` revokes the grant where the issuer advertises
+of expiry is refreshed before a request is sent. A mutation whose outcome is unknown (a timeout,
+a dropped connection, or an unreadable response) never reaches this path: it is reported as
+`unknown_outcome` and is never replayed. `RemoteClient::logout` revokes the grant where the issuer advertises
 RFC 7009 revocation and deletes the stored record; recovery already in flight when logout runs is
 abandoned, and background recovery never reloads a stored grant after logout until an explicit
 login or `load_stored_session`, so a slow reload cannot resurrect a signed-out session.

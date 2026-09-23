@@ -415,23 +415,7 @@ impl RemoteClient {
         rb: reqwest::RequestBuilder,
         kind: CallKind,
     ) -> Result<T> {
-        // Only reads are ever re-sent. A mutation rejected with 401 is reported, never replayed.
-        let retry =
-            (kind == CallKind::Read && self.oauth.is_some()).then(|| rb.try_clone()).flatten();
-        let mut exchange = self.send_and_read(rb, kind).await?;
-
-        if exchange.status == reqwest::StatusCode::UNAUTHORIZED
-            && let Some(retry) = retry
-            && self
-                .recover_read_authorization(
-                    exchange.token.as_deref(),
-                    exchange.challenge.as_deref(),
-                )
-                .await?
-        {
-            // Exactly one retry per call: a second 401 is reported below without recovery.
-            exchange = self.send_and_read(retry, kind).await?;
-        }
+        let exchange = self.send_authorized(rb, kind).await?;
 
         if exchange.status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(self.unauthorized(exchange.challenge));
@@ -442,6 +426,33 @@ impl RemoteClient {
         }
 
         serde_json::from_slice(&exchange.bytes).map_err(|e| self.decode_failure(kind, e))
+    }
+
+    /// Send a request and, for an OAuth remote whose request was answered with HTTP 401,
+    /// recover authorization once and re-send the identical request once.
+    ///
+    /// A 401 is a complete, authoritative response: the resource rejected the credential before
+    /// executing anything, so re-sending the same request — the same method, URL, and body, and
+    /// therefore the same mutation `operation_id` — cannot double-apply it. This holds for reads
+    /// and mutations alike. A transport failure or unreadable response never produces a status
+    /// here (it is returned as `Unreachable`/`UnknownOutcome` by `send_and_read`), so an unknown
+    /// outcome is never replayed. A second 401 is returned to the caller without further recovery.
+    async fn send_authorized(
+        &self,
+        rb: reqwest::RequestBuilder,
+        kind: CallKind,
+    ) -> Result<Exchange> {
+        let replay = self.oauth.is_some().then(|| rb.try_clone()).flatten();
+        let exchange = self.send_and_read(rb, kind).await?;
+        if exchange.status == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(replay) = replay
+            && self
+                .recover_authorization(exchange.token.as_deref(), exchange.challenge.as_deref())
+                .await?
+        {
+            return self.send_and_read(replay, kind).await;
+        }
+        Ok(exchange)
     }
 
     /// The error for a final HTTP 401: OAuth remotes report that interactive login is needed
@@ -475,7 +486,7 @@ impl RemoteClient {
         rb: reqwest::RequestBuilder,
     ) -> Result<RemoteRevisionedWrite<T>> {
         let Exchange { status, bytes, challenge, .. } =
-            self.send_and_read(rb, CallKind::Mutation).await?;
+            self.send_authorized(rb, CallKind::Mutation).await?;
 
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(self.unauthorized(challenge));
@@ -643,8 +654,8 @@ impl RemoteClient {
         Ok(metadata)
     }
 
-    /// Recover a read rejected with HTTP 401. Returns `Ok(true)` when a different credential is
-    /// now in place and the read should be retried once.
+    /// Recover a request rejected with HTTP 401. Returns `Ok(true)` when a different credential
+    /// is now in place and the request should be re-sent once.
     ///
     /// Trust comes only from context this process already validated: a challenge's
     /// `resource_metadata` is used only if it passes full discovery validation; otherwise the
@@ -652,7 +663,7 @@ impl RemoteClient {
     /// persistent store is authoritative: a grant rotated by another process is adopted without
     /// refreshing, a grant removed by another process is forgotten here too, and an unexpired
     /// grant the server rejected is refreshed once. Recovery that races a logout abandons.
-    async fn recover_read_authorization(
+    async fn recover_authorization(
         &self,
         rejected_token: Option<&str>,
         challenge: Option<&str>,
@@ -2005,6 +2016,13 @@ mod tests {
         token_hits: Arc<AtomicUsize>,
         revoke_hits: Arc<AtomicUsize>,
         mutation_hits: Arc<AtomicUsize>,
+        /// Tokens the mutation routes refuse although `/v1/info` accepts them.
+        mutation_rejects: Arc<std::sync::Mutex<Vec<String>>>,
+        mutation_reject_all: Arc<std::sync::atomic::AtomicBool>,
+        /// Milliseconds a mutation route waits before answering (to force a client timeout).
+        mutation_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+        /// `(bearer, body)` of every mutation request, in order.
+        mutation_requests: Arc<std::sync::Mutex<Vec<(Option<String>, serde_json::Value)>>>,
         bearers: Arc<std::sync::Mutex<Vec<Option<String>>>>,
         /// When set, the protected-resource metadata handler waits for this before answering.
         metadata_gate: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>>,
@@ -2026,6 +2044,10 @@ mod tests {
                 token_hits: Arc::default(),
                 revoke_hits: Arc::default(),
                 mutation_hits: Arc::default(),
+                mutation_rejects: Arc::default(),
+                mutation_reject_all: Arc::default(),
+                mutation_delay_ms: Arc::default(),
+                mutation_requests: Arc::default(),
                 bearers: Arc::default(),
                 metadata_gate: Arc::default(),
                 metadata_entered: Arc::default(),
@@ -2036,7 +2058,8 @@ mod tests {
                 .route("/token", axum::routing::post(Self::token))
                 .route("/revoke", axum::routing::post(Self::revoke))
                 .route("/v1/info", axum::routing::get(Self::info))
-                .route("/v1/drawers", axum::routing::post(Self::mutation))
+                .route("/v1/drawers", axum::routing::post(Self::add_drawer))
+                .route("/v1/coordination/tasks/{id}/claim", axum::routing::post(Self::claim))
                 .with_state(mock.clone());
             let task = tokio::spawn(async move {
                 axum::serve(listener, app).await.expect("mock server");
@@ -2153,17 +2176,60 @@ mod tests {
                 && bearer
                     .is_some_and(|token| mock.valid.lock().expect("valid tokens").contains(&token))
             {
-                axum::Json(serde_json::json!({"server_version":"test","federation_api_version":1u32,"embedding_profile":"balanced","capabilities":[]})).into_response()
+                axum::Json(serde_json::json!({"server_version":"test","federation_api_version":1u32,"embedding_profile":"balanced","capabilities":["coordination"]})).into_response()
             } else {
                 mock.challenge()
             }
         }
 
-        async fn mutation(
+        /// Record a mutation and return the 401 challenge if its bearer is refused.
+        async fn mutation_refusal(
+            &self,
+            headers: &axum::http::HeaderMap,
+            body: &[u8],
+        ) -> Option<axum::response::Response> {
+            self.mutation_hits.fetch_add(1, Ordering::SeqCst);
+            let bearer = Self::bearer(headers);
+            let body = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+            self.mutation_requests.lock().expect("mutation requests").push((bearer.clone(), body));
+            let delay = self.mutation_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            let accepted = !self.mutation_reject_all.load(Ordering::SeqCst)
+                && bearer.is_some_and(|token| {
+                    self.valid.lock().expect("valid tokens").contains(&token)
+                        && !self.mutation_rejects.lock().expect("mutation rejects").contains(&token)
+                });
+            (!accepted).then(|| self.challenge())
+        }
+
+        async fn add_drawer(
             axum::extract::State(mock): axum::extract::State<Self>,
+            headers: axum::http::HeaderMap,
+            body: axum::body::Bytes,
         ) -> axum::response::Response {
-            mock.mutation_hits.fetch_add(1, Ordering::SeqCst);
-            mock.challenge()
+            if let Some(refusal) = mock.mutation_refusal(&headers, &body).await {
+                return refusal;
+            }
+            axum::Json(serde_json::json!({"success": true, "drawer_id": "drawer-1", "wing": "wing", "room": "room"})).into_response()
+        }
+
+        /// A revisioned coordination write; an accepted request answers with a revision conflict,
+        /// which the client decodes without needing a full task DTO.
+        async fn claim(
+            axum::extract::State(mock): axum::extract::State<Self>,
+            headers: axum::http::HeaderMap,
+            body: axum::body::Bytes,
+        ) -> axum::response::Response {
+            if let Some(refusal) = mock.mutation_refusal(&headers, &body).await {
+                return refusal;
+            }
+            (
+                axum::http::StatusCode::CONFLICT,
+                axum::Json(serde_json::json!({"code": "revision_conflict", "message": "stale", "actual_revision": 7})),
+            )
+                .into_response()
         }
     }
 
@@ -2440,17 +2506,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_mutation_is_never_replayed_or_refreshed() {
+    async fn rejected_mutation_is_recovered_and_replayed_once_with_the_same_operation() {
+        let (mock, task) = MockIssuer::start(true).await;
+        let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
+        let client = signed_in_client(&mock, store, "old-access").await;
+        // Reads still accept the old token; the write path rejects it with a definite 401.
+        mock.accept("old-access");
+        mock.mutation_rejects.lock().expect("rejects").push("old-access".to_owned());
+        let mut request = oauth_add_request();
+        request.operation_id = Some("op-stable-1".to_owned());
+        request.drawer_id = Some("drawer-1".to_owned());
+
+        let response = client.add_drawer(request).await.expect("replayed mutation succeeds");
+        assert_eq!(response.drawer_id.as_deref(), Some("drawer-1"));
+        assert_eq!(
+            mock.mutation_hits.load(Ordering::SeqCst),
+            2,
+            "one rejected attempt and one replay"
+        );
+        assert_eq!(mock.token_hits.load(Ordering::SeqCst), 1, "one forced refresh");
+        let requests = mock.mutation_requests.lock().expect("requests").clone();
+        assert_eq!(requests[0].0.as_deref(), Some("old-access"));
+        assert_eq!(requests[1].0.as_deref(), Some("refreshed-1"));
+        assert_eq!(requests[0].1, requests[1].1, "the replay carries the identical body");
+        assert_eq!(requests[1].1["operation_id"], "op-stable-1", "the operation id is preserved");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rejected_revisioned_write_is_replayed_once_with_the_same_body() {
+        let (mock, task) = MockIssuer::start(true).await;
+        let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
+        let client = signed_in_client(&mock, store, "old-access").await;
+        mock.accept("old-access");
+        mock.mutation_rejects.lock().expect("rejects").push("old-access".to_owned());
+        let lease = TaskLeaseRequest {
+            expected_revision: 3,
+            lease_seconds: 60,
+            worker: Some("worker".to_owned()),
+        };
+
+        let outcome =
+            client.coordination_task_claim("task-1", lease).await.expect("replayed claim");
+        assert!(matches!(outcome, RemoteRevisionedWrite::Conflict { actual_revision: Some(7) }));
+        assert_eq!(mock.mutation_hits.load(Ordering::SeqCst), 2);
+        let requests = mock.mutation_requests.lock().expect("requests").clone();
+        assert_eq!(requests[0].1, requests[1].1);
+        assert_eq!(requests[1].1["expected_revision"], 3);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn persistently_rejected_mutation_is_replayed_at_most_once() {
         let (mock, task) = MockIssuer::start(true).await;
         let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
         let client = signed_in_client(&mock, store, "access").await;
         mock.accept("access");
+        mock.mutation_reject_all.store(true, Ordering::SeqCst);
         let result = client.add_drawer(oauth_add_request()).await;
         assert!(matches!(result, Err(RemoteError::AuthenticationRequired { .. })), "{result:?}");
+        assert_eq!(mock.mutation_hits.load(Ordering::SeqCst), 2, "never more than one replay");
+        assert_eq!(mock.token_hits.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn mutation_with_an_unknown_outcome_is_never_replayed() {
+        let (mock, task) = MockIssuer::start(true).await;
+        let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
+        store
+            .save(oauth_session(&mock.resource(), &mock.base, "access"))
+            .await
+            .expect("seed store");
+        let mut endpoint = oauth_endpoint(&mock.base, store);
+        endpoint.timeout = Duration::from_millis(400);
+        let client = RemoteClient::new(endpoint).expect("client");
+        assert!(client.load_stored_session(&mock.base).await.expect("stored session"));
+        mock.accept("access");
+        client.info().await.expect("handshake");
+        // The write reaches the server but no response arrives before the client times out.
+        mock.mutation_delay_ms.store(1_500, Ordering::SeqCst);
+        let result = client.add_drawer(oauth_add_request()).await;
+        assert!(matches!(result, Err(RemoteError::UnknownOutcome { .. })), "{result:?}");
+        tokio::time::sleep(Duration::from_millis(1_600)).await;
         assert_eq!(
             mock.mutation_hits.load(Ordering::SeqCst),
             1,
-            "a 401 mutation is sent exactly once"
+            "an unconfirmed write is not re-sent"
         );
         assert_eq!(mock.token_hits.load(Ordering::SeqCst), 0);
         task.abort();
