@@ -3,24 +3,30 @@
 //! This crate owns the hub's issuer/resource configuration and the protocol metadata
 //! contract. Google is deliberately represented only as an upstream identity provider;
 //! the hub must mint credentials for its own resource before a request can reach a palace.
-//! The gateway exposes only the documented OAuth metadata and grant endpoints;
-//! REST forwarding remains deliberately absent.
+//! The gateway exposes documented OAuth metadata and grant endpoints, a closed
+//! REST forwarding inventory, and session-protected access administration.
+
+pub mod access_policy;
+pub mod forwarding;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use agentpalace_core::{AuthenticatedOwner, Issuer, OwnerId, SubjectBinding};
 use axum::{
     Json, Router,
-    extract::{Form, Query, State},
+    body::to_bytes,
+    extract::{Form, Path, Query, Request, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Redirect},
-    routing::{get, post},
+    response::{IntoResponse, Redirect, Response},
+    routing::{get, post, put},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use access_policy::{AccessEntry, AccessPolicyError, AccessPolicySnapshot, AccessPolicyStore, AccessRole, PolicyDecision};
+use forwarding::{AuthorizedOwner, DemoRole, ForwardRequest, Forwarder, PrivateTokenProvisioner};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -314,6 +320,15 @@ pub enum GatewayMode {
     LoopbackDemo,
 }
 
+/// Whether hard deletion is available through the demo hub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardDeletePolicy {
+    /// Disable deletion entirely.
+    Disabled,
+    /// Proposed demo default: require a fresh admin browser session and CSRF token.
+    RecentAdminBrowser,
+}
+
 /// Fail-closed gateway configuration shared by handlers and metadata generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -425,6 +440,7 @@ struct CodeGrant {
     challenge: String,
     resource: String,
     owner: AdmissionIdentity,
+    role_ceiling: AccessRole,
     expires: u64,
     used: bool,
 }
@@ -446,12 +462,13 @@ struct DeviceGrant {
     resource: String,
     user_code: String,
     owner: Option<AdmissionIdentity>,
+    role_ceiling: Option<AccessRole>,
     verify_state: Option<String>,
     verify_nonce: Option<String>,
     verify_csrf: String,
     browser_id: Option<String>,
     expires: u64,
-    next_poll: u64,
+    next_poll: Option<Instant>,
     poll_interval: u64,
     polls: u32,
     verify_attempts: u32,
@@ -463,6 +480,7 @@ struct DeviceGrant {
 struct RefreshGrant {
     family: String,
     owner: AdmissionIdentity,
+    role_ceiling: AccessRole,
     resource: String,
     expires: u64,
     current: String,
@@ -472,6 +490,7 @@ struct RefreshGrant {
 struct AccessGrant {
     family: String,
     owner: AdmissionIdentity,
+    role_ceiling: AccessRole,
     resource: String,
     expires: u64,
     revoked: bool,
@@ -483,8 +502,12 @@ struct AccessGrant {
 #[derive(Clone)]
 pub struct Gateway {
     config: Arc<GatewayConfig>,
+    hard_delete_policy: HardDeletePolicy,
     policy: Arc<dyn AdmissionPolicy>,
     verifier: Option<Arc<dyn GoogleOidcVerifier>>,
+    forwarder: Option<Arc<Forwarder>>,
+    token_provisioner: Option<Arc<PrivateTokenProvisioner>>,
+    access_store: Option<Arc<AccessPolicyStore>>,
     state: Arc<Mutex<GatewayState>>,
     device_timing: DeviceTiming,
 }
@@ -516,6 +539,7 @@ struct GatewayState {
     sessions: BTreeMap<String, BrowserSession>,
     /// Next `DeviceGrant::issued` value.
     device_seq: u64,
+    admin_deletes_in_flight: BTreeMap<String, u32>,
 }
 
 /// A hub browser session. The CSRF secret is never serialized or returned.
@@ -550,6 +574,50 @@ impl AgentGrantRole {
     }
 }
 
+fn register_rest_routes(router: Router<Gateway>) -> Router<Gateway> {
+    router
+        .route("/v1/health", get(forward_rest))
+        .route("/v1/info", get(forward_rest))
+        .route("/v1/drawers", get(forward_rest).post(forward_rest))
+        .route("/v1/drawers/{id}", get(forward_rest).delete(forward_rest))
+        .route("/v1/drawers/search", post(forward_rest))
+        .route("/v1/drawers/check_duplicate", post(forward_rest))
+        .route("/v1/kg/timeline", get(forward_rest))
+        .route("/v1/kg/stats", get(forward_rest))
+        .route("/v1/kg/query", post(forward_rest))
+        .route("/v1/kg/facts", post(forward_rest))
+        .route("/v1/kg/facts/invalidate", post(forward_rest))
+        .route("/v1/ingest/preflight", post(forward_rest))
+        .route("/v1/ingest/batch", post(forward_rest))
+        .route("/v1/taxonomy", get(forward_rest))
+        .route("/v1/wings", get(forward_rest))
+        .route("/v1/rooms", get(forward_rest))
+        .route("/v1/changes", get(forward_rest))
+        .route("/v1/coordination/tasks", get(forward_rest).post(forward_rest))
+        .route("/v1/coordination/tasks/{id}", get(forward_rest))
+        .route("/v1/coordination/tasks/{id}/claim", post(forward_rest))
+        .route("/v1/coordination/tasks/{id}/renew", post(forward_rest))
+        .route("/v1/coordination/tasks/{id}/transition", post(forward_rest))
+        .route("/v1/coordination/messages", post(forward_rest))
+        .route("/v1/coordination/messages/{id}", get(forward_rest))
+        .route("/v1/coordination/messages/{id}/ack", post(forward_rest))
+        .route("/v1/coordination/inbox", get(forward_rest))
+        .route("/v1/coordination/artifacts", post(forward_rest))
+        .route("/v1/coordination/artifacts/{id}", get(forward_rest))
+        .route("/v1/coordination/results", post(forward_rest))
+        .route("/v1/coordination/results/{id}", get(forward_rest))
+        .route("/v1/coordination/events", get(forward_rest))
+}
+
+struct AdminDeleteGuard { gateway: Gateway, owner: AdmissionIdentity }
+
+impl Drop for AdminDeleteGuard {
+    fn drop(&mut self) {
+        self.gateway.end_admin_delete(self.owner.owner.id.as_str());
+        let _ = self.gateway.reconcile_owner_tokens(&self.owner.owner.id);
+    }
+}
+
 impl Gateway {
     /// Create a gateway after validating its server-side configuration.
     pub fn new(
@@ -559,8 +627,12 @@ impl Gateway {
         config.validate()?;
         Ok(Self {
             config: Arc::new(config),
+            hard_delete_policy: HardDeletePolicy::RecentAdminBrowser,
             policy,
             verifier: None,
+            forwarder: None,
+            token_provisioner: None,
+            access_store: None,
             state: Arc::new(Mutex::new(GatewayState::default())),
             device_timing: DeviceTiming::default(),
         })
@@ -582,9 +654,126 @@ impl Gateway {
         self
     }
 
-    /// Build the metadata routes and the protocol endpoints. No REST proxy or `/mcp` route is installed.
+    /// Attach the configured private AgentPalace REST origin.
+    pub fn with_forwarder(mut self, forwarder: Arc<Forwarder>) -> Self {
+        self.forwarder = Some(forwarder);
+        self
+    }
+
+    /// Attach the server-side provisioner for owner-scoped palace credentials.
+    pub fn with_token_provisioner(mut self, provisioner: Arc<PrivateTokenProvisioner>) -> Self {
+        self.token_provisioner = Some(provisioner);
+        self
+    }
+
+    /// Configure the proposed admin-browser-only hard-delete default.
+    pub fn with_hard_delete_policy(mut self, policy: HardDeletePolicy) -> Self {
+        self.hard_delete_policy = policy;
+        self
+    }
+
+    /// Attach the persistent editable access policy used for live admission and role checks.
+    pub fn with_access_policy_store(mut self, store: Arc<AccessPolicyStore>) -> Self {
+        self.access_store = Some(store);
+        self
+    }
+
+    fn resolve_identity(&self, identity: &VerifiedIdentity) -> Result<Option<PolicyDecision>, ProtocolError> {
+        if let Some(store) = &self.access_store {
+            return store.resolve(identity).map_err(|_| ProtocolError::ServerError);
+        }
+        Ok(self.policy.admit(identity).map(|admission| PolicyDecision {
+            admission,
+            role: AccessRole::Write,
+        }))
+    }
+
+    fn role_for_owner(&self, owner_id: &agentpalace_core::OwnerId) -> Result<Option<AccessRole>, ProtocolError> {
+        match &self.access_store {
+            Some(store) => store.role_for_owner(owner_id).map_err(|_| ProtocolError::ServerError),
+            None => Ok(Some(AccessRole::Write)),
+        }
+    }
+
+    fn effective_role(&self, owner: &AdmissionIdentity, ceiling: AccessRole) -> Result<AccessRole, ProtocolError> {
+        let current = self.role_for_owner(&owner.owner.id)?.ok_or(ProtocolError::AccessDenied)?;
+        let rank = |role| match role { AccessRole::Readonly => 0, AccessRole::Write => 1, AccessRole::Admin => 2 };
+        let role = if rank(current) < rank(ceiling) { current } else { ceiling };
+        // OAuth grants are not administrative browser sessions. Hard deletion remains
+        // available only to a recently authenticated administrator browser request.
+        Ok(if role == AccessRole::Admin { AccessRole::Write } else { role })
+    }
+
+    fn begin_admin_delete(&self, owner_id: &str) -> Result<(), ProtocolError> {
+        let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+        let count = state.admin_deletes_in_flight.entry(owner_id.into()).or_default();
+        *count = count.saturating_add(1);
+        Ok(())
+    }
+
+    fn end_admin_delete(&self, owner_id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(count) = state.admin_deletes_in_flight.get_mut(owner_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 { state.admin_deletes_in_flight.remove(owner_id); }
+            }
+        }
+    }
+
+    fn reconcile_email_tokens(&self, email: &str) -> Result<(), ProtocolError> {
+        let Some(store) = &self.access_store else { return Err(ProtocolError::ServerError) };
+        let owner_id = store.owner_id_for_email(email).map_err(|_| ProtocolError::ServerError)?;
+        if let Some(owner_id) = owner_id { self.reconcile_owner_tokens(&owner_id)?; }
+        Ok(())
+    }
+
+    fn reconcile_owner_tokens(&self, owner_id: &agentpalace_core::OwnerId) -> Result<(), ProtocolError> {
+        let (Some(store), Some(provisioner)) = (&self.access_store, &self.token_provisioner) else { return Ok(()) };
+        let Some(current_role) = store.role_for_owner(owner_id).map_err(|_| ProtocolError::ServerError)? else {
+            provisioner.revoke(owner_id.as_str()).map_err(|_| ProtocolError::ServerError)?;
+            return Ok(());
+        };
+        let owner = {
+            let state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+            state.access.values().map(|grant| &grant.owner)
+                .chain(state.refresh.values().map(|grant| &grant.owner))
+                .chain(state.codes.values().map(|grant| &grant.owner))
+                .chain(state.devices.values().filter_map(|grant| grant.owner.as_ref()))
+                .chain(state.sessions.values().map(|session| &session.owner))
+                .find(|owner| &owner.owner.id == owner_id).cloned()
+        };
+        let Some(owner) = owner else {
+            provisioner.revoke(owner_id.as_str()).map_err(|_| ProtocolError::ServerError)?;
+            return Ok(());
+        };
+        let active_roles = self.active_token_roles(owner_id, current_role)?;
+        provisioner.reconcile_roles(&owner, &active_roles).map_err(|_| ProtocolError::ServerError)?;
+        Ok(())
+    }
+
+    fn active_token_roles(&self, owner_id: &agentpalace_core::OwnerId, current: AccessRole) -> Result<Vec<DemoRole>, ProtocolError> {
+        let state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+        let mut roles = Vec::new();
+        let mut add = |ceiling: AccessRole| {
+            let rank = |role| match role { AccessRole::Readonly => 0, AccessRole::Write => 1, AccessRole::Admin => 2 };
+            let role = if rank(current) < rank(ceiling) { current } else { ceiling };
+            let role = if role == AccessRole::Admin { AccessRole::Write } else { role };
+            let role = match role { AccessRole::Readonly => DemoRole::Readonly, AccessRole::Write => DemoRole::Write, AccessRole::Admin => DemoRole::Write };
+            if !roles.contains(&role) { roles.push(role); }
+        };
+        for grant in state.access.values().filter(|grant| grant.owner.owner.id == *owner_id && !grant.revoked && grant.expires >= now()) { add(grant.role_ceiling); }
+        for grant in state.refresh.values().filter(|grant| grant.owner.owner.id == *owner_id && !grant.revoked && grant.expires >= now()) { add(grant.role_ceiling); }
+        for grant in state.codes.values().filter(|grant| grant.owner.owner.id == *owner_id && !grant.used && grant.expires >= now()) { add(grant.role_ceiling); }
+        for grant in state.devices.values().filter(|grant| grant.owner.as_ref().is_some_and(|owner| owner.owner.id == *owner_id) && !grant.denied && grant.expires >= now()) {
+            if let Some(ceiling) = grant.role_ceiling { add(ceiling); }
+        }
+        if state.admin_deletes_in_flight.get(owner_id.as_str()).copied().unwrap_or(0) > 0 { roles.push(DemoRole::Admin); }
+        Ok(roles)
+    }
+
+    /// Build documented metadata, OAuth, access administration, and explicit REST routes.
     pub fn router(&self) -> Router {
-        Router::new()
+        register_rest_routes(Router::new()
             .route("/.well-known/oauth-protected-resource", get(protected_metadata))
             .route("/.well-known/oauth-authorization-server", get(authorization_metadata))
             .route("/register", post(register))
@@ -600,6 +789,8 @@ impl Gateway {
             .route("/revoke", post(revoke))
             .route("/device", post(device))
             .route("/device/verify", get(begin_device_verify).post(verify_device))
+            .route("/hub/v1/access", get(get_access))
+            .route("/hub/v1/access/{email}", put(put_access).delete(delete_access)))
             .with_state(self.clone())
     }
 
@@ -634,7 +825,9 @@ impl Gateway {
         {
             return Err(ProtocolError::InvalidRequest);
         }
-        let owner = self.policy.admit(&identity).ok_or(ProtocolError::AccessDenied)?;
+        let decision = self.resolve_identity(&identity)?.ok_or(ProtocolError::AccessDenied)?;
+        let ceiling = decision.role;
+        let owner = decision.admission;
         let code = secret("code", client_id, challenge);
         let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
         prune_expired(&mut state, now());
@@ -646,6 +839,7 @@ impl Gateway {
                 challenge: challenge.into(),
                 resource: resource.into(),
                 owner,
+                role_ceiling: ceiling,
                 expires: now() + 60,
                 used: false,
             },
@@ -752,7 +946,7 @@ impl Gateway {
         resource: &str,
     ) -> Result<TokenResponse, ProtocolError> {
         let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
-        let owner = {
+        let (owner, role_ceiling) = {
             let grant = state.codes.get_mut(code).ok_or(ProtocolError::InvalidGrant)?;
             if grant.used
                 || grant.expires < now()
@@ -764,9 +958,10 @@ impl Gateway {
                 return Err(ProtocolError::InvalidGrant);
             }
             grant.used = true;
-            grant.owner.clone()
+            (grant.owner.clone(), grant.role_ceiling)
         };
-        Ok(issue(&mut state, owner, resource))
+        self.effective_role(&owner, role_ceiling)?;
+        Ok(issue(&mut state, owner, role_ceiling, resource))
     }
 
     /// Start an RFC 8628 grant; the private device code is returned only to
@@ -840,12 +1035,13 @@ impl Gateway {
                 resource: resource.into(),
                 user_code: user_code.clone(),
                 owner: None,
+                role_ceiling: None,
                 verify_state: None,
                 verify_nonce: None,
                 verify_csrf: secret("device-csrf", &device_code, &user_code),
                 browser_id: None,
                 expires: now() + lifetime_seconds,
-                next_poll: 0,
+                next_poll: None,
                 poll_interval: interval_seconds,
                 polls: 0,
                 verify_attempts: 0,
@@ -889,9 +1085,10 @@ impl Gateway {
         if grant.verify_attempts > 5 {
             return Err(ProtocolError::SlowDown);
         }
-        match self.policy.admit(&identity) {
-            Some(owner) => {
-                grant.owner = Some(owner);
+        match self.resolve_identity(&identity)? {
+            Some(decision) => {
+                grant.owner = Some(decision.admission);
+                grant.role_ceiling = Some(decision.role);
                 Ok(())
             }
             None => {
@@ -1007,16 +1204,19 @@ impl Gateway {
             return Err(ProtocolError::AccessDenied);
         }
         grant.polls = grant.polls.saturating_add(1);
-        if timestamp < grant.next_poll {
+        let poll_time = Instant::now();
+        if grant.next_poll.is_some_and(|next_poll| poll_time < next_poll) {
             grant.poll_interval = grant.poll_interval.saturating_add(5);
-            grant.next_poll = timestamp + grant.poll_interval;
+            grant.next_poll = Some(poll_time + Duration::from_secs(grant.poll_interval));
             return Err(ProtocolError::SlowDown);
         }
-        grant.next_poll = timestamp + grant.poll_interval;
+        grant.next_poll = Some(poll_time + Duration::from_secs(grant.poll_interval));
         let owner = grant.owner.clone().ok_or(ProtocolError::AuthorizationPending)?;
+        let role_ceiling = grant.role_ceiling.ok_or(ProtocolError::AccessDenied)?;
         let resource = grant.resource.clone();
+        self.effective_role(&owner, role_ceiling)?;
         state.devices.remove(device_code);
-        Ok(issue(&mut state, owner, &resource))
+        Ok(issue(&mut state, owner, role_ceiling, &resource))
     }
 
     /// Poll a device grant while enforcing its public-client binding.
@@ -1037,45 +1237,53 @@ impl Gateway {
 
     /// Rotate a refresh token, rejecting reuse and revoked/expired grants.
     pub fn refresh(&self, refresh_token: &str) -> Result<TokenResponse, ProtocolError> {
-        let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
-        let (family, owner, resource, expires) = {
-            let family = state
-                .refresh
-                .get(refresh_token)
-                .map(|grant| grant.family.clone())
+        let (family, owner, role_ceiling, resource, expires, reused) = {
+            let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+            let family = state.refresh.get(refresh_token).map(|grant| grant.family.clone())
                 .ok_or(ProtocolError::InvalidGrant)?;
-            let (revoked, owner, resource, expires) = {
-                let grant =
-                    state.refresh.get_mut(refresh_token).ok_or(ProtocolError::InvalidGrant)?;
-                let revoked = grant.revoked;
-                if !revoked {
-                    if grant.expires < now() {
-                        return Err(ProtocolError::InvalidGrant);
-                    }
+            let (revoked, owner, role_ceiling, resource, expires) = {
+                let grant = state.refresh.get_mut(refresh_token).ok_or(ProtocolError::InvalidGrant)?;
+                let was_revoked = grant.revoked;
+                if !was_revoked {
+                    if grant.expires < now() { return Err(ProtocolError::InvalidGrant); }
                     grant.revoked = true;
                 }
-                (revoked, grant.owner.clone(), grant.resource.clone(), grant.expires)
+                (was_revoked, grant.owner.clone(), grant.role_ceiling, grant.resource.clone(), grant.expires)
             };
-            if revoked {
-                revoke_family(&mut state, &family);
-                return Err(ProtocolError::InvalidGrant);
-            }
-            (family, owner, resource, expires)
+            if revoked { revoke_family(&mut state, &family); }
+            (family, owner, role_ceiling, resource, expires, revoked)
         };
-        let response = issue_with_family(&mut state, family, owner, &resource, expires);
+        if reused {
+            self.reconcile_owner_tokens(&owner.owner.id)?;
+            return Err(ProtocolError::InvalidGrant);
+        }
+        if let Err(error) = self.effective_role(&owner, role_ceiling) {
+            let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+            revoke_family(&mut state, &family);
+            drop(state);
+            self.reconcile_owner_tokens(&owner.owner.id)?;
+            return Err(error);
+        }
+        let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+        let response = issue_with_family(&mut state, family, owner, role_ceiling, &resource, expires);
         Ok(response)
     }
 
     /// Revoke a hub grant; Google tokens are not accepted here.
     pub fn revoke(&self, token: &str) -> Result<(), ProtocolError> {
-        let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
-        if let Some(family) = state.refresh.get(token).map(|grant| grant.family.clone()) {
-            revoke_family(&mut state, &family);
-            return Ok(());
-        }
-        if let Some(family) = state.access.get(token).map(|grant| grant.family.clone()) {
-            revoke_family(&mut state, &family);
-        }
+        let owner_id = {
+            let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+            if let Some(family) = state.refresh.get(token).map(|grant| grant.family.clone()) {
+                let owner_id = state.refresh.get(token).map(|grant| grant.owner.owner.id.clone());
+                revoke_family(&mut state, &family);
+                owner_id
+            } else if let Some(family) = state.access.get(token).map(|grant| grant.family.clone()) {
+                let owner_id = state.access.get(token).map(|grant| grant.owner.owner.id.clone());
+                revoke_family(&mut state, &family);
+                owner_id
+            } else { None }
+        };
+        if let Some(owner_id) = owner_id { self.reconcile_owner_tokens(&owner_id)?; }
         Ok(())
     }
 
@@ -1086,12 +1294,25 @@ impl Gateway {
         access_token: &str,
         resource: &str,
     ) -> Result<AdmissionIdentity, ProtocolError> {
-        let state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
-        let grant = state.access.get(access_token).ok_or(ProtocolError::InvalidGrant)?;
+        self.authorize_rest_role(access_token, resource).map(|(owner, _)| owner)
+    }
+
+    /// Validate the bearer and its live role against the role ceiling captured at issuance.
+    pub fn authorize_rest_role(
+        &self,
+        access_token: &str,
+        resource: &str,
+    ) -> Result<(AdmissionIdentity, AccessRole), ProtocolError> {
+        let grant = {
+            let state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+            state.access.get(access_token).cloned().ok_or(ProtocolError::InvalidGrant)?
+        };
         if grant.revoked || grant.expires < now() || grant.resource != resource {
             return Err(ProtocolError::InvalidGrant);
         }
-        Ok(grant.owner.clone())
+        let role = self.effective_role(&grant.owner, grant.role_ceiling)?;
+        self.reconcile_owner_tokens(&grant.owner.owner.id)?;
+        Ok((grant.owner, role))
     }
 
     /// Create a browser session after a successful Google transaction.
@@ -1141,6 +1362,7 @@ impl Gateway {
     ) -> Result<(), ProtocolError> {
         let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
         let session = live_session(&state, session_id)?;
+        if self.role_for_owner(&session.owner.owner.id)?.is_none() { return Err(ProtocolError::AccessDenied); }
         if session.csrf != csrf {
             return Err(ProtocolError::InvalidRequest);
         }
@@ -1159,6 +1381,8 @@ impl Gateway {
             })
             .ok_or(ProtocolError::InvalidGrant)?;
         revoke_family(&mut state, &family);
+        drop(state);
+        self.reconcile_owner_tokens(&owner)?;
         Ok(())
     }
 
@@ -1180,6 +1404,7 @@ impl Gateway {
     pub fn own_connections(&self, session_id: &str) -> Result<Vec<String>, ProtocolError> {
         let state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
         let session = live_session(&state, session_id)?;
+        if self.role_for_owner(&session.owner.owner.id)?.is_none() { return Err(ProtocolError::AccessDenied); }
         Ok(state
             .refresh
             .values()
@@ -1195,6 +1420,7 @@ impl Gateway {
     ) -> Result<Vec<serde_json::Value>, ProtocolError> {
         let state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
         let session = live_session(&state, session_id)?;
+        if self.role_for_owner(&session.owner.owner.id)?.is_none() { return Err(ProtocolError::AccessDenied); }
         Ok(state
             .refresh
             .values()
@@ -1300,12 +1526,13 @@ fn revoke_family(state: &mut GatewayState, family: &str) {
         access.revoked = true;
     }
 }
-fn issue(state: &mut GatewayState, owner: AdmissionIdentity, resource: &str) -> TokenResponse {
+fn issue(state: &mut GatewayState, owner: AdmissionIdentity, role_ceiling: AccessRole, resource: &str) -> TokenResponse {
     prune_expired(state, now());
     issue_with_family(
         state,
         secret("family", owner.owner.id.as_str(), resource),
         owner,
+        role_ceiling,
         resource,
         now() + 7 * 24 * 60 * 60,
     )
@@ -1314,6 +1541,7 @@ fn issue_with_family(
     state: &mut GatewayState,
     family: String,
     owner: AdmissionIdentity,
+    role_ceiling: AccessRole,
     resource: &str,
     grant_expiry: u64,
 ) -> TokenResponse {
@@ -1324,6 +1552,7 @@ fn issue_with_family(
         AccessGrant {
             family: family.clone(),
             owner: owner.clone(),
+            role_ceiling,
             resource: resource.into(),
             expires: now() + 900,
             revoked: false,
@@ -1334,6 +1563,7 @@ fn issue_with_family(
         RefreshGrant {
             family,
             owner,
+            role_ceiling,
             resource: resource.into(),
             expires: grant_expiry,
             current: refresh.clone(),
@@ -1490,6 +1720,7 @@ struct RevokeRequest {
     #[serde(default)]
     csrf_token: Option<String>,
 }
+
 #[derive(Debug, Deserialize)]
 struct ConsentRequest {
     transaction: String,
@@ -1515,6 +1746,220 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
             .find_map(|part| part.trim().strip_prefix(&format!("{name}=")).map(str::to_owned))
     })
 }
+enum AdminCsrf {
+    Required(Option<String>),
+    ReadOnly,
+}
+
+fn admin_actor(
+    g: &Gateway,
+    headers: &HeaderMap,
+    csrf: AdminCsrf,
+) -> Result<(String, AdmissionIdentity, String), ProtocolError> {
+    let session_id = cookie_value(headers, "agentpalace_session").ok_or(ProtocolError::AccessDenied)?;
+    let owner = g.require_recent_auth(&session_id, Duration::from_secs(300))?;
+    let current_role = g.role_for_owner(&owner.owner.id)?.ok_or(ProtocolError::AccessDenied)?;
+    if current_role != AccessRole::Admin {
+        return Err(ProtocolError::AccessDenied);
+    }
+    let session_csrf = g.state.lock().map_err(|_| ProtocolError::ServerError)?
+        .sessions.get(&session_id).map(|session| session.csrf.clone())
+        .ok_or(ProtocolError::AccessDenied)?;
+    match csrf {
+        AdminCsrf::Required(Some(value)) if value == session_csrf => {}
+        AdminCsrf::Required(_) => return Err(ProtocolError::InvalidRequest),
+        AdminCsrf::ReadOnly => {}
+    }
+    Ok((session_id, owner, session_csrf))
+}
+
+fn response_for_admin_error(error: ProtocolError) -> Response {
+    match error {
+        ProtocolError::AccessDenied | ProtocolError::InvalidRequest => StatusCode::FORBIDDEN.into_response(),
+        other => other.into_response(),
+    }
+}
+
+fn response_for_policy_error(error: AccessPolicyError) -> Response {
+    let status = match error {
+        AccessPolicyError::RevisionConflict { .. } => StatusCode::PRECONDITION_FAILED,
+        AccessPolicyError::LastEnabledAdmin | AccessPolicyError::Invalid(_) => StatusCode::BAD_REQUEST,
+        AccessPolicyError::BindingConflict | AccessPolicyError::EmailChanged => StatusCode::CONFLICT,
+        AccessPolicyError::Storage(_) => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, Json(serde_json::json!({"error": "access_policy_update_failed"}))).into_response()
+}
+
+fn if_match_revision(headers: &HeaderMap) -> Result<u64, Response> {
+    let value = headers.get(header::IF_MATCH).and_then(|value| value.to_str().ok())
+        .ok_or_else(|| StatusCode::PRECONDITION_REQUIRED.into_response())?;
+    let revision = value.trim().strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(value.trim())
+        .parse::<u64>().map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+    Ok(revision)
+}
+
+async fn forward_rest(State(g): State<Gateway>, request: Request) -> Response {
+    // Health is a public hub liveness response and does not contact the private palace.
+    if matches!(request.method(), &axum::http::Method::GET | &axum::http::Method::HEAD)
+        && request.uri().path() == "/v1/health"
+    {
+        if request.method() == axum::http::Method::HEAD { return StatusCode::OK.into_response(); }
+        return Json(serde_json::json!({"status": "ok"})).into_response();
+    }
+    if g.access_store.is_none() { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
+    let Some(forwarder) = &g.forwarder else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
+    let Some(provisioner) = &g.token_provisioner else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let mut headers = request.headers().clone();
+    let (owner, role) = if method == axum::http::Method::DELETE {
+        if g.hard_delete_policy == HardDeletePolicy::Disabled { return StatusCode::FORBIDDEN.into_response(); }
+        let csrf = headers.get("x-csrf-token").and_then(|value| value.to_str().ok()).map(str::to_owned);
+        match admin_actor(&g, &headers, AdminCsrf::Required(csrf)) {
+            Ok((_, owner, _)) => (owner, DemoRole::Admin),
+            Err(error) => return response_for_admin_error(error),
+        }
+    } else {
+        let Some(token) = headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer ")) else {
+                return StatusCode::UNAUTHORIZED.into_response();
+            };
+        match g.authorize_rest_role(token, &g.config.resource) {
+            Ok((owner, role)) => (owner, match role {
+                AccessRole::Readonly => DemoRole::Readonly,
+                AccessRole::Write => DemoRole::Write,
+                AccessRole::Admin => DemoRole::Write,
+            }),
+            Err(error) => return error.into_response(),
+        }
+    };
+    // The hub credential authenticates this hop only; never pass it to the palace.
+    headers.remove(header::AUTHORIZATION);
+    let path_and_query = uri.path_and_query().map(|value| value.as_str().to_owned()).unwrap_or_else(|| uri.path().to_owned());
+    let body_limit = if path_and_query.starts_with("/v1/ingest/preflight") || path_and_query.starts_with("/v1/ingest/batch") {
+        16 * 1024 * 1024
+    } else {
+        8 * 1024 * 1024
+    };
+    let body = match to_bytes(request.into_body(), body_limit).await {
+        Ok(body) => body.to_vec(),
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let is_delete = method == axum::http::Method::DELETE;
+    let _delete_guard = if is_delete {
+        if let Err(error) = g.begin_admin_delete(owner.owner.id.as_str()) { return error.into_response(); }
+        Some(AdminDeleteGuard { gateway: g.clone(), owner: owner.clone() })
+    } else { None };
+    if let Err(error) = g.reconcile_owner_tokens(&owner.owner.id) { return error.into_response(); }
+    let provisioned = match provisioner.provision(&owner, role) {
+        Ok(token) => token,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let request = ForwardRequest { method, path_and_query, headers, body };
+    let forwarded = forwarder.forward(&AuthorizedOwner {
+        owner_id: provisioned.owner_id,
+        upstream_token: provisioned.token,
+        role: provisioned.role,
+    }, request).await;
+    if let Err(error) = g.reconcile_owner_tokens(&owner.owner.id) { return error.into_response(); }
+    match forwarded {
+        Ok(upstream) => {
+            let mut response = Response::new(axum::body::Body::from(upstream.body));
+            *response.status_mut() = upstream.status;
+            *response.headers_mut() = upstream.headers;
+            response
+        }
+        Err(forwarding::ForwardError::Forbidden) => StatusCode::FORBIDDEN.into_response(),
+        Err(forwarding::ForwardError::SpoofedIdentity) => StatusCode::BAD_REQUEST.into_response(),
+        Err(forwarding::ForwardError::UnsupportedRoute) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
+async fn get_access(State(g): State<Gateway>, headers: HeaderMap) -> Response {
+    let (_, owner, csrf) = match admin_actor(&g, &headers, AdminCsrf::ReadOnly) {
+        Ok(value) => value,
+        Err(error) => return response_for_admin_error(error),
+    };
+    let Some(store) = &g.access_store else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
+    let snapshot = match store.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return response_for_policy_error(error),
+    };
+    let mut response = Json(serde_json::json!({
+        "revision": snapshot.revision,
+        "users": snapshot.users,
+        "csrf_token": csrf,
+        "actor": owner.owner.id.as_str(),
+    })).into_response();
+    if let Ok(value) = format!("\"{}\"", snapshot.revision).parse() {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().expect("static header"));
+    response
+}
+
+async fn put_access(State(g): State<Gateway>, Path(email): Path<String>, headers: HeaderMap, Json(entry): Json<AccessEntry>) -> Response {
+    let csrf = headers.get("x-csrf-token").and_then(|value| value.to_str().ok()).map(str::to_owned);
+    let (_, owner, _) = match admin_actor(&g, &headers, AdminCsrf::Required(csrf)) {
+        Ok(value) => value,
+        Err(error) => return response_for_admin_error(error),
+    };
+    let revision = match if_match_revision(&headers) { Ok(value) => value, Err(response) => return response };
+    let Some(store) = &g.access_store else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
+    let mut snapshot = match store.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return response_for_policy_error(error),
+    };
+    if snapshot.revision != revision {
+        return response_for_policy_error(AccessPolicyError::RevisionConflict { expected: revision, actual: snapshot.revision });
+    }
+    snapshot.users.insert(email.clone(), entry);
+    match store.replace(revision, owner.owner.id.as_str(), snapshot.users) {
+        Ok(snapshot) => {
+            if let Err(error) = g.reconcile_email_tokens(&email) { return error.into_response(); }
+            access_snapshot_response(snapshot)
+        }
+        Err(error) => response_for_policy_error(error),
+    }
+}
+
+async fn delete_access(State(g): State<Gateway>, Path(email): Path<String>, headers: HeaderMap) -> Response {
+    let csrf = headers.get("x-csrf-token").and_then(|value| value.to_str().ok()).map(str::to_owned);
+    let (_, owner, _) = match admin_actor(&g, &headers, AdminCsrf::Required(csrf)) {
+        Ok(value) => value,
+        Err(error) => return response_for_admin_error(error),
+    };
+    let revision = match if_match_revision(&headers) { Ok(value) => value, Err(response) => return response };
+    let Some(store) = &g.access_store else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
+    let mut snapshot = match store.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return response_for_policy_error(error),
+    };
+    if snapshot.revision != revision {
+        return response_for_policy_error(AccessPolicyError::RevisionConflict { expected: revision, actual: snapshot.revision });
+    }
+    if snapshot.users.remove(&email).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match store.replace(revision, owner.owner.id.as_str(), snapshot.users) {
+        Ok(snapshot) => {
+            if let Err(error) = g.reconcile_email_tokens(&email) { return error.into_response(); }
+            access_snapshot_response(snapshot)
+        }
+        Err(error) => response_for_policy_error(error),
+    }
+}
+
+fn access_snapshot_response(snapshot: AccessPolicySnapshot) -> Response {
+    let mut response = Json(serde_json::json!({"revision": snapshot.revision, "users": snapshot.users})).into_response();
+    if let Ok(value) = format!("\"{}\"", snapshot.revision).parse() {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().expect("static header"));
+    response
+}
+
 fn transaction_browser_id(g: &Gateway, transaction: &str) -> Option<String> {
     g.state
         .lock()
@@ -1679,9 +2124,18 @@ async fn google_consent(
                 };
             let session_id = secret("session", &client_state, &code);
             let csrf = secret("csrf", &session_id, &client_state);
-            if let Err(error) = g.create_session(&session_id, owner, &csrf) {
-                return error.into_response();
-            }
+            let is_current_admin = match g.role_for_owner(&owner.owner.id) {
+                Ok(Some(AccessRole::Admin)) => true,
+                Ok(Some(_)) => false,
+                Ok(None) => return ProtocolError::AccessDenied.into_response(),
+                Err(error) => return error.into_response(),
+            };
+            let create = if is_current_admin {
+                g.create_admin_session(&session_id, owner, &csrf)
+            } else {
+                g.create_session(&session_id, owner, &csrf)
+            };
+            if let Err(error) = create { return error.into_response(); }
             let secure = secure_attribute(&g);
             let mut response = Redirect::temporary(url.as_str()).into_response();
             if let Ok(value) =

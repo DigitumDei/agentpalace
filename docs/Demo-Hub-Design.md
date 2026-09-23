@@ -1,10 +1,6 @@
 # Demo hub design
 
-Status: implementation in progress, 2026-09-22. The gateway protocol slice,
-including the Google ID-token verifier adapter, is implemented in
-`agentpalace-demo-hub` and exercised end to end against a mock provider. The
-hosting binary does not yet start a listener, grants are held in memory, and
-no live Google sign-in has been verified. The demo has not shipped and
+Status: gateway, persistent access policy, and explicit REST forwarding are implemented in `agentpalace-demo-hub`; the hosting binary does not yet start a listener and no live Google sign-in has been verified. The demo has not shipped and
 AgentPalace is not ready for 1.0.
 
 A tester supplies their own Google OAuth credentials and admin email, starts
@@ -348,55 +344,83 @@ including batch ingest and invalidation, must follow the same operation inventor
 (see [canonical REST inventory](Demo-Hub-REST-Inventory.md)).
 Do not forward /mcp or add generic tool-execution routes.
 
-Proposed persistent /data/hub/access.json (illustrative addresses):
+The gateway stores the editable policy at `/data/hub/access.json` by default.
+Its actual format is a revisioned email map plus an audit chain:
 
 ~~~json
 {
-  "schema_version": 1,
-  "revision": 1,
-  "users": [
-    {"email": "admin@example.com", "role": "admin", "enabled": true},
-    {"email": "writer@example.com", "role": "write", "enabled": true},
-    {"email": "reader@example.com", "role": "readonly", "enabled": true}
+  "format": 1,
+  "revision": 2,
+  "users": {
+    "admin@gmail.com": {"role": "admin", "enabled": true, "mailbox_proven": false},
+    "writer@gmail.com": {"role": "write", "enabled": true, "mailbox_proven": false},
+    "reader@gmail.com": {"role": "readonly", "enabled": true, "mailbox_proven": false}
+  },
+  "audit": [
+    {"actor": "bootstrap", "occurred_at": "<unix-seconds>", "action": "bootstrap_admin_created", "before": null,
+     "after": {"admin@gmail.com": {"role": "admin", "enabled": true, "mailbox_proven": false}}},
+    {"actor": "operator-id", "occurred_at": "<unix-seconds>", "action": "policy_replaced",
+     "before": {"admin@gmail.com": {"role": "admin", "enabled": true, "mailbox_proven": false}},
+     "after": {"admin@gmail.com": {"role": "admin", "enabled": true, "mailbox_proven": false},
+               "writer@gmail.com": {"role": "write", "enabled": true, "mailbox_proven": false},
+               "reader@gmail.com": {"role": "readonly", "enabled": true, "mailbox_proven": false}}}
   ]
 }
 ~~~
 
-Store subject bindings and immutable owner IDs in a small persistent gateway
-database, separate from the editable list. Trim surrounding whitespace and
-normalize domain case; do not collapse dots, plus tags, or aliases. Reject
-duplicates and invalid roles. Changing email requires an explicit admission
-update linked to the same owner, without rewriting historical provenance.
+The first admin entry is created only when the policy file is absent and a
+bootstrap email is configured. Existing malformed or unreadable policy never
+falls back to bootstrap. Subject bindings and immutable owner IDs live in the
+separate `/data/hub/bindings.json`; the gateway assigns an owner ID when a
+listed identity first signs in. Trim outer whitespace and lowercase the domain;
+preserve the local part and do not collapse dots, plus tags, or aliases. Gmail
+addresses need no extra mailbox flag. For a custom-domain bootstrap admin,
+set `BootstrapAdmin.mailbox_proven=true` only after an operator has checked
+current mailbox ownership; it defaults to false. Set an access entry's
+`mailbox_proven` only after the same proof for any other non-Gmail address.
+Email changes require an explicit binding update, without rewriting historical
+provenance.
 
-Proposed hub-only endpoints, not existing AgentPalace routes. Public OAuth
-metadata, authorization, token, Google callback, and revocation endpoints are
-also required, including device authorization and verification; use the
-maintained auth component's routes and publish the discovery endpoints in
-its metadata. Authorization/token endpoints enforce their protocol checks even
-though users need no existing API token to start login.
+The implemented hub access routes are:
 
-| Endpoint | Authorization |
+| Endpoint | Authorization and behavior |
 |---|---|
-| GET /hub/v1/me | Signed-in owner or their hub access token |
-| GET /hub/v1/connections | Browser session; list own authorized agent connections |
-| DELETE /hub/v1/connections/{id} | Browser session; revoke own OAuth grant |
-| GET /hub/v1/access | Admin session; returns revision/ETag |
-| PUT /hub/v1/access/{email} | Admin session and current If-Match revision |
-| DELETE /hub/v1/access/{email} | Admin session and current If-Match revision |
+| GET `/hub/v1/access` | Recent admin browser session; returns users, revision, ETag, and the session CSRF token |
+| PUT `/hub/v1/access/{email}` | Recent admin browser session, `x-csrf-token`, and `If-Match`; body is one `{role, enabled, mailbox_proven}` entry |
+| DELETE `/hub/v1/access/{email}` | Same checks; removes one email entry |
 
-The tester supplies the initial admin email in local setup. There is no public first-user-becomes-admin
-flow. Reject API removal/demotion of the last enabled admin. Use a single writer
-lock, validation, fsync, atomic replacement, and actor/time/before/after auditing.
-Reject stale updates; never record credentials in the audit trail.
+The admin browser session is created only after a fresh Google sign-in resolves
+to an enabled admin. Mutations require the session CSRF token and current ETag.
+The API refuses to remove or demote the last enabled admin. It writes audit
+records with the immutable actor ID, time, before/after policy, and no secrets.
 
-Mount the configuration directory on a persistent volume. Manual edits follow
-the same schema, increase revision, use atomic replacement, and coordinate
-with API writes through the documented lock. Reread policy before authorizing
-requests; missing, unreadable, or malformed policy denies protected requests
-instead of retaining old permissions. Record manual changes as operator/file
-changes, without inventing a Google actor. Keep local change history for test inspection.
-Manual editing is a trusted host override; no multi-replica synchronization is
-needed for this demo.
+For a manual edit, stop any concurrent editor and take the same exclusive lock
+as the API on `/data/hub/access.json.lock`. Keep `format` unchanged, make the
+policy change, increment `revision` by one, and append an `operator_file_edit`
+audit event whose `actor` identifies the operator, `occurred_at` is Unix seconds,
+`before` is the previous full `users` map, and `after` is the edited full map.
+Keep the previous audit chain intact; the final `after` must match `users` and
+`revision` must equal the audit-event count. Validate canonical email keys,
+roles, proof flags, and the enabled-admin rule. Write a sibling temporary file,
+flush it, call `fsync`, then atomically replace `access.json` and sync the parent
+directory before releasing the lock. Never edit `bindings.json` to change a
+role. Missing, unreadable, or malformed policy denies protected requests.
+Manual file edits are operator events and must not be attributed to Google.
+The complete policy file, including its full-snapshot audit chain, is capped at
+4 MiB, matching the fail-closed read limit. An edit whose serialized result
+would reach that limit is rejected before atomic replacement, preserving the
+last valid policy; operators should plan edits while there is room for another
+full before/after snapshot. Audit rotation is future work before this demo
+policy is used for long-lived production administration.
+
+Admin-only hard deletion remains the proposed demo default, not a confirmed
+user decision. It requires a recent admin browser session and CSRF token;
+OAuth bearer grants are capped at write even for admins. Configure
+`Gateway::with_hard_delete_policy(HardDeletePolicy::Disabled)` to disable hard
+delete; `RecentAdminBrowser` is the current default. Forwarding accepts only
+the closed inventory in
+[Demo-Hub-REST-Inventory.md](Demo-Hub-REST-Inventory.md); unknown routes and
+`/mcp` are not exposed.
 
 ## Owner provenance is a launch requirement
 
