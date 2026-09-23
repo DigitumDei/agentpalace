@@ -1,8 +1,6 @@
 # Demo hub authorization architecture
 
-Status: implemented gateway slice, 2026-09-21. This note records the component
-decision and the protocol boundary for issue #164. It does not claim live Google
-evidence, deployment, or operation of a tester's account.
+Status: implemented gateway authorization and issue #165 policy/forwarding slice, 2026-09-23. This note describes the actual route and storage boundaries; it does not claim live Google evidence or deployment.
 
 ## Boundary and ownership
 
@@ -25,12 +23,12 @@ excluded from serialized output.
 
 | Concern | Selected component | Boundary owned by AgentPalace |
 |---|---|---|
-| HTTP routing and middleware | Axum 0.8 with Tokio | Route inventory, HTTPS/loopback rule, no `/mcp` or broad REST forwarding |
+| HTTP routing and middleware | Axum 0.8 with Tokio | Explicit REST route inventory, HTTPS/loopback rule, no `/mcp` or generic proxy |
 | OAuth authorization-code/device protocol | Axum form handlers with RFC 8252 PKCE and RFC 8628 state machines | One-time code binding, consent, resource/client checks, polling limits and error semantics |
 | Google ID-token exchange and validation | `reqwest` plus `jsonwebtoken` in `GoogleOidcVerifierAdapter`, injected through the async `GoogleOidcVerifier` trait | Server-side code exchange at Google's fixed token endpoint with the exact hub callback; RS256-only signature check against the JWKS key named by `kid`; issuer, audience, expiry (no leeway), nonce, verified-email and subject checks; server-held state and nonce; no Google token admission. OIDC discovery documents are not fetched: the endpoints are fixed |
 | Opaque hub grant handles | Cryptographically random in-memory handles | Hub issuer/resource binding, 15-minute access lifetime, seven-day grant ceiling, rotation and revocation; JWT signing/key rotation is not claimed |
 | Browser sessions and CSRF | Axum cookie/session routes | Per-transaction browser-binding cookie, Secure cookies outside loopback demo mode, CSRF on consent and revocation forms, own-connection filtering. See the admin-scope note below |
-| In-memory grants, admissions, and revocation | `GatewayState` maps owned by the gateway | Immutable owner/issuer/subject binding, email-change handling, refresh reuse detection and fail-closed admission policy; durable SQLite storage is not claimed |
+| Durable access policy and in-memory OAuth grants | `AccessPolicyStore` JSON files plus `GatewayState` | Live role checks, immutable subject/owner bindings, ETag revision conflicts, audit chain, and fail-closed malformed-policy handling; OAuth grants remain in memory |
 
 The selected libraries provide maintained protocol primitives; they do not
 decide AgentPalace's authorization. The gateway code remains responsible for
@@ -42,8 +40,9 @@ and each protocol surface has matching tests.
 ## Implemented gateway surfaces
 
 The gateway advertises protected-resource and authorization-server metadata,
-native registration, authorization/token/revocation, and device
-authorization/verification endpoints. The in-memory demo state implements the
+native registration, authorization/token/revocation, device
+authorization/verification endpoints, admin access routes, and only the explicit
+REST forwarding inventory in `Demo-Hub-REST-Inventory.md`. The in-memory demo state implements the
 protocol invariants below; a durable adapter must persist the same records
 atomically before deployment:
 
@@ -63,7 +62,7 @@ atomically before deployment:
   seven-day absolute grant expiry, reuse detection, and revocation;
 * browser sessions protected by CSRF and ending eight hours after sign-in, with
   connection lists/revocation limited to the authenticated owner's grants
-  (recent-authentication administration is an open scope decision, below);
+  and a five-minute recent-admin window for access administration;
 * bounded state: every record that can no longer be used is pruned whenever a
   new one is created (expired browser transactions, authorization codes, access
   tokens, refresh records past their grant expiry, and sessions); outstanding
@@ -105,14 +104,12 @@ user can retry verification.
 
 ## Open scope decisions
 
-* **Recent-authentication administration (issue #164).** The original issue
-  asks for recent authentication before administration, but #164 defines no
-  administrative HTTP operation and access-list administration is issue #165.
-  The gateway therefore provides only the library boundary —
-  `Gateway::create_admin_session` and `Gateway::require_recent_auth` — and no
-  HTTP route creates an admin session or performs an administrative action. No
-  admin endpoint was invented here; the route and its re-authentication step
-  belong with the #165 administration surface.
+* **Admin HTTP session and access API (issue #165).** A successful fresh Google
+  callback creates an admin session only when the current policy grants admin.
+  `GET /hub/v1/access` returns the policy revision/ETag and a same-session CSRF
+  token. Per-email `PUT` and `DELETE` require that token plus `If-Match`; all
+  three routes recheck current admin role and the five-minute recent-auth window.
+  Native OAuth grants remain capped at write, including grants owned by admins.
 * **Connection revocation handles.** `GET /connections` lists the signed-in
   owner's grants and uses each grant's current refresh token as its revocation
   handle for `POST /connections/revoke`. The list is owner-scoped and requires
@@ -148,8 +145,8 @@ failures. Live Google sign-in remains unverified by this repository.
 
 ## Explicit exclusions
 
-This slice does not add REST forwarding, `/mcp`, a memory dashboard, Docker or
-deployment resources, Google Cloud resources, account operations, or issue
-#165 access administration. Offline defaults and the existing bearer-token
-path remain unchanged. The shared palace may be visible to admitted users,
-but provenance never becomes permission or truth by implication.
+This slice adds explicit REST forwarding, persistent access administration,
+and private owner-scoped engine credentials. It does not add `/mcp`, a memory
+dashboard, Google Cloud resources, account operations, or deployment. The
+shared palace may be visible to admitted users, but provenance never becomes
+permission or truth by implication.

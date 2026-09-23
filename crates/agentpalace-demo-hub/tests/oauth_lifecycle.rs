@@ -6,7 +6,7 @@
 //! the matching JWKS. Each simulated browser is an independent cookie jar.
 //!
 //! The protected resource is a test-only `/v1/info` read that authorizes bearer tokens through
-//! `Gateway::authorize_rest`; the gateway itself deliberately has no REST forwarding.
+//! `Gateway::authorize_rest`; the gateway now forwards only the closed REST inventory using owner-scoped private engine tokens.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
