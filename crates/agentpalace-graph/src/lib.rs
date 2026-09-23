@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use aho_corasick::AhoCorasick;
-use agentpalace_core::{DrawerId, DrawerRecord, PersistedProvenance};
+use agentpalace_core::{DrawerId, DrawerRecord, PersistedProvenance, ProvenanceResponse};
 use agentpalace_storage::{
     DrawerFilter, DrawerStore, EntityRecord, EntityRegistryStore, GraphDocument, GraphStore,
     KnowledgeGraphFact, KnowledgeGraphStore, ToolStateStore, core::AgentPalaceError,
@@ -505,6 +505,8 @@ pub struct KnowledgeQueryRow {
     pub confidence: f32,
     pub source_closet: Option<String>,
     pub current: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ProvenanceResponse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -515,6 +517,8 @@ pub struct KnowledgeTimelineRow {
     pub valid_from: Option<String>,
     pub valid_to: Option<String>,
     pub current: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ProvenanceResponse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1105,6 +1109,7 @@ where
                             .map(|drawer_id| drawer_id.as_str().to_owned())
                             .or_else(|| fact.source_file.clone()),
                         current: is_active_on(&fact, today),
+                        provenance: fact.provenance.as_ref().map(PersistedProvenance::response),
                     });
                 }
                 if fact.object_entity_id == entity_id
@@ -1127,6 +1132,7 @@ where
                             .map(|drawer_id| drawer_id.as_str().to_owned())
                             .or_else(|| fact.source_file.clone()),
                         current: is_active_on(&fact, today),
+                        provenance: fact.provenance.as_ref().map(PersistedProvenance::response),
                     });
                 }
                 None
@@ -1169,6 +1175,7 @@ where
                     valid_from: fact.valid_from.map(format_date),
                     valid_to: fact.valid_to.map(format_date),
                     current,
+                    provenance: fact.provenance.as_ref().map(PersistedProvenance::response),
                 }
             })
             .collect::<Vec<_>>();
