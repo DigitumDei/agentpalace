@@ -62,9 +62,51 @@ pub struct RemoteConfigV1 {
     /// Name of the environment variable whose value is used as the bearer token.
     #[serde(default)]
     pub token_env: Option<String>,
+    /// Optional provider-neutral public/native OAuth configuration. Secrets are
+    /// never accepted in this section; credentials belong in the runtime store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthConfigV1>,
     /// Connection timeout in milliseconds (defaults to [`DEFAULT_REMOTE_TIMEOUT_MS`]).
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+}
+
+/// File-format OAuth settings for a public/native client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthConfigV1 {
+    /// Registered public client identifier.
+    pub client_id: String,
+    /// Optional account partition for the credential store.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Explicitly use volatile in-memory credentials.
+    #[serde(default)]
+    pub allow_in_memory: bool,
+    /// Explicitly allow the exact configured loopback demo origin.
+    #[serde(default)]
+    pub allow_loopback_demo: bool,
+    /// Interactive login transport: `browser`, `device`, or `auto`.
+    #[serde(default)]
+    pub login_mode: OAuthLoginMode,
+    /// Interactive login timeout in seconds.
+    #[serde(default)]
+    pub login_timeout_seconds: Option<u64>,
+}
+
+/// Interactive OAuth login transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthLoginMode {
+    /// Use the native browser and loopback callback flow.
+    Browser,
+    /// Use RFC 8628 device authorization without an inbound callback.
+    Device,
+    /// Use browser login when usable, otherwise use device authorization.
+    Auto,
+}
+
+impl Default for OAuthLoginMode {
+    fn default() -> Self { Self::Auto }
 }
 
 /// How requests for a particular resource are routed.
@@ -187,8 +229,21 @@ pub struct ResolvedRemote {
     pub url: String,
     /// Bearer token (resolved from `token_env` or inline `token`).
     pub token: Option<String>,
+    /// Optional provider-neutral OAuth settings.
+    pub oauth: Option<ResolvedOAuthConfig>,
     /// Connection timeout.
     pub timeout: Duration,
+}
+
+/// Runtime form of [`OAuthConfigV1`] with defaults applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedOAuthConfig {
+    pub client_id: String,
+    pub account: Option<String>,
+    pub allow_in_memory: bool,
+    pub allow_loopback_demo: bool,
+    pub login_mode: OAuthLoginMode,
+    pub login_timeout_seconds: u64,
 }
 
 /// A resolved routing rule.
@@ -292,7 +347,23 @@ pub(crate) fn resolve_federation_config(
         let token = resolve_token(&raw.name, raw.token_env.as_deref(), raw.token, &env_lookup);
         let timeout = Duration::from_millis(raw.timeout_ms.unwrap_or(DEFAULT_REMOTE_TIMEOUT_MS));
 
-        remotes.insert(raw.name.clone(), ResolvedRemote { name: raw.name, url, token, timeout });
+        let oauth = raw.oauth.map(|oauth| {
+            if oauth.client_id.trim().is_empty() {
+                return Err(AgentPalaceError::ConfigParse {
+                    path: config_path.to_path_buf(),
+                    message: format!("federation.remotes.{}.oauth.client_id must not be empty", raw.name),
+                });
+            }
+            Ok(ResolvedOAuthConfig {
+            client_id: oauth.client_id,
+            account: oauth.account,
+            allow_in_memory: oauth.allow_in_memory,
+            allow_loopback_demo: oauth.allow_loopback_demo,
+            login_mode: oauth.login_mode,
+            login_timeout_seconds: oauth.login_timeout_seconds.unwrap_or(300),
+            })
+        }).transpose()?;
+        remotes.insert(raw.name.clone(), ResolvedRemote { name: raw.name, url, token, oauth, timeout });
     }
 
     // ── 2. Resolve wing rules ─────────────────────────────────────────────────
@@ -807,6 +878,7 @@ mod tests {
                 url: "https://example.com".to_owned(),
                 token: None,
                 token_env: None,
+                oauth: None,
                 timeout_ms: None,
             }],
             default_mode: None,
@@ -840,6 +912,7 @@ mod tests {
                 url: "https://solo.example".to_owned(),
                 token: None,
                 token_env: None,
+                oauth: None,
                 timeout_ms: None,
             }],
             default_mode: None,
@@ -868,6 +941,7 @@ mod tests {
                     url: "https://a.example".to_owned(),
                     token: None,
                     token_env: None,
+                    oauth: None,
                     timeout_ms: None,
                 },
                 RemoteConfigV1 {
@@ -875,6 +949,7 @@ mod tests {
                     url: "https://b.example".to_owned(),
                     token: None,
                     token_env: None,
+                    oauth: None,
                     timeout_ms: None,
                 },
             ],
@@ -924,6 +999,7 @@ mod tests {
                     url: "https://a.example".to_owned(),
                     token: None,
                     token_env: None,
+                    oauth: None,
                     timeout_ms: None,
                 },
                 RemoteConfigV1 {
@@ -931,6 +1007,7 @@ mod tests {
                     url: "https://b.example".to_owned(),
                     token: None,
                     token_env: None,
+                    oauth: None,
                     timeout_ms: None,
                 },
             ],
@@ -951,6 +1028,7 @@ mod tests {
                 url: "https://solo.example".to_owned(),
                 token: None,
                 token_env: None,
+                oauth: None,
                 timeout_ms: None,
             }],
             default_mode: Some(RouteMode::Remote),
@@ -972,6 +1050,7 @@ mod tests {
                 url: "https://example.com".to_owned(),
                 token: Some("inline-tok".to_owned()),
                 token_env: Some("MY_TOKEN_VAR".to_owned()),
+                oauth: None,
                 timeout_ms: None,
             }],
             default_mode: None,
@@ -985,6 +1064,71 @@ mod tests {
     }
 
     #[test]
+    fn oauth_settings_are_resolved_without_secret_material() {
+        let section = FederationConfigV1 {
+            remotes: vec![RemoteConfigV1 {
+                name: "oauth".to_owned(),
+                url: "https://hub.example".to_owned(),
+                token: None,
+                token_env: None,
+                oauth: Some(OAuthConfigV1 {
+                    client_id: "demo-public-client".to_owned(),
+                    account: Some("alice".to_owned()),
+                    allow_in_memory: true,
+                    allow_loopback_demo: false,
+                    login_mode: OAuthLoginMode::Auto,
+                    login_timeout_seconds: None,
+                }),
+                timeout_ms: None,
+            }],
+            default_mode: None,
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination: BTreeMap::new(),
+        };
+        let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
+        let oauth = fed.remotes["oauth"].oauth.as_ref().expect("OAuth settings");
+        assert_eq!(oauth.client_id, "demo-public-client");
+        assert_eq!(oauth.account.as_deref(), Some("alice"));
+        assert!(oauth.allow_in_memory);
+        assert_eq!(oauth.login_timeout_seconds, 300);
+        assert_eq!(oauth.login_mode, OAuthLoginMode::Auto);
+    }
+
+    #[test]
+    fn oauth_client_id_must_not_be_empty() {
+        let section = FederationConfigV1 {
+            remotes: vec![RemoteConfigV1 {
+                name: "oauth".to_owned(),
+                url: "https://hub.example".to_owned(),
+                token: None,
+                token_env: None,
+                oauth: Some(OAuthConfigV1 {
+                    client_id: "  ".to_owned(),
+                    account: None,
+                    allow_in_memory: false,
+                    allow_loopback_demo: false,
+                    login_mode: OAuthLoginMode::Auto,
+                    login_timeout_seconds: None,
+                }),
+                timeout_ms: None,
+            }],
+            default_mode: None,
+            wings: BTreeMap::new(),
+            kg: None,
+            coordination: BTreeMap::new(),
+        };
+        assert!(resolve_federation_config(Some(section), config_path(), no_env()).is_err());
+    }
+
+    #[test]
+    fn oauth_login_mode_is_strictly_validated_from_yaml() {
+        let value = serde_yaml::from_str::<OAuthLoginMode>("device").expect("device mode");
+        assert_eq!(value, OAuthLoginMode::Device);
+        assert!(serde_yaml::from_str::<OAuthLoginMode>("headless").is_err());
+    }
+
+    #[test]
     fn token_env_missing_falls_back_to_inline() {
         let section = FederationConfigV1 {
             remotes: vec![RemoteConfigV1 {
@@ -992,6 +1136,7 @@ mod tests {
                 url: "https://example.com".to_owned(),
                 token: Some("inline-tok".to_owned()),
                 token_env: Some("MISSING_VAR".to_owned()),
+                oauth: None,
                 timeout_ms: None,
             }],
             default_mode: None,
@@ -1011,6 +1156,7 @@ mod tests {
                 url: "https://example.com".to_owned(),
                 token: None,
                 token_env: None,
+                oauth: None,
                 timeout_ms: None,
             }],
             default_mode: None,
@@ -1030,6 +1176,7 @@ mod tests {
                 url: "http://example.com".to_owned(),
                 token: Some("tok".to_owned()),
                 token_env: None,
+                oauth: None,
                 timeout_ms: None,
             }],
             default_mode: None,
@@ -1049,6 +1196,7 @@ mod tests {
                 url: "http://127.0.0.1:8765".to_owned(),
                 token: Some("tok".to_owned()),
                 token_env: None,
+                oauth: None,
                 timeout_ms: None,
             }],
             default_mode: None,
@@ -1069,6 +1217,7 @@ mod tests {
                 url: "https://example.com".to_owned(),
                 token: None,
                 token_env: None,
+                oauth: None,
                 timeout_ms: None,
             }],
             default_mode: None,
@@ -1169,6 +1318,7 @@ mod tests {
                 name: remote_name.to_owned(),
                 url: remote_url.to_owned(),
                 token: None,
+                oauth: None,
                 timeout: Duration::from_secs(5),
             },
         );
@@ -1664,6 +1814,7 @@ mod tests {
                 url: "https://palace.example".to_owned(),
                 token: None,
                 token_env: None,
+                oauth: None,
                 timeout_ms: None,
             }],
             default_mode: None,
@@ -1714,6 +1865,7 @@ mod tests {
                     name: "hub".to_owned(),
                     url: "https://palace.example".to_owned(),
                     token: None,
+                    oauth: None,
                     timeout: Duration::from_secs(5),
                 },
             );
@@ -1752,6 +1904,7 @@ mod tests {
                 url: "https://palace.example".to_owned(),
                 token: None,
                 token_env: None,
+                oauth: None,
                 timeout_ms: None,
             }],
             default_mode: None,
@@ -1787,6 +1940,7 @@ mod tests {
                 url: "https://palace.example".to_owned(),
                 token: None,
                 token_env: None,
+                oauth: None,
                 timeout_ms: None,
             }],
             default_mode: None,
@@ -2005,6 +2159,7 @@ mod tests {
                 url: "https://palace.example".to_owned(),
                 token: None,
                 token_env: None,
+                oauth: None,
                 timeout_ms: None,
             }],
             default_mode: None,
@@ -2038,6 +2193,7 @@ mod tests {
                 url: "https://palace.example".to_owned(),
                 token: None,
                 token_env: None,
+                oauth: None,
                 timeout_ms: None,
             }],
             default_mode: None,

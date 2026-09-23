@@ -13,7 +13,7 @@ use agentpalace_federation::{
     NewTaskResultRequest, RemoteDrawerResult, TaskLeaseRequest, TransitionTaskRequest,
 };
 use agentpalace_remote::{
-    RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, RemoteRevisionedWrite,
+    configured_token_store, OAuthConfig, RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, RemoteRevisionedWrite,
 };
 use agentpalace_storage::UNSCOPED_WING;
 use serde_json::{Value, json};
@@ -44,6 +44,16 @@ impl FederationRouter {
                 name: remote.name.clone(),
                 base_url: remote.url.clone(),
                 token: remote.token.clone(),
+                oauth: remote.oauth.as_ref().map(|oauth| OAuthConfig {
+                    client_id: oauth.client_id.clone(),
+                    account: oauth.account.clone(),
+                    allow_in_memory: oauth.allow_in_memory,
+                    allow_loopback_demo: oauth.allow_loopback_demo,
+                    login_mode: oauth.login_mode,
+                    token_store: Some(configured_token_store(oauth.allow_in_memory)),
+                    interaction: None,
+                    login_timeout_seconds: oauth.login_timeout_seconds,
+                }),
                 timeout: remote.timeout,
             };
             match RemoteClient::new(endpoint) {
@@ -2588,6 +2598,8 @@ fn remote_error_classification(error: &RemoteError) -> &'static str {
     match error {
         RemoteError::Unreachable { .. } => "unreachable",
         RemoteError::Unauthorized { .. } => "unauthorized",
+        RemoteError::AuthenticationRequired { .. } => "authentication_required",
+        RemoteError::CredentialStore { .. } => "credential_store",
         RemoteError::VersionSkew { .. } => "version_skew",
         RemoteError::RemoteRejected { .. } => "rejected",
         RemoteError::InvalidResponse { .. } => "invalid_response",
@@ -3648,7 +3660,7 @@ mod tests {
                     status: 404,
                     body: "not found".to_owned(),
                 },
-                Self::Unauthorized => RemoteError::Unauthorized { remote: "mock".to_owned() },
+                Self::Unauthorized => RemoteError::Unauthorized { remote: "mock".to_owned(), resource_metadata: None },
                 Self::VersionSkew => {
                     RemoteError::VersionSkew { remote: "mock".to_owned(), ours: 1, theirs: 2 }
                 }
@@ -4015,6 +4027,7 @@ mod tests {
             name: name.to_owned(),
             url: "https://test.example".to_owned(),
             token: None,
+            oauth: None,
             timeout: Duration::from_secs(5),
         }
     }

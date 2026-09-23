@@ -1,6 +1,6 @@
 # AgentPalace — instructions for Claude
 
-A Rust workspace of 16 crates implementing AgentPalace, local-first memory, continuity,
+A Rust workspace of 17 crates implementing AgentPalace, local-first memory, continuity,
 and coordination for AI agents. The technical name is `agentpalace`. MemPalace names
 remain only where required for migration, historical evidence, and persisted identity.
 
@@ -34,9 +34,10 @@ cargo test -p agentpalace-storage --locked
 ```
 
 Packages: `agentpalace-a2a`, `agentpalace-cli`, `agentpalace-config`, `agentpalace-core`,
-`agentpalace-dialect`, `agentpalace-embeddings`, `agentpalace-federation`, `agentpalace-graph`,
-`agentpalace-import`, `agentpalace-ingest`, `agentpalace-mcp`, `agentpalace-mcp-tasks`,
-`agentpalace-remote`, `agentpalace-search`, `agentpalace-server`, `agentpalace-storage`.
+`agentpalace-demo-hub`, `agentpalace-dialect`, `agentpalace-embeddings`,
+`agentpalace-federation`, `agentpalace-graph`, `agentpalace-import`, `agentpalace-ingest`,
+`agentpalace-mcp`, `agentpalace-mcp-tasks`, `agentpalace-remote`, `agentpalace-search`,
+`agentpalace-server`, `agentpalace-storage`.
 
 ## Embeddings are offline by default
 

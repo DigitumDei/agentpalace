@@ -597,8 +597,27 @@ The optional `federation` section of `~/.agentpalace/config.json` controls routi
     that isn't local dev.
   - `token`: inline bearer token string (optional)
   - `token_env`: name of an environment variable holding the bearer token (optional, preferred over `token` — keeps secrets out of config.json)
-  - Token resolution: the environment variable value wins if both are set; if `token_env` is set but the variable is not present in the environment, the config loader warns and falls back to the inline `token` (or proceeds unauthenticated if neither is set)
+  - `oauth`: optional provider-neutral public-client settings: `client_id` (must not be blank), optional `account`, `allow_in_memory`, `allow_loopback_demo`, `login_mode` (`browser`, `device`, or `auto`; default `auto`), and `login_timeout_seconds` (default `300`, clamped to 1–900). This contains no credential material. On Windows, macOS, and Linux the CLI and MCP server store grants in the platform credential store; on other platforms there is no secure store, so every credential operation fails as unavailable unless `allow_in_memory` is set.
   - `timeout_ms`: HTTP request timeout in milliseconds. Default: `5000`
+  - Token resolution: the environment variable value wins if both are set; if `token_env` is set but the variable is not present in the environment, the config loader warns and falls back to the inline `token` (or proceeds unauthenticated if neither is set)
+
+OAuth is represented by the non-secret `oauth` settings above. Run
+`agentpalace auth login --remote NAME --resource-metadata URL [--mode browser|device|auto]`;
+the command starts from the protected-resource metadata URL in the
+authentication challenge and uses the configured `login_mode` unless the CLI
+override is supplied. `auto` selects browser/callback only when usable,
+otherwise selecting device authorization;
+unattended calls return an authentication-required result instead of opening a browser. The CLI
+uses the platform OS credential store (Keychain, Credential Manager, or Secret Service); embedding
+callers may inject another secure `TokenStore`. `allow_in_memory` is the explicit volatile/test mode and
+otherwise storage failures are reported, distinguishing an unavailable store, a corrupt record, and
+a backend failure from the absence of a grant. Subsequent CLI commands load a matching stored grant after
+the remote's protected-resource challenge, so login and use may be separate processes.
+Grants are keyed by the remote's exact `url` (the OAuth resource), the issuer, `client_id`, and
+`account`; a trailing slash on a path makes a different resource.
+`agentpalace auth logout --remote NAME --issuer ISSUER` revokes the grant where the issuer supports
+it and removes the local record. `allow_loopback_demo` is required for an exact loopback issuer; other
+discovered metadata and endpoints must use HTTPS.
 
 Validation:
 - Duplicate `name` values across remotes fail config load.

@@ -11,7 +11,7 @@ pub use config::{
     ServerConfigFileV1, ServerRuntimeConfig, build_runtime,
 };
 pub use federation::{
-    FederationConfigV1, FederationRuntimeConfig, ProjectRoutingConfig, RemoteConfigV1,
-    ReplicationStatus, ResolvedRemote, ResolvedRouteRule, RouteMode, RouteQuery, RouteRuleV1,
-    WriteTarget, DEFAULT_COORDINATION_WING, resolve_coordination_route, resolve_kg_route, resolve_route,
+    FederationConfigV1, FederationRuntimeConfig, OAuthConfigV1, ProjectRoutingConfig, RemoteConfigV1,
+    OAuthLoginMode, ReplicationStatus, ResolvedRemote, ResolvedRouteRule, RouteMode, RouteQuery, RouteRuleV1,
+    ResolvedOAuthConfig, WriteTarget, DEFAULT_COORDINATION_WING, resolve_coordination_route, resolve_kg_route, resolve_route,
 };

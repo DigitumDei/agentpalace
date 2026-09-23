@@ -1,5 +1,8 @@
 //! [`RemoteClient`] — concrete reqwest-backed implementation of [`RemoteApi`].
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use agentpalace_federation::{
     AckMessageRequest, AddDrawerRequest, AddDrawerResponse, ChangesQuery, ChangesResponse,
     CheckDuplicateRequest, CheckDuplicateResponse, CoordinationArtifactDto,
@@ -10,6 +13,8 @@ use agentpalace_federation::{
     ListDrawersQuery, ListDrawersResponse, NewArtifactRequest, NewMessageRequest, NewTaskRequest,
     NewTaskResultRequest, TaskLeaseRequest, TransitionTaskRequest,
 };
+
+use tokio::sync::Mutex;
 
 use crate::{
     RemoteApi, RemoteEndpoint, RemoteRevisionedWrite,
@@ -47,6 +52,39 @@ enum CallKind {
     Mutation,
 }
 
+/// One HTTP response as read by `send_and_read`.
+struct Exchange {
+    status: reqwest::StatusCode,
+    bytes: Vec<u8>,
+    /// RFC 9728 `resource_metadata` from a `WWW-Authenticate` challenge, if any.
+    challenge: Option<String>,
+    /// The bearer token the request carried, so 401 recovery can tell a rotated grant from the
+    /// rejected one.
+    token: Option<String>,
+}
+
+/// What [`RemoteClient::logout`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogoutOutcome {
+    /// Whether a stored record was deleted.
+    pub store: crate::ClearOutcome,
+    /// Whether the grant was revoked at the issuer.
+    pub revocation: RevocationOutcome,
+}
+
+/// Issuer-side revocation result of a logout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevocationOutcome {
+    /// The issuer accepted the RFC 7009 revocation request.
+    Revoked,
+    /// No grant was available to revoke.
+    NoCredential,
+    /// No trusted issuer metadata, or the issuer advertises no revocation endpoint.
+    Unsupported,
+    /// The issuer was unreachable or refused revocation; local credentials were still removed.
+    Failed(String),
+}
+
 /// A reqwest-backed HTTP client for one remote AgentPalace federation endpoint.
 ///
 /// Build with [`RemoteClient::new`]; then use via the [`RemoteApi`] trait.
@@ -56,8 +94,29 @@ pub struct RemoteClient {
     name: String,
     /// Base URL, normalised to end with `'/'` so [`reqwest::Url::join`] works correctly.
     base_url: reqwest::Url,
-    /// Optional bearer token sent on every authenticated request.
-    token: Option<String>,
+    /// Exact OAuth resource identity (the configured URL, not the slash-terminated transport
+    /// base). Credentials are stored and looked up under this identity.
+    oauth_resource: String,
+    /// Bearer token sent on every authenticated request: the static configured token, or the
+    /// current OAuth access token.
+    token: Mutex<Option<String>>,
+    oauth: Option<crate::OAuthConfig>,
+    /// The OAuth grant currently in use by this process.
+    oauth_session: Mutex<Option<crate::OAuthSession>>,
+    /// Authorization-server metadata validated by discovery in this process. Recovery reuses it
+    /// instead of trusting an unauthenticated challenge.
+    trusted_metadata: Mutex<Option<crate::AuthorizationServerMetadata>>,
+    token_store: crate::SharedTokenStore,
+    /// Serializes every grant transition (login, reload, refresh, logout).
+    login_lock: Mutex<()>,
+    /// Incremented by every logout. Recovery that started before a logout observes the change
+    /// and abandons, so an in-flight reload or refresh can never resurrect a signed-out grant.
+    auth_epoch: AtomicU64,
+    /// Incremented whenever a grant is committed; lets concurrent logins share one result.
+    session_generation: AtomicU64,
+    /// Set by logout and cleared only by an explicit login or explicit stored-session load, so
+    /// background recovery never reloads a credential the user signed out of.
+    signed_out: AtomicBool,
     /// Shared reqwest HTTP client (connection-pool aware).
     http: reqwest::Client,
     /// Cached result of the initial `GET /v1/info` handshake.
@@ -69,6 +128,16 @@ pub struct RemoteClient {
 }
 
 impl RemoteClient {
+    /// Return the slash-normalized REST transport base URL.
+    pub fn base_url(&self) -> &str {
+        self.base_url.as_str()
+    }
+
+    /// Return the exact OAuth resource identity supplied by the endpoint.
+    pub fn oauth_resource(&self) -> &str {
+        &self.oauth_resource
+    }
+
     /// Construct a new client from a [`RemoteEndpoint`] descriptor.
     ///
     /// Returns [`RemoteError::InvalidConfig`] when the URL is unparseable or the
@@ -84,6 +153,7 @@ impl RemoteClient {
                 remote: endpoint.name.clone(),
                 message: format!("cannot parse base URL `{raw_url}`: {e}"),
             })?;
+        let oauth_resource = base_url.to_string();
 
         // Normalize: ensure the path ends with '/' so that Url::join with a
         // relative path (e.g. "v1/info") appends rather than replaces the last
@@ -103,10 +173,29 @@ impl RemoteClient {
                 message: format!("failed to build HTTP client: {e}"),
             })?;
 
+        let token_store: crate::SharedTokenStore =
+            endpoint.oauth.as_ref().and_then(|config| config.token_store.clone()).unwrap_or_else(
+                || {
+                    if endpoint.oauth.as_ref().is_some_and(|config| config.allow_in_memory) {
+                        Arc::new(crate::InMemoryTokenStore::default())
+                    } else {
+                        Arc::new(crate::UnavailableTokenStore)
+                    }
+                },
+            );
         Ok(Self {
             name: endpoint.name,
             base_url,
-            token: endpoint.token,
+            oauth_resource,
+            token: Mutex::new(endpoint.token),
+            oauth: endpoint.oauth,
+            oauth_session: Mutex::new(None),
+            trusted_metadata: Mutex::new(None),
+            token_store,
+            login_lock: Mutex::new(()),
+            auth_epoch: AtomicU64::new(0),
+            session_generation: AtomicU64::new(0),
+            signed_out: AtomicBool::new(false),
             http,
             info: tokio::sync::OnceCell::new(),
         })
@@ -143,11 +232,10 @@ impl RemoteClient {
     /// handshake itself.
     async fn fetch_info(&self) -> Result<InfoResponse> {
         let url = self.url("v1/info")?;
-        let rb = self.http.get(url);
-        // The handshake is a read. A failed handshake therefore degrades to
-        // `Unreachable` for the mutations gated behind it — "before send", never
-        // `UnknownOutcome`.
-        self.execute(rb, CallKind::Read).await
+        // `execute` owns the single bounded authentication recovery. Keeping
+        // the handshake on that path prevents a failed/revoked credential from
+        // recursively re-entering recovery.
+        self.execute(self.http.get(url), CallKind::Read).await
     }
 
     /// Ensure the version handshake has been performed, returning a reference
@@ -177,12 +265,12 @@ impl RemoteClient {
     /// `kind` steers transport-failure classification: reads degrade to
     /// [`RemoteError::Unreachable`], while a mutation that may have been
     /// delivered surfaces as [`RemoteError::UnknownOutcome`].
-    async fn send_and_read(
-        &self,
-        rb: reqwest::RequestBuilder,
-        kind: CallKind,
-    ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
-        let rb = match &self.token {
+    async fn send_and_read(&self, rb: reqwest::RequestBuilder, kind: CallKind) -> Result<Exchange> {
+        if self.oauth.is_some() {
+            self.refresh_if_expiring().await;
+        }
+        let token = self.token.lock().await.clone();
+        let rb = match &token {
             Some(tok) => rb.bearer_auth(tok),
             None => rb,
         };
@@ -202,7 +290,12 @@ impl RemoteClient {
                 break;
             }
         }
-        Ok((status, bytes))
+        let challenge = response
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::oauth::resource_metadata_from_challenge);
+        Ok(Exchange { status, bytes, challenge, token })
     }
 
     /// Map a [`reqwest::Error`] from [`reqwest::RequestBuilder::send`] into a
@@ -258,7 +351,7 @@ impl RemoteClient {
         match kind {
             CallKind::Read => RemoteError::Unreachable { remote, message },
             CallKind::Mutation if status == reqwest::StatusCode::UNAUTHORIZED => {
-                RemoteError::Unauthorized { remote }
+                RemoteError::Unauthorized { remote, resource_metadata: None }
             }
             CallKind::Mutation if !status.is_success() => RemoteError::RemoteRejected {
                 remote,
@@ -322,17 +415,58 @@ impl RemoteClient {
         rb: reqwest::RequestBuilder,
         kind: CallKind,
     ) -> Result<T> {
-        let (status, bytes) = self.send_and_read(rb, kind).await?;
+        let exchange = self.send_authorized(rb, kind).await?;
 
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(RemoteError::Unauthorized { remote: self.name.clone() });
+        if exchange.status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(self.unauthorized(exchange.challenge));
         }
 
-        if !status.is_success() {
-            return Err(self.remote_rejected(status, &bytes));
+        if !exchange.status.is_success() {
+            return Err(self.remote_rejected(exchange.status, &exchange.bytes));
         }
 
-        serde_json::from_slice(&bytes).map_err(|e| self.decode_failure(kind, e))
+        serde_json::from_slice(&exchange.bytes).map_err(|e| self.decode_failure(kind, e))
+    }
+
+    /// Send a request and, for an OAuth remote whose request was answered with HTTP 401,
+    /// recover authorization once and re-send the identical request once.
+    ///
+    /// A 401 is a complete, authoritative response: the resource rejected the credential before
+    /// executing anything, so re-sending the same request — the same method, URL, and body, and
+    /// therefore the same mutation `operation_id` — cannot double-apply it. This holds for reads
+    /// and mutations alike. A transport failure or unreadable response never produces a status
+    /// here (it is returned as `Unreachable`/`UnknownOutcome` by `send_and_read`), so an unknown
+    /// outcome is never replayed. A second 401 is returned to the caller without further recovery.
+    async fn send_authorized(
+        &self,
+        rb: reqwest::RequestBuilder,
+        kind: CallKind,
+    ) -> Result<Exchange> {
+        let replay = self.oauth.is_some().then(|| rb.try_clone()).flatten();
+        let exchange = self.send_and_read(rb, kind).await?;
+        if exchange.status == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(replay) = replay
+            && self
+                .recover_authorization(exchange.token.as_deref(), exchange.challenge.as_deref())
+                .await?
+        {
+            return self.send_and_read(replay, kind).await;
+        }
+        Ok(exchange)
+    }
+
+    /// The error for a final HTTP 401: OAuth remotes report that interactive login is needed
+    /// (preserving any RFC 9728 challenge); static-token remotes report rejected credentials.
+    fn unauthorized(&self, challenge: Option<String>) -> RemoteError {
+        if self.oauth.is_some() {
+            RemoteError::AuthenticationRequired {
+                remote: self.name.clone(),
+                action: "run the explicit remote OAuth login command".to_owned(),
+                resource_metadata: challenge,
+            }
+        } else {
+            RemoteError::Unauthorized { remote: self.name.clone(), resource_metadata: challenge }
+        }
     }
 
     /// Like [`Self::execute`], but a `409` body whose `code` is `"revision_conflict"` decodes
@@ -351,10 +485,11 @@ impl RemoteClient {
         &self,
         rb: reqwest::RequestBuilder,
     ) -> Result<RemoteRevisionedWrite<T>> {
-        let (status, bytes) = self.send_and_read(rb, CallKind::Mutation).await?;
+        let Exchange { status, bytes, challenge, .. } =
+            self.send_authorized(rb, CallKind::Mutation).await?;
 
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(RemoteError::Unauthorized { remote: self.name.clone() });
+            return Err(self.unauthorized(challenge));
         }
 
         if status == reqwest::StatusCode::CONFLICT {
@@ -397,6 +532,431 @@ impl RemoteClient {
                 capability: COORDINATION_CAPABILITY.to_owned(),
             })
         }
+    }
+
+    fn oauth_config(&self) -> Result<&crate::OAuthConfig> {
+        self.oauth.as_ref().ok_or_else(|| RemoteError::InvalidConfig {
+            remote: self.name.clone(),
+            message: "OAuth operation requested for a remote without OAuth configuration"
+                .to_owned(),
+        })
+    }
+
+    fn store_error(&self, error: crate::TokenStoreError) -> RemoteError {
+        RemoteError::CredentialStore {
+            remote: self.name.clone(),
+            kind: error.kind,
+            message: error.message,
+        }
+    }
+
+    fn login_failed(&self, action: String) -> RemoteError {
+        RemoteError::AuthenticationRequired {
+            remote: self.name.clone(),
+            action,
+            resource_metadata: None,
+        }
+    }
+
+    fn resource_url(&self) -> Result<reqwest::Url> {
+        reqwest::Url::parse(&self.oauth_resource).map_err(|_| RemoteError::InvalidConfig {
+            remote: self.name.clone(),
+            message: "invalid OAuth resource".to_owned(),
+        })
+    }
+
+    /// Publish a grant in-process (caller holds `login_lock`).
+    async fn publish_locked(&self, session: crate::OAuthSession) {
+        *self.token.lock().await = Some(session.access_token.clone());
+        *self.oauth_session.lock().await = Some(session);
+        self.session_generation.fetch_add(1, Ordering::SeqCst);
+        self.signed_out.store(false, Ordering::SeqCst);
+    }
+
+    /// Drop the in-process grant (caller holds `login_lock`).
+    async fn forget_locked(&self) -> Option<crate::OAuthSession> {
+        *self.token.lock().await = None;
+        self.oauth_session.lock().await.take()
+    }
+
+    /// Publish a new grant and persist it (caller holds `login_lock`). The grant is published
+    /// before persistence so a secure-store failure does not discard a grant that just cost the
+    /// user an interactive login; the store failure is still returned for remediation.
+    async fn commit_locked(&self, session: crate::OAuthSession) -> Result<()> {
+        self.publish_locked(session.clone()).await;
+        self.token_store.save(session).await.map_err(|error| self.store_error(error))
+    }
+
+    /// Discover and validate protected-resource and authorization-server metadata from an
+    /// RFC 9728 `resource_metadata` URL. On success the issuer metadata becomes trusted context
+    /// for later recovery in this process.
+    pub async fn discover(
+        &self,
+        resource_metadata: &str,
+    ) -> Result<(crate::ProtectedResourceMetadata, crate::AuthorizationServerMetadata)> {
+        let config = self.oauth_config()?;
+        let (protected, metadata) = crate::discover_metadata(
+            &self.http,
+            resource_metadata,
+            &self.resource_url()?,
+            &self.base_url,
+            config.allow_loopback_demo,
+        )
+        .await
+        .map_err(|message| RemoteError::AuthenticationRequired {
+            remote: self.name.clone(),
+            action: message,
+            resource_metadata: Some(resource_metadata.to_owned()),
+        })?;
+        *self.trusted_metadata.lock().await = Some(metadata.clone());
+        Ok((protected, metadata))
+    }
+
+    /// Fetch and validate RFC 8414 metadata for an issuer this client already holds a grant
+    /// from. The document must name the same issuer, and its endpoints must satisfy the same
+    /// origin and transport policy as discovery. On success the metadata becomes trusted context.
+    pub async fn authorization_server_metadata(
+        &self,
+        issuer: &str,
+    ) -> Result<crate::AuthorizationServerMetadata> {
+        if let Some(metadata) =
+            self.trusted_metadata.lock().await.clone().filter(|metadata| metadata.issuer == issuer)
+        {
+            return Ok(metadata);
+        }
+        let config = self.oauth_config()?;
+        let invalid = |message: String| RemoteError::AuthenticationRequired {
+            remote: self.name.clone(),
+            action: message,
+            resource_metadata: None,
+        };
+        let metadata = crate::fetch_authorization_server_metadata(
+            &self.http,
+            issuer,
+            &self.base_url,
+            config.allow_loopback_demo,
+        )
+        .await
+        .map_err(invalid)?;
+        let protected = crate::ProtectedResourceMetadata {
+            resource: self.oauth_resource.clone(),
+            authorization_servers: vec![issuer.to_owned()],
+        };
+        crate::validate_metadata(
+            &protected,
+            &metadata,
+            &self.resource_url()?,
+            &self.base_url,
+            config.allow_loopback_demo,
+        )
+        .map_err(invalid)?;
+        *self.trusted_metadata.lock().await = Some(metadata.clone());
+        Ok(metadata)
+    }
+
+    /// Recover a request rejected with HTTP 401. Returns `Ok(true)` when a different credential
+    /// is now in place and the request should be re-sent once.
+    ///
+    /// Trust comes only from context this process already validated: a challenge's
+    /// `resource_metadata` is used only if it passes full discovery validation; otherwise the
+    /// retained discovery result, or the issuer of the grant already in use, is used. The
+    /// persistent store is authoritative: a grant rotated by another process is adopted without
+    /// refreshing, a grant removed by another process is forgotten here too, and an unexpired
+    /// grant the server rejected is refreshed once. Recovery that races a logout abandons.
+    async fn recover_authorization(
+        &self,
+        rejected_token: Option<&str>,
+        challenge: Option<&str>,
+    ) -> Result<bool> {
+        let Some(config) = self.oauth.as_ref() else { return Ok(false) };
+        let epoch = self.auth_epoch.load(Ordering::SeqCst);
+        if self.signed_out.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+
+        let mut metadata = None;
+        if let Some(challenge) = challenge {
+            metadata = self.discover(challenge).await.ok().map(|(_, metadata)| metadata);
+        }
+        if metadata.is_none() {
+            metadata = self.trusted_metadata.lock().await.clone();
+        }
+        if metadata.is_none() {
+            let issuer =
+                self.oauth_session.lock().await.as_ref().map(|session| session.issuer.clone());
+            if let Some(issuer) = issuer {
+                metadata = self.authorization_server_metadata(&issuer).await.ok();
+            }
+        }
+        let Some(metadata) = metadata else { return Ok(false) };
+
+        let _guard = self.login_lock.lock().await;
+        if self.auth_epoch.load(Ordering::SeqCst) != epoch || self.signed_out.load(Ordering::SeqCst)
+        {
+            return Ok(false);
+        }
+        let stored = self
+            .token_store
+            .load(
+                &self.oauth_resource,
+                &metadata.issuer,
+                &config.client_id,
+                config.account.as_deref(),
+            )
+            .await
+            .map_err(|error| self.store_error(error))?;
+        let Some(current) = stored else {
+            // The authoritative store holds no grant: another process signed out.
+            self.forget_locked().await;
+            return Ok(false);
+        };
+        if rejected_token != Some(current.access_token.as_str()) {
+            self.publish_locked(current).await;
+            return Ok(true);
+        }
+        match crate::refresh(&self.http, &metadata, &current).await {
+            Ok(session) => {
+                self.commit_locked(session).await?;
+                Ok(true)
+            }
+            Err(crate::TokenEndpointFailure::Rejected(_)) => {
+                self.forget_locked().await;
+                self.token_store
+                    .clear(
+                        &current.resource,
+                        &current.issuer,
+                        &current.client_id,
+                        current.account.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| self.store_error(error))?;
+                Ok(false)
+            }
+            Err(crate::TokenEndpointFailure::Transient(message)) => {
+                Err(RemoteError::Unreachable { remote: self.name.clone(), message })
+            }
+        }
+    }
+
+    /// Refresh an access token that is about to expire before sending a request. Best effort:
+    /// on any failure the request is sent with the current token and a 401 is handled normally.
+    async fn refresh_if_expiring(&self) {
+        let Some(session) = self.oauth_session.lock().await.clone() else { return };
+        let expiring = session
+            .expires_at
+            .is_some_and(|at| at <= crate::oauth::now_seconds().saturating_add(30));
+        if !expiring || session.refresh_token.is_none() {
+            return;
+        }
+        let Some(metadata) = self
+            .trusted_metadata
+            .lock()
+            .await
+            .clone()
+            .filter(|metadata| metadata.issuer == session.issuer)
+        else {
+            return;
+        };
+        let _guard = self.login_lock.lock().await;
+        let unchanged = self
+            .oauth_session
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|current| current.access_token == session.access_token);
+        if !unchanged || self.signed_out.load(Ordering::SeqCst) {
+            return;
+        }
+        match crate::refresh(&self.http, &metadata, &session).await {
+            Ok(fresh) => {
+                if let Err(error) = self.commit_locked(fresh).await {
+                    tracing::warn!(remote = %self.name, %error, "refreshed OAuth grant could not be persisted");
+                }
+            }
+            Err(crate::TokenEndpointFailure::Rejected(_)) => {
+                self.forget_locked().await;
+                if let Err(error) = self
+                    .token_store
+                    .clear(
+                        &session.resource,
+                        &session.issuer,
+                        &session.client_id,
+                        session.account.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(remote = %self.name, %error, "rejected OAuth grant could not be removed from the credential store");
+                }
+            }
+            Err(crate::TokenEndpointFailure::Transient(_)) => {}
+        }
+    }
+
+    /// Complete one explicit browser login for an OAuth-configured endpoint. Concurrent callers
+    /// share one in-flight grant instead of opening multiple browsers.
+    pub async fn login(
+        &self,
+        metadata: &crate::AuthorizationServerMetadata,
+        resource: &str,
+    ) -> Result<()> {
+        self.interactive_login(metadata, resource, agentpalace_config::OAuthLoginMode::Browser)
+            .await
+    }
+
+    /// Discover metadata from a preserved RFC 9728 challenge and perform one explicit login
+    /// using the configured login mode.
+    pub async fn login_from_challenge(&self, resource_metadata: &str) -> Result<()> {
+        self.login_from_challenge_with_mode(resource_metadata, None).await
+    }
+
+    /// Discover metadata from a preserved challenge and perform login using an
+    /// optional foreground override, otherwise the configured login mode.
+    pub async fn login_from_challenge_with_mode(
+        &self,
+        resource_metadata: &str,
+        mode: Option<agentpalace_config::OAuthLoginMode>,
+    ) -> Result<()> {
+        let config = self.oauth_config()?;
+        let (protected, metadata) = self.discover(resource_metadata).await?;
+        let mode = crate::select_login_mode(
+            mode.unwrap_or(config.login_mode),
+            crate::browser_callback_usable(),
+        );
+        self.interactive_login(&metadata, &protected.resource, mode).await
+    }
+
+    async fn interactive_login(
+        &self,
+        metadata: &crate::AuthorizationServerMetadata,
+        resource: &str,
+        mode: agentpalace_config::OAuthLoginMode,
+    ) -> Result<()> {
+        let config = self.oauth_config()?;
+        let observed = self.session_generation.load(Ordering::SeqCst);
+        let _guard = self.login_lock.lock().await;
+        // A caller that waited while another caller committed a grant for the same identity
+        // shares it instead of starting a second interactive login. A grant that already existed
+        // before this call started is not reused: an explicit login always re-authorizes.
+        let shared = self.session_generation.load(Ordering::SeqCst) != observed
+            && self.oauth_session.lock().await.as_ref().is_some_and(|session| {
+                crate::resource_key(&session.resource) == crate::resource_key(resource)
+                    && session.issuer == metadata.issuer
+                    && session.client_id == config.client_id
+                    && session.account.as_deref() == config.account.as_deref()
+            });
+        if shared {
+            return Ok(());
+        }
+        let session = match mode {
+            agentpalace_config::OAuthLoginMode::Device => {
+                crate::device_login(&self.http, metadata, config, resource).await
+            }
+            _ => crate::browser_login(&self.http, metadata, config, resource).await,
+        }
+        .map_err(|message| self.login_failed(message))?;
+        *self.trusted_metadata.lock().await = Some(metadata.clone());
+        self.commit_locked(session).await
+    }
+
+    /// Load a previously authorized grant for this remote's exact OAuth resource and the given
+    /// issuer. `Ok(false)` means no grant is stored; a store failure is returned as
+    /// [`RemoteError::CredentialStore`], never as absence.
+    pub async fn load_stored_session(&self, issuer: &str) -> Result<bool> {
+        let config = self.oauth_config()?;
+        let _guard = self.login_lock.lock().await;
+        let stored = self
+            .token_store
+            .load(&self.oauth_resource, issuer, &config.client_id, config.account.as_deref())
+            .await
+            .map_err(|error| self.store_error(error))?;
+        let Some(session) = stored else { return Ok(false) };
+        self.publish_locked(session).await;
+        Ok(true)
+    }
+
+    /// Refresh the current grant once, replacing the access and rotating refresh token together.
+    /// An authoritative rejection forgets the grant in-process and in the store; a transient
+    /// failure keeps it and is reported as [`RemoteError::Unreachable`].
+    pub async fn refresh(&self, metadata: &crate::AuthorizationServerMetadata) -> Result<()> {
+        let _guard = self.login_lock.lock().await;
+        let current = self.oauth_session.lock().await.clone().ok_or_else(|| {
+            self.login_failed("run the explicit remote OAuth login command".to_owned())
+        })?;
+        match crate::refresh(&self.http, metadata, &current).await {
+            Ok(session) => self.commit_locked(session).await,
+            Err(crate::TokenEndpointFailure::Rejected(message)) => {
+                self.forget_locked().await;
+                self.token_store
+                    .clear(
+                        &current.resource,
+                        &current.issuer,
+                        &current.client_id,
+                        current.account.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| self.store_error(error))?;
+                Err(self.login_failed(message))
+            }
+            Err(crate::TokenEndpointFailure::Transient(message)) => {
+                Err(RemoteError::Unreachable { remote: self.name.clone(), message })
+            }
+        }
+    }
+
+    /// Sign out: forget the grant in-process, revoke it at the issuer where possible, and delete
+    /// the stored record for this remote's exact OAuth resource.
+    ///
+    /// `issuer` selects the stored record; when `None`, the issuer of the grant in use is used.
+    /// Revocation uses `metadata` when given, otherwise metadata already trusted by this process.
+    /// After logout, background recovery never reloads a stored grant until an explicit login
+    /// or [`Self::load_stored_session`].
+    pub async fn logout(
+        &self,
+        issuer: Option<&str>,
+        metadata: Option<&crate::AuthorizationServerMetadata>,
+    ) -> Result<LogoutOutcome> {
+        let config = self.oauth_config()?;
+        let _guard = self.login_lock.lock().await;
+        self.auth_epoch.fetch_add(1, Ordering::SeqCst);
+        self.signed_out.store(true, Ordering::SeqCst);
+        let in_memory = self.forget_locked().await;
+        let issuer = issuer
+            .map(str::to_owned)
+            .or_else(|| in_memory.as_ref().map(|session| session.issuer.clone()));
+        let Some(issuer) = issuer else {
+            return Ok(LogoutOutcome {
+                store: crate::ClearOutcome::Absent,
+                revocation: RevocationOutcome::NoCredential,
+            });
+        };
+        let in_memory = in_memory.filter(|session| session.issuer == issuer);
+        // A corrupt or unreadable record must still be deletable, so a load failure only
+        // prevents revocation; the delete below reports the store's real state.
+        let stored = self
+            .token_store
+            .load(&self.oauth_resource, &issuer, &config.client_id, config.account.as_deref())
+            .await;
+        let grant = in_memory.or(stored.ok().flatten());
+        let trusted = self.trusted_metadata.lock().await.clone();
+        let metadata = metadata.cloned().or(trusted).filter(|metadata| metadata.issuer == issuer);
+        let revocation = match (&grant, &metadata) {
+            (None, _) => RevocationOutcome::NoCredential,
+            (Some(_), Some(metadata)) if metadata.revocation_endpoint.is_none() => {
+                RevocationOutcome::Unsupported
+            }
+            (Some(_), None) => RevocationOutcome::Unsupported,
+            (Some(grant), Some(metadata)) => match crate::revoke(&self.http, metadata, grant).await
+            {
+                Ok(()) => RevocationOutcome::Revoked,
+                Err(message) => RevocationOutcome::Failed(message),
+            },
+        };
+        let store = self
+            .token_store
+            .clear(&self.oauth_resource, &issuer, &config.client_id, config.account.as_deref())
+            .await
+            .map_err(|error| self.store_error(error))?;
+        Ok(LogoutOutcome { store, revocation })
     }
 }
 
@@ -784,19 +1344,22 @@ impl RemoteApi for RemoteClient {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use axum::response::IntoResponse;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+    use tempfile::tempdir;
 
     use super::*;
-    use crate::DEFAULT_TIMEOUT;
     use crate::error::is_transient_http_status;
+    use crate::{DEFAULT_TIMEOUT, TokenStore};
 
     fn endpoint(base_url: &str) -> RemoteEndpoint {
         RemoteEndpoint {
             name: "test-remote".to_owned(),
             base_url: base_url.to_owned(),
             token: None,
+            oauth: None,
             timeout: DEFAULT_TIMEOUT,
         }
     }
@@ -845,7 +1408,10 @@ mod tests {
         assert!(
             RemoteError::Unreachable { remote: mk_name(), message: "x".to_owned() }.is_degradable()
         );
-        assert!(!RemoteError::Unauthorized { remote: mk_name() }.is_degradable());
+        assert!(
+            !RemoteError::Unauthorized { remote: mk_name(), resource_metadata: None }
+                .is_degradable()
+        );
         assert!(
             !RemoteError::VersionSkew { remote: mk_name(), ours: 1, theirs: 2 }.is_degradable()
         );
@@ -908,7 +1474,7 @@ mod tests {
 
         // Authoritative / config errors are terminal and never retryable.
         for err in [
-            RemoteError::Unauthorized { remote: mk_name() },
+            RemoteError::Unauthorized { remote: mk_name(), resource_metadata: None },
             RemoteError::VersionSkew { remote: mk_name(), ours: 1, theirs: 2 },
             RemoteError::InvalidResponse { remote: mk_name(), message: "x".to_owned() },
             RemoteError::InvalidConfig { remote: mk_name(), message: "x".to_owned() },
@@ -951,6 +1517,7 @@ mod tests {
             name: "test-remote".to_owned(),
             base_url: format!("http://{addr}"),
             token: None,
+            oauth: None,
             timeout,
         })
         .unwrap()
@@ -1328,5 +1895,847 @@ mod tests {
             }
             other => panic!("expected InvalidResponse for undecodable read, got: {other:?}"),
         }
+    }
+
+    // ── OAuth grant lifecycle ────────────────────────────────────────────────
+
+    fn oauth_endpoint(base_url: &str, store: crate::SharedTokenStore) -> RemoteEndpoint {
+        RemoteEndpoint {
+            name: "oauth-test-remote".to_owned(),
+            base_url: base_url.to_owned(),
+            token: None,
+            oauth: Some(crate::OAuthConfig {
+                client_id: "test-client".to_owned(),
+                account: Some("test-account".to_owned()),
+                allow_in_memory: false,
+                allow_loopback_demo: true,
+                login_mode: agentpalace_config::OAuthLoginMode::Device,
+                token_store: Some(store),
+                interaction: None,
+                login_timeout_seconds: 5,
+            }),
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+
+    fn oauth_session(resource: &str, issuer: &str, access_token: &str) -> crate::OAuthSession {
+        crate::OAuthSession {
+            access_token: access_token.to_owned(),
+            refresh_token: Some(format!("{access_token}-refresh")),
+            expires_at: None,
+            resource: resource.to_owned(),
+            issuer: issuer.to_owned(),
+            client_id: "test-client".to_owned(),
+            account: Some("test-account".to_owned()),
+        }
+    }
+
+    async fn stored_token(store: &dyn TokenStore, resource: &str, issuer: &str) -> Option<String> {
+        store
+            .load(resource, issuer, "test-client", Some("test-account"))
+            .await
+            .expect("store load")
+            .map(|session| session.access_token)
+    }
+
+    /// A store whose every operation outcome is scripted, for deterministic failure cases that
+    /// never touch a real OS credential store.
+    #[derive(Debug, Default)]
+    struct ScriptedStore {
+        inner: crate::InMemoryTokenStore,
+        load_error: std::sync::Mutex<Option<crate::TokenStoreError>>,
+        save_error: std::sync::Mutex<Option<crate::TokenStoreError>>,
+        clear_error: std::sync::Mutex<Option<crate::TokenStoreError>>,
+    }
+
+    impl ScriptedStore {
+        fn fail(
+            slot: &std::sync::Mutex<Option<crate::TokenStoreError>>,
+            error: crate::TokenStoreError,
+        ) {
+            *slot.lock().expect("script lock") = Some(error);
+        }
+
+        fn scripted(
+            slot: &std::sync::Mutex<Option<crate::TokenStoreError>>,
+        ) -> std::result::Result<(), crate::TokenStoreError> {
+            slot.lock().expect("script lock").clone().map_or(Ok(()), Err)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::TokenStore for ScriptedStore {
+        async fn load(
+            &self,
+            resource: &str,
+            issuer: &str,
+            client_id: &str,
+            account: Option<&str>,
+        ) -> std::result::Result<Option<crate::OAuthSession>, crate::TokenStoreError> {
+            Self::scripted(&self.load_error)?;
+            self.inner.load(resource, issuer, client_id, account).await
+        }
+
+        async fn save(
+            &self,
+            session: crate::OAuthSession,
+        ) -> std::result::Result<(), crate::TokenStoreError> {
+            Self::scripted(&self.save_error)?;
+            self.inner.save(session).await
+        }
+
+        async fn clear(
+            &self,
+            resource: &str,
+            issuer: &str,
+            client_id: &str,
+            account: Option<&str>,
+        ) -> std::result::Result<crate::ClearOutcome, crate::TokenStoreError> {
+            Self::scripted(&self.clear_error)?;
+            self.inner.clear(resource, issuer, client_id, account).await
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RefreshBehaviour {
+        Rotate,
+        Reject,
+        Unavailable,
+    }
+
+    /// A minimal issuer + protected resource. `/v1/info` accepts only tokens in `valid`;
+    /// `/v1/drawers` (a mutation) always answers 401. Every endpoint counts its hits.
+    #[derive(Clone)]
+    struct MockIssuer {
+        base: String,
+        valid: Arc<std::sync::Mutex<Vec<String>>>,
+        reject_all: Arc<std::sync::atomic::AtomicBool>,
+        refresh: Arc<std::sync::Mutex<RefreshBehaviour>>,
+        challenge_metadata: bool,
+        info_hits: Arc<AtomicUsize>,
+        token_hits: Arc<AtomicUsize>,
+        revoke_hits: Arc<AtomicUsize>,
+        mutation_hits: Arc<AtomicUsize>,
+        /// Tokens the mutation routes refuse although `/v1/info` accepts them.
+        mutation_rejects: Arc<std::sync::Mutex<Vec<String>>>,
+        mutation_reject_all: Arc<std::sync::atomic::AtomicBool>,
+        /// Milliseconds a mutation route waits before answering (to force a client timeout).
+        mutation_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+        /// `(bearer, body)` of every mutation request, in order.
+        mutation_requests: Arc<std::sync::Mutex<Vec<(Option<String>, serde_json::Value)>>>,
+        bearers: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        /// When set, the protected-resource metadata handler waits for this before answering.
+        metadata_gate: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>>,
+        metadata_entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl MockIssuer {
+        async fn start(challenge_metadata: bool) -> (Self, tokio::task::JoinHandle<()>) {
+            let listener =
+                tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("mock listener");
+            let base = format!("http://{}", listener.local_addr().expect("mock address"));
+            let mock = Self {
+                base,
+                valid: Arc::default(),
+                reject_all: Arc::default(),
+                refresh: Arc::new(std::sync::Mutex::new(RefreshBehaviour::Rotate)),
+                challenge_metadata,
+                info_hits: Arc::default(),
+                token_hits: Arc::default(),
+                revoke_hits: Arc::default(),
+                mutation_hits: Arc::default(),
+                mutation_rejects: Arc::default(),
+                mutation_reject_all: Arc::default(),
+                mutation_delay_ms: Arc::default(),
+                mutation_requests: Arc::default(),
+                bearers: Arc::default(),
+                metadata_gate: Arc::default(),
+                metadata_entered: Arc::default(),
+            };
+            let app = axum::Router::new()
+                .route("/.well-known/oauth-protected-resource", axum::routing::get(Self::protected))
+                .route("/.well-known/oauth-authorization-server", axum::routing::get(Self::server))
+                .route("/token", axum::routing::post(Self::token))
+                .route("/revoke", axum::routing::post(Self::revoke))
+                .route("/v1/info", axum::routing::get(Self::info))
+                .route("/v1/drawers", axum::routing::post(Self::add_drawer))
+                .route("/v1/coordination/tasks/{id}/claim", axum::routing::post(Self::claim))
+                .with_state(mock.clone());
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("mock server");
+            });
+            (mock, task)
+        }
+
+        fn resource(&self) -> String {
+            format!("{}/", self.base)
+        }
+
+        fn accept(&self, token: &str) {
+            self.valid.lock().expect("valid tokens").push(token.to_owned());
+        }
+
+        fn set_refresh(&self, behaviour: RefreshBehaviour) {
+            *self.refresh.lock().expect("refresh behaviour") = behaviour;
+        }
+
+        fn metadata(&self) -> crate::AuthorizationServerMetadata {
+            crate::AuthorizationServerMetadata {
+                issuer: self.base.clone(),
+                authorization_endpoint: format!("{}/authorize", self.base),
+                token_endpoint: format!("{}/token", self.base),
+                revocation_endpoint: Some(format!("{}/revoke", self.base)),
+                device_authorization_endpoint: None,
+            }
+        }
+
+        async fn protected(
+            axum::extract::State(mock): axum::extract::State<Self>,
+        ) -> axum::response::Response {
+            let gate = mock.metadata_gate.lock().expect("gate").clone();
+            if let Some(gate) = gate {
+                mock.metadata_entered.notify_one();
+                gate.notified().await;
+            }
+            axum::Json(serde_json::json!({"resource": mock.resource(), "authorization_servers": [mock.base]})).into_response()
+        }
+
+        async fn server(
+            axum::extract::State(mock): axum::extract::State<Self>,
+        ) -> axum::response::Response {
+            let metadata = mock.metadata();
+            axum::Json(serde_json::json!({
+                "issuer": metadata.issuer, "authorization_endpoint": metadata.authorization_endpoint,
+                "token_endpoint": metadata.token_endpoint, "revocation_endpoint": metadata.revocation_endpoint,
+            }))
+            .into_response()
+        }
+
+        async fn token(
+            axum::extract::State(mock): axum::extract::State<Self>,
+        ) -> axum::response::Response {
+            let n = mock.token_hits.fetch_add(1, Ordering::SeqCst) + 1;
+            match *mock.refresh.lock().expect("refresh behaviour") {
+                RefreshBehaviour::Rotate => {
+                    let access = format!("refreshed-{n}");
+                    mock.accept(&access);
+                    axum::Json(serde_json::json!({"access_token": access, "refresh_token": format!("rotated-{n}"), "token_type": "Bearer", "expires_in": 900})).into_response()
+                }
+                RefreshBehaviour::Reject => (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"error": "invalid_grant"})),
+                )
+                    .into_response(),
+                RefreshBehaviour::Unavailable => {
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+            }
+        }
+
+        async fn revoke(
+            axum::extract::State(mock): axum::extract::State<Self>,
+        ) -> axum::http::StatusCode {
+            mock.revoke_hits.fetch_add(1, Ordering::SeqCst);
+            axum::http::StatusCode::OK
+        }
+
+        fn bearer(headers: &axum::http::HeaderMap) -> Option<String> {
+            headers
+                .get(axum::http::header::AUTHORIZATION)?
+                .to_str()
+                .ok()?
+                .strip_prefix("Bearer ")
+                .map(str::to_owned)
+        }
+
+        fn challenge(&self) -> axum::response::Response {
+            let value = if self.challenge_metadata {
+                format!(
+                    "Bearer error=\"invalid_token\", resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
+                    self.base
+                )
+            } else {
+                "Bearer error=\"invalid_token\"".to_owned()
+            };
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                [(axum::http::header::WWW_AUTHENTICATE, value)],
+                "unauthorized",
+            )
+                .into_response()
+        }
+
+        async fn info(
+            axum::extract::State(mock): axum::extract::State<Self>,
+            headers: axum::http::HeaderMap,
+        ) -> axum::response::Response {
+            mock.info_hits.fetch_add(1, Ordering::SeqCst);
+            let bearer = Self::bearer(&headers);
+            mock.bearers.lock().expect("bearers").push(bearer.clone());
+            if !mock.reject_all.load(Ordering::SeqCst)
+                && bearer
+                    .is_some_and(|token| mock.valid.lock().expect("valid tokens").contains(&token))
+            {
+                axum::Json(serde_json::json!({"server_version":"test","federation_api_version":1u32,"embedding_profile":"balanced","capabilities":["coordination"]})).into_response()
+            } else {
+                mock.challenge()
+            }
+        }
+
+        /// Record a mutation and return the 401 challenge if its bearer is refused.
+        async fn mutation_refusal(
+            &self,
+            headers: &axum::http::HeaderMap,
+            body: &[u8],
+        ) -> Option<axum::response::Response> {
+            self.mutation_hits.fetch_add(1, Ordering::SeqCst);
+            let bearer = Self::bearer(headers);
+            let body = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+            self.mutation_requests.lock().expect("mutation requests").push((bearer.clone(), body));
+            let delay = self.mutation_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            let accepted = !self.mutation_reject_all.load(Ordering::SeqCst)
+                && bearer.is_some_and(|token| {
+                    self.valid.lock().expect("valid tokens").contains(&token)
+                        && !self.mutation_rejects.lock().expect("mutation rejects").contains(&token)
+                });
+            (!accepted).then(|| self.challenge())
+        }
+
+        async fn add_drawer(
+            axum::extract::State(mock): axum::extract::State<Self>,
+            headers: axum::http::HeaderMap,
+            body: axum::body::Bytes,
+        ) -> axum::response::Response {
+            if let Some(refusal) = mock.mutation_refusal(&headers, &body).await {
+                return refusal;
+            }
+            axum::Json(serde_json::json!({"success": true, "drawer_id": "drawer-1", "wing": "wing", "room": "room"})).into_response()
+        }
+
+        /// A revisioned coordination write; an accepted request answers with a revision conflict,
+        /// which the client decodes without needing a full task DTO.
+        async fn claim(
+            axum::extract::State(mock): axum::extract::State<Self>,
+            headers: axum::http::HeaderMap,
+            body: axum::body::Bytes,
+        ) -> axum::response::Response {
+            if let Some(refusal) = mock.mutation_refusal(&headers, &body).await {
+                return refusal;
+            }
+            (
+                axum::http::StatusCode::CONFLICT,
+                axum::Json(serde_json::json!({"code": "revision_conflict", "message": "stale", "actual_revision": 7})),
+            )
+                .into_response()
+        }
+    }
+
+    /// A client for `mock` holding `session` in-process and in `store`.
+    async fn signed_in_client(
+        mock: &MockIssuer,
+        store: Arc<dyn TokenStore>,
+        access: &str,
+    ) -> RemoteClient {
+        store.save(oauth_session(&mock.resource(), &mock.base, access)).await.expect("seed store");
+        let client = RemoteClient::new(oauth_endpoint(&mock.base, store)).expect("client");
+        assert!(client.load_stored_session(&mock.base).await.expect("load stored session"));
+        client
+    }
+
+    fn oauth_add_request() -> AddDrawerRequest {
+        AddDrawerRequest {
+            wing: "wing".to_owned(),
+            room: "room".to_owned(),
+            content: "content".to_owned(),
+            source_file: None,
+            added_by: None,
+            drawer_id: None,
+            operation_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stored_session_reloads_into_a_new_remote_client_under_the_exact_resource() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("oauth.json");
+        let store: Arc<dyn TokenStore> = Arc::new(crate::FileTokenStore::new(&path));
+        store
+            .save(oauth_session(
+                "https://hub.example/",
+                "https://issuer.example",
+                "persisted-access",
+            ))
+            .await
+            .unwrap();
+
+        // A different process (a second client over a fresh handle to the same file).
+        let second = RemoteClient::new(oauth_endpoint(
+            "https://hub.example",
+            Arc::new(crate::FileTokenStore::new(&path)),
+        ))
+        .unwrap();
+        assert!(second.load_stored_session("https://issuer.example").await.unwrap());
+        assert_eq!(second.token.lock().await.as_deref(), Some("persisted-access"));
+        // A path resource never matches the root resource's record.
+        let path_client =
+            RemoteClient::new(oauth_endpoint("https://hub.example/api", store)).unwrap();
+        assert!(!path_client.load_stored_session("https://issuer.example").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn store_load_failures_are_distinct_from_absence() {
+        for kind in [
+            crate::TokenStoreErrorKind::Unavailable,
+            crate::TokenStoreErrorKind::Corrupt,
+            crate::TokenStoreErrorKind::Backend,
+        ] {
+            let store = Arc::new(ScriptedStore::default());
+            ScriptedStore::fail(
+                &store.load_error,
+                crate::TokenStoreError { kind, message: "scripted".to_owned() },
+            );
+            let client =
+                RemoteClient::new(oauth_endpoint("https://hub.example/api", store)).unwrap();
+            match client.load_stored_session("https://issuer.example").await {
+                Err(RemoteError::CredentialStore { kind: reported, .. }) => {
+                    assert_eq!(reported, kind)
+                }
+                other => panic!("expected a {kind} credential-store error, got {other:?}"),
+            }
+        }
+        let absent = RemoteClient::new(oauth_endpoint(
+            "https://hub.example/api",
+            Arc::new(ScriptedStore::default()),
+        ))
+        .unwrap();
+        assert!(!absent.load_stored_session("https://issuer.example").await.unwrap());
+        // The unavailable store never reports "no credential".
+        let unavailable = RemoteClient::new(oauth_endpoint(
+            "https://hub.example/api",
+            Arc::new(crate::UnavailableTokenStore),
+        ))
+        .unwrap();
+        assert!(matches!(
+            unavailable.load_stored_session("https://issuer.example").await,
+            Err(RemoteError::CredentialStore { kind: crate::TokenStoreErrorKind::Unavailable, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn logout_reports_removed_absent_and_delete_failure() {
+        let store = Arc::new(ScriptedStore::default());
+        store
+            .save(oauth_session("https://hub.example/api", "https://issuer.example", "access"))
+            .await
+            .unwrap();
+        let client =
+            RemoteClient::new(oauth_endpoint("https://hub.example/api", store.clone())).unwrap();
+        assert!(client.load_stored_session("https://issuer.example").await.unwrap());
+        let removed = client.logout(None, None).await.unwrap();
+        assert_eq!(removed.store, crate::ClearOutcome::Removed);
+        assert_eq!(removed.revocation, RevocationOutcome::Unsupported);
+        let absent = client.logout(Some("https://issuer.example"), None).await.unwrap();
+        assert_eq!(
+            absent,
+            LogoutOutcome {
+                store: crate::ClearOutcome::Absent,
+                revocation: RevocationOutcome::NoCredential
+            }
+        );
+
+        store
+            .save(oauth_session("https://hub.example/api", "https://issuer.example", "access"))
+            .await
+            .unwrap();
+        assert!(client.load_stored_session("https://issuer.example").await.unwrap());
+        ScriptedStore::fail(
+            &store.clear_error,
+            crate::TokenStoreError::backend("scripted delete failure"),
+        );
+        match client.logout(None, None).await {
+            Err(RemoteError::CredentialStore {
+                kind: crate::TokenStoreErrorKind::Backend, ..
+            }) => {}
+            other => panic!("expected a propagated delete failure, got {other:?}"),
+        }
+        assert!(
+            client.token.lock().await.is_none(),
+            "the in-process grant is dropped even when deletion fails"
+        );
+        assert!(client.oauth_session.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_is_reported_and_the_new_grant_stays_in_process() {
+        let store = Arc::new(ScriptedStore::default());
+        store
+            .save(oauth_session("https://hub.example/", "https://issuer.example", "stale-access"))
+            .await
+            .unwrap();
+        let client =
+            RemoteClient::new(oauth_endpoint("https://hub.example", store.clone())).unwrap();
+        assert!(client.load_stored_session("https://issuer.example").await.unwrap());
+        ScriptedStore::fail(
+            &store.save_error,
+            crate::TokenStoreError::unavailable("scripted keychain locked"),
+        );
+        let _guard = client.login_lock.lock().await;
+        let error = client
+            .commit_locked(oauth_session(
+                "https://hub.example/",
+                "https://issuer.example",
+                "fresh-access",
+            ))
+            .await
+            .expect_err("save failure must be explicit");
+        assert!(matches!(
+            error,
+            RemoteError::CredentialStore { kind: crate::TokenStoreErrorKind::Unavailable, .. }
+        ));
+        assert_eq!(client.token.lock().await.as_deref(), Some("fresh-access"));
+        assert_eq!(
+            stored_token(&store.inner, "https://hub.example/", "https://issuer.example")
+                .await
+                .as_deref(),
+            Some("stale-access")
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpired_rejected_grant_refreshes_once_using_the_grant_issuer_without_challenge_metadata()
+     {
+        let (mock, task) = MockIssuer::start(false).await;
+        let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
+        // Unexpired locally, but the resource no longer accepts it; no trusted metadata yet and
+        // the challenge carries no resource_metadata.
+        let client = signed_in_client(&mock, store.clone(), "server-rejected").await;
+        let info = client.info().await.expect("recovered read");
+        assert_eq!(info.federation_api_version, 1);
+        assert_eq!(
+            mock.info_hits.load(Ordering::SeqCst),
+            2,
+            "one rejected attempt and exactly one retry"
+        );
+        assert_eq!(mock.token_hits.load(Ordering::SeqCst), 1, "exactly one forced refresh");
+        assert_eq!(
+            stored_token(store.as_ref(), &mock.resource(), &mock.base).await.as_deref(),
+            Some("refreshed-1")
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn persistent_rejection_is_bounded_to_one_refresh_and_one_retry() {
+        let (mock, task) = MockIssuer::start(true).await;
+        // The issuer rotates happily, but the resource never accepts anything.
+        let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
+        let client = signed_in_client(&mock, store, "server-rejected").await;
+        mock.reject_all.store(true, Ordering::SeqCst);
+        let refused = client.info().await;
+        assert!(matches!(
+            refused,
+            Err(RemoteError::Unauthorized { .. }) | Err(RemoteError::AuthenticationRequired { .. })
+        ));
+        assert_eq!(mock.info_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(mock.token_hits.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn grant_rotated_by_another_process_is_adopted_without_refreshing() {
+        let (mock, task) = MockIssuer::start(true).await;
+        let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
+        let client = signed_in_client(&mock, store.clone(), "old-access").await;
+        // Another process logged in again and replaced the stored grant.
+        store
+            .save(oauth_session(&mock.resource(), &mock.base, "other-process-access"))
+            .await
+            .unwrap();
+        mock.accept("other-process-access");
+        client.info().await.expect("adopted grant");
+        assert_eq!(
+            mock.token_hits.load(Ordering::SeqCst),
+            0,
+            "a rotated grant must not be refreshed again"
+        );
+        assert_eq!(client.token.lock().await.as_deref(), Some("other-process-access"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn grant_removed_by_another_process_is_forgotten_not_refreshed() {
+        let (mock, task) = MockIssuer::start(true).await;
+        let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
+        let client = signed_in_client(&mock, store.clone(), "old-access").await;
+        assert_eq!(
+            store.clear(&mock.resource(), &mock.base, "test-client", Some("test-account")).await,
+            Ok(crate::ClearOutcome::Removed)
+        );
+        assert!(matches!(client.info().await, Err(RemoteError::AuthenticationRequired { .. })));
+        assert_eq!(mock.token_hits.load(Ordering::SeqCst), 0);
+        assert!(client.oauth_session.lock().await.is_none());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rejected_refresh_clears_the_grant_but_a_transient_failure_keeps_it() {
+        let (mock, task) = MockIssuer::start(true).await;
+        let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
+        let client = signed_in_client(&mock, store.clone(), "server-rejected").await;
+
+        mock.set_refresh(RefreshBehaviour::Unavailable);
+        assert!(
+            matches!(client.info().await, Err(RemoteError::Unreachable { .. })),
+            "an unreachable issuer is not a sign-out"
+        );
+        assert_eq!(
+            stored_token(store.as_ref(), &mock.resource(), &mock.base).await.as_deref(),
+            Some("server-rejected")
+        );
+        assert!(client.oauth_session.lock().await.is_some());
+
+        mock.set_refresh(RefreshBehaviour::Reject);
+        assert!(matches!(client.info().await, Err(RemoteError::AuthenticationRequired { .. })));
+        assert_eq!(stored_token(store.as_ref(), &mock.resource(), &mock.base).await, None);
+        assert!(client.token.lock().await.is_none());
+        assert!(client.oauth_session.lock().await.is_none());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rejected_mutation_is_recovered_and_replayed_once_with_the_same_operation() {
+        let (mock, task) = MockIssuer::start(true).await;
+        let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
+        let client = signed_in_client(&mock, store, "old-access").await;
+        // Reads still accept the old token; the write path rejects it with a definite 401.
+        mock.accept("old-access");
+        mock.mutation_rejects.lock().expect("rejects").push("old-access".to_owned());
+        let mut request = oauth_add_request();
+        request.operation_id = Some("op-stable-1".to_owned());
+        request.drawer_id = Some("drawer-1".to_owned());
+
+        let response = client.add_drawer(request).await.expect("replayed mutation succeeds");
+        assert_eq!(response.drawer_id.as_deref(), Some("drawer-1"));
+        assert_eq!(
+            mock.mutation_hits.load(Ordering::SeqCst),
+            2,
+            "one rejected attempt and one replay"
+        );
+        assert_eq!(mock.token_hits.load(Ordering::SeqCst), 1, "one forced refresh");
+        let requests = mock.mutation_requests.lock().expect("requests").clone();
+        assert_eq!(requests[0].0.as_deref(), Some("old-access"));
+        assert_eq!(requests[1].0.as_deref(), Some("refreshed-1"));
+        assert_eq!(requests[0].1, requests[1].1, "the replay carries the identical body");
+        assert_eq!(requests[1].1["operation_id"], "op-stable-1", "the operation id is preserved");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rejected_revisioned_write_is_replayed_once_with_the_same_body() {
+        let (mock, task) = MockIssuer::start(true).await;
+        let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
+        let client = signed_in_client(&mock, store, "old-access").await;
+        mock.accept("old-access");
+        mock.mutation_rejects.lock().expect("rejects").push("old-access".to_owned());
+        let lease = TaskLeaseRequest {
+            expected_revision: 3,
+            lease_seconds: 60,
+            worker: Some("worker".to_owned()),
+        };
+
+        let outcome =
+            client.coordination_task_claim("task-1", lease).await.expect("replayed claim");
+        assert!(matches!(outcome, RemoteRevisionedWrite::Conflict { actual_revision: Some(7) }));
+        assert_eq!(mock.mutation_hits.load(Ordering::SeqCst), 2);
+        let requests = mock.mutation_requests.lock().expect("requests").clone();
+        assert_eq!(requests[0].1, requests[1].1);
+        assert_eq!(requests[1].1["expected_revision"], 3);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn persistently_rejected_mutation_is_replayed_at_most_once() {
+        let (mock, task) = MockIssuer::start(true).await;
+        let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
+        let client = signed_in_client(&mock, store, "access").await;
+        mock.accept("access");
+        mock.mutation_reject_all.store(true, Ordering::SeqCst);
+        let result = client.add_drawer(oauth_add_request()).await;
+        assert!(matches!(result, Err(RemoteError::AuthenticationRequired { .. })), "{result:?}");
+        assert_eq!(mock.mutation_hits.load(Ordering::SeqCst), 2, "never more than one replay");
+        assert_eq!(mock.token_hits.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn mutation_with_an_unknown_outcome_is_never_replayed() {
+        let (mock, task) = MockIssuer::start(true).await;
+        let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
+        store
+            .save(oauth_session(&mock.resource(), &mock.base, "access"))
+            .await
+            .expect("seed store");
+        let mut endpoint = oauth_endpoint(&mock.base, store);
+        endpoint.timeout = Duration::from_millis(400);
+        let client = RemoteClient::new(endpoint).expect("client");
+        assert!(client.load_stored_session(&mock.base).await.expect("stored session"));
+        mock.accept("access");
+        client.info().await.expect("handshake");
+        // The write reaches the server but no response arrives before the client times out.
+        mock.mutation_delay_ms.store(1_500, Ordering::SeqCst);
+        let result = client.add_drawer(oauth_add_request()).await;
+        assert!(matches!(result, Err(RemoteError::UnknownOutcome { .. })), "{result:?}");
+        tokio::time::sleep(Duration::from_millis(1_600)).await;
+        assert_eq!(
+            mock.mutation_hits.load(Ordering::SeqCst),
+            1,
+            "an unconfirmed write is not re-sent"
+        );
+        assert_eq!(mock.token_hits.load(Ordering::SeqCst), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn expiring_grant_is_refreshed_before_a_mutation_is_sent() {
+        let (mock, task) = MockIssuer::start(true).await;
+        let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
+        let mut expiring = oauth_session(&mock.resource(), &mock.base, "expiring");
+        expiring.expires_at = Some(crate::oauth::now_seconds());
+        store.save(expiring).await.unwrap();
+        let client = RemoteClient::new(oauth_endpoint(&mock.base, store)).unwrap();
+        client
+            .discover(&format!("{}/.well-known/oauth-protected-resource", mock.base))
+            .await
+            .expect("trusted discovery");
+        assert!(client.load_stored_session(&mock.base).await.unwrap());
+        mock.accept("expiring");
+        let _ = client.add_drawer(oauth_add_request()).await;
+        assert_eq!(
+            mock.token_hits.load(Ordering::SeqCst),
+            1,
+            "the refresh happens before the request is sent"
+        );
+        assert_eq!(client.token.lock().await.as_deref(), Some("refreshed-1"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn delayed_recovery_racing_logout_cannot_resurrect_the_session() {
+        let (mock, task) = MockIssuer::start(true).await;
+        let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
+        let client = Arc::new(signed_in_client(&mock, store.clone(), "server-rejected").await);
+
+        // Hold recovery inside discovery: it has observed the 401 but not yet reloaded.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *mock.metadata_gate.lock().expect("gate") = Some(gate.clone());
+        let reader = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.info().await })
+        };
+        mock.metadata_entered.notified().await;
+
+        // Logout completes while recovery is suspended.
+        let outcome = client.logout(None, None).await.expect("logout");
+        assert_eq!(outcome.store, crate::ClearOutcome::Removed);
+        // A stale copy reappears in the store (for example a slow concurrent writer); recovery
+        // must still not adopt or refresh it.
+        store.save(oauth_session(&mock.resource(), &mock.base, "stale-copy")).await.unwrap();
+        mock.accept("stale-copy");
+        *mock.metadata_gate.lock().expect("gate") = None;
+        gate.notify_one();
+
+        let result = reader.await.expect("reader task");
+        assert!(matches!(result, Err(RemoteError::AuthenticationRequired { .. })), "{result:?}");
+        assert_eq!(mock.token_hits.load(Ordering::SeqCst), 0, "no refresh after logout");
+        assert!(client.token.lock().await.is_none());
+        assert!(client.oauth_session.lock().await.is_none());
+        // Later background reads stay signed out too.
+        assert!(client.info().await.is_err());
+        assert_eq!(
+            mock.bearers.lock().expect("bearers").last().cloned(),
+            Some(None),
+            "no credential is sent after logout"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_delete_on_logout_does_not_let_recovery_reload_the_surviving_record() {
+        let (mock, task) = MockIssuer::start(true).await;
+        let store = Arc::new(ScriptedStore::default());
+        let client = signed_in_client(&mock, store.clone(), "access").await;
+        ScriptedStore::fail(
+            &store.clear_error,
+            crate::TokenStoreError::backend("scripted delete failure"),
+        );
+        assert!(matches!(
+            client.logout(None, Some(&mock.metadata())).await,
+            Err(RemoteError::CredentialStore { .. })
+        ));
+        assert_eq!(
+            mock.revoke_hits.load(Ordering::SeqCst),
+            1,
+            "revocation is attempted before the local delete"
+        );
+        mock.accept("access");
+        assert!(
+            client.info().await.is_err(),
+            "the surviving record must not be reloaded by background recovery"
+        );
+        assert_eq!(mock.token_hits.load(Ordering::SeqCst), 0);
+        // An explicit load is a deliberate user action and does reload it.
+        assert!(client.load_stored_session(&mock.base).await.unwrap());
+        client.info().await.expect("explicitly reloaded grant");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn logout_clears_the_exact_resource_record_for_both_slash_forms() {
+        let store: Arc<dyn TokenStore> = Arc::new(crate::InMemoryTokenStore::default());
+        store
+            .save(oauth_session("https://hub.example/api", "https://issuer.example", "no-slash"))
+            .await
+            .unwrap();
+        store
+            .save(oauth_session("https://hub.example/api/", "https://issuer.example", "slash"))
+            .await
+            .unwrap();
+
+        let client =
+            RemoteClient::new(oauth_endpoint("https://hub.example/api", store.clone())).unwrap();
+        assert_eq!(client.oauth_resource(), "https://hub.example/api");
+        assert_eq!(
+            client.base_url(),
+            "https://hub.example/api/",
+            "transport base is normalized separately"
+        );
+        let outcome = client.logout(Some("https://issuer.example"), None).await.unwrap();
+        assert_eq!(outcome.store, crate::ClearOutcome::Removed);
+        assert_eq!(
+            stored_token(store.as_ref(), "https://hub.example/api", "https://issuer.example").await,
+            None
+        );
+        assert_eq!(
+            stored_token(store.as_ref(), "https://hub.example/api/", "https://issuer.example")
+                .await
+                .as_deref(),
+            Some("slash")
+        );
+
+        let slash_client =
+            RemoteClient::new(oauth_endpoint("https://hub.example/api/", store.clone())).unwrap();
+        assert_eq!(slash_client.oauth_resource(), "https://hub.example/api/");
+        assert_eq!(
+            slash_client.logout(Some("https://issuer.example"), None).await.unwrap().store,
+            crate::ClearOutcome::Removed
+        );
+        assert_eq!(
+            stored_token(store.as_ref(), "https://hub.example/api/", "https://issuer.example")
+                .await,
+            None
+        );
     }
 }

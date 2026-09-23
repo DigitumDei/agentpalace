@@ -9,6 +9,38 @@ This is the frozen command surface for `agentpalace` v1.
 
 ## Commands
 
+### `auth login|logout`
+
+OAuth is opt-in per configured remote. `auth login --remote <NAME>
+--resource-metadata <URL> [--mode browser|device|auto]` performs
+protected-resource and authorization-server discovery, then selects the
+configured or explicitly requested login mode. `browser` uses one native-client
+PKCE flow; `device` uses RFC 8628 device authorization when the issuer advertises it; `auto` chooses the
+browser/callback path when usable and otherwise selects device authorization.
+The mode is selected once per foreground login, so automatic selection does not
+repeatedly launch a browser after the callback path is known to be unavailable.
+The default configured mode is `auto`. The CLI stores grants through the
+platform OS credential store, or only in memory when `allow_in_memory` is
+explicitly enabled. Background and MCP requests never
+open a browser; they return an actionable authentication-required result.
+
+`auth logout --remote <NAME> --issuer <ISSUER>` removes the stored grant for
+that issuer and the remote's exact OAuth resource — the configured `url` as
+written, so `https://hub.example/api` and `https://hub.example/api/` are
+different grants (the REST transport's trailing-slash normalization is not used
+for credential lookup). Before deleting, it fetches the issuer's RFC 8414
+metadata, validates it against the remote, and revokes the grant at the
+advertised revocation endpoint; revocation is best effort and the local delete
+happens regardless. Output reports both outcomes: `OAuth session cleared.` or
+`No stored OAuth session matched this remote and issuer; nothing was cleared.`,
+followed by whether the grant was revoked, not revoked (no validated revocation
+endpoint), or revocation failed.
+
+Both subcommands exit `0` on success and `1` when the operation fails,
+including when the credential store is unavailable, holds a corrupt record, or
+reports a backend failure — a store failure is never reported as "no session".
+Credentials and tokens are never command-line arguments or config values.
+
 ### `migrate`
 
 Offline MemPalace upgrade, also invoked by both installers. Requires

@@ -1,9 +1,8 @@
 # Google OAuth setup for the local demo
 
-Status: preparation guide, 2026-09-17. The Docker demo is still a proposal.
-The localhost URL and callback below are the proposed package defaults; confirm
-them against the implemented example before creating credentials. No Google
-Cloud resources have been created by this work.
+Status: tester-owned setup guide, 2026-09-21. The gateway supports the
+documented loopback protocol endpoints; no Google Cloud resources have been
+created by this work.
 
 The tester performs this setup in their own Google Cloud project. It provides
 Google sign-in for containers running on their machine; it does not deploy
@@ -34,6 +33,12 @@ Register this exact proposed authorized redirect URI:
 http://localhost:8080/auth/google/callback
 ~~~
 
+Also register the device-verification callback used by headless clients:
+
+~~~text
+http://localhost:8080/auth/google/device-callback
+~~~
+
 Save the client ID and client secret privately. Google supports localhost HTTP
 redirects for testing; the registered scheme, host, port, and path must match
 the gateway's callback.
@@ -46,13 +51,18 @@ Both desktop and device-code login use this same gateway-to-Google web login;
 do not create a Google TV/device client.
 
 The proposed gateway uses server-side redirects, so browser JavaScript origins
-are not needed for this flow. If implementation changes that, update this guide
-to match before use.
+are not needed for this flow. The gateway's `GoogleOidcVerifierAdapter` (wired
+in by the hosting layer, which is not yet packaged) exchanges Google's
+authorization code server-side at the callback that received it and validates
+the returned ID token's RS256 signature against Google's published keys, plus
+its issuer, audience, expiry, verified-email flag, and nonce, after the hub has
+checked state; only then is a hub code issued. If implementation changes that,
+update this guide to match before use.
 
 ## 3. Supply the tester's local settings
 
-The package will provide an example environment/configuration file with these
-inputs (exact variable names will be finalized with implementation):
+The gateway configuration supplies these inputs (the package does not provide
+credentials or a maintainer-owned account):
 
 | Setting | Value |
 |---|---|
@@ -60,7 +70,7 @@ inputs (exact variable names will be finalized with implementation):
 | Google client secret | From that application; local secret, never committed |
 | Initial admin email | The Google account you will use to test |
 | Local hub origin | http://localhost:8080 |
-| Google callback | http://localhost:8080/auth/google/callback |
+| Google callback | http://localhost:8080/auth/google/callback and http://localhost:8080/auth/google/device-callback |
 
 Bootstrap the initial admin into the editable allowlist once. For role testing,
 add your other test emails as write or readonly. Google's app/test-user settings
@@ -98,6 +108,13 @@ test by publishing the container on every network interface.
 For an SSH-hosted client, device authorization remains supported when the hub
 is reachable from that client and the browser. Exposing or tunneling a remotely
 hosted hub is outside this local package's required setup.
+
+For real-browser validation, first confirm Docker Desktop is running, WSL can
+resolve and reach the configured hub origin, and the browser can reach that same
+origin. Keep the demo loopback-only. Run CLI login once with `--mode browser`,
+make an authenticated read, then repeat with `--mode device` from WSL or a
+headless client. These are instructions only; this repository does not claim
+live Google-account or Google-resource evidence.
 
 ## Troubleshooting
 

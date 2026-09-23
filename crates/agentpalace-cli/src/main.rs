@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use agentpalace_config::{
-    ConfigFileV1, ConfigLoader, AgentPalaceConfig, ProjectConfig, ProjectRegistryEntryV1,
-    ProjectRoomConfig, ResolvedPaths, RouteMode, RouteQuery, WriteTarget, build_runtime,
-    resolve_route,
+    AgentPalaceConfig, ConfigFileV1, ConfigLoader, OAuthLoginMode, ProjectConfig,
+    ProjectRegistryEntryV1, ProjectRoomConfig, ResolvedPaths, RouteMode, RouteQuery, WriteTarget,
+    build_runtime, resolve_route,
 };
 use agentpalace_core::{EmbeddingProfile, RoomId, SearchQuery, WingId};
 use agentpalace_embeddings::{
@@ -25,7 +25,9 @@ use agentpalace_ingest::{
     prepare_project_batch_with_config, project_branch_source_prefix,
     project_canonical_source_prefix, project_root_relative, wing_kind_source_prefix,
 };
-use agentpalace_remote::{RemoteApi, RemoteClient, RemoteEndpoint, RemoteError};
+use agentpalace_remote::{
+    OAuthConfig, RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, configured_token_store,
+};
 use agentpalace_search::{Layer1Config, SearchRuntime, SearchRuntimePolicy, WakeUpRequest};
 use agentpalace_server::{TokenRegistry, build_router};
 use agentpalace_storage::{
@@ -177,6 +179,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Authorize or forget a configured remote OAuth session.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
     /// Detect rooms from your project's safe source directories.
     Init {
         dir: PathBuf,
@@ -378,6 +385,47 @@ enum Commands {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum AuthCommands {
+    /// Discover metadata from an RFC 9728 resource_metadata URL and start OAuth login.
+    Login {
+        #[arg(long)]
+        remote: String,
+        #[arg(long, value_name = "URL")]
+        resource_metadata: String,
+        /// Login transport; defaults to the remote's configured mode.
+        #[arg(long, value_enum)]
+        mode: Option<CliOAuthLoginMode>,
+    },
+    /// Clear the locally stored grant. Revocation is issuer-specific and is performed by the
+    /// library when metadata is supplied by an embedding application.
+    Logout {
+        #[arg(long)]
+        remote: String,
+        /// Issuer URL used to identify the stored grant.
+        #[arg(long)]
+        issuer: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum CliOAuthLoginMode {
+    Browser,
+    Device,
+    Auto,
+}
+
+impl From<CliOAuthLoginMode> for OAuthLoginMode {
+    fn from(mode: CliOAuthLoginMode) -> Self {
+        match mode {
+            CliOAuthLoginMode::Browser => Self::Browser,
+            CliOAuthLoginMode::Device => Self::Device,
+            CliOAuthLoginMode::Auto => Self::Auto,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum CliMode {
     Projects,
@@ -412,16 +460,20 @@ impl CliPruneKind {
 #[derive(Debug, Clone)]
 struct CliContext {
     config_base_dir: Option<PathBuf>,
+    /// Credential store override. Production always uses the platform store selected by
+    /// `configured_token_store`; tests inject a scripted store so they never touch the user's
+    /// real OS keychain.
+    token_store: Option<agentpalace_remote::SharedTokenStore>,
 }
 
 impl CliContext {
     fn production() -> Self {
-        Self { config_base_dir: None }
+        Self { config_base_dir: None, token_store: None }
     }
 
     #[cfg(test)]
     fn for_tests(config_base_dir: PathBuf) -> Self {
-        Self { config_base_dir: Some(config_base_dir) }
+        Self { config_base_dir: Some(config_base_dir), token_store: None }
     }
 }
 
@@ -544,6 +596,7 @@ where
         return Ok(CliOutput::success(render_help()));
     };
     match command {
+        Commands::Auth { command } => execute_auth(command, cli.palace.as_deref(), context),
         Commands::Init { dir, yes, repo_config, project_id } => execute_init(
             &dir,
             yes,
@@ -658,6 +711,96 @@ where
             } else {
                 execute_serve(bind, token_file, cli.palace.as_deref(), context, provider_factory)
             }
+        }
+    }
+}
+
+fn execute_auth(
+    command: AuthCommands,
+    palace_override: Option<&Path>,
+    context: &CliContext,
+) -> Result<CliOutput, clap::Error> {
+    let config = load_runtime_config(palace_override, context).map_err(config_error)?;
+    let (remote_name, operation) = match command {
+        AuthCommands::Login { remote, resource_metadata, mode } => {
+            (remote, AuthOperation::Login(resource_metadata, mode.map(Into::into)))
+        }
+        AuthCommands::Logout { remote, issuer } => (remote, AuthOperation::Logout(issuer)),
+    };
+    let remote = config.federation.remotes.get(&remote_name).ok_or_else(|| {
+        clap::Error::raw(
+            clap::error::ErrorKind::InvalidValue,
+            format!("unknown remote `{remote_name}`"),
+        )
+    })?;
+    if remote.oauth.is_none() {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::InvalidValue,
+            format!("remote `{remote_name}` has no OAuth configuration"),
+        ));
+    }
+    let client = cli_remote_client(context, remote).map_err(|error| {
+        clap::Error::raw(clap::error::ErrorKind::InvalidValue, error.to_string())
+    })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| clap::Error::raw(clap::error::ErrorKind::Io, error.to_string()))?;
+    let volatile = remote.oauth.as_ref().is_some_and(|oauth| oauth.allow_in_memory);
+    Ok(match runtime.block_on(run_auth_operation(&client, operation, volatile)) {
+        Ok(text) => CliOutput::success(text),
+        Err(error) => CliOutput::failure(1, format!("{error}\n")),
+    })
+}
+
+enum AuthOperation {
+    Login(String, Option<OAuthLoginMode>),
+    Logout(String),
+}
+
+/// Run one `auth` operation against a client built by [`cli_remote_client`], so the stored
+/// grant is always addressed by the remote's exact OAuth resource identity.
+async fn run_auth_operation(
+    client: &RemoteClient,
+    operation: AuthOperation,
+    volatile: bool,
+) -> Result<String, RemoteError> {
+    match operation {
+        AuthOperation::Login(resource_metadata, mode) => {
+            client.login_from_challenge_with_mode(&resource_metadata, mode).await?;
+            Ok(if volatile {
+                "OAuth login completed; credentials are held in volatile memory for this process only.\n".to_owned()
+            } else {
+                "OAuth login completed; credentials were stored in the platform credential store.\n"
+                    .to_owned()
+            })
+        }
+        AuthOperation::Logout(issuer) => {
+            // Revocation is best effort and needs validated issuer metadata; the local delete
+            // happens regardless and its outcome (including a store failure) is always reported.
+            let metadata = client.authorization_server_metadata(&issuer).await.ok();
+            let outcome = client.logout(Some(&issuer), metadata.as_ref()).await?;
+            let mut text = match outcome.store {
+                agentpalace_remote::ClearOutcome::Removed => "OAuth session cleared.".to_owned(),
+                agentpalace_remote::ClearOutcome::Absent => {
+                    "No stored OAuth session matched this remote and issuer; nothing was cleared."
+                        .to_owned()
+                }
+            };
+            match outcome.revocation {
+                agentpalace_remote::RevocationOutcome::Revoked => {
+                    text.push_str(" The grant was revoked at the issuer.")
+                }
+                agentpalace_remote::RevocationOutcome::Unsupported => {
+                    text.push_str(" The grant was not revoked at the issuer (no validated revocation endpoint).");
+                }
+                agentpalace_remote::RevocationOutcome::Failed(message) => {
+                    text.push_str(&format!(" Revocation at the issuer failed: {message}."));
+                }
+                agentpalace_remote::RevocationOutcome::NoCredential => {}
+            }
+            text.push('\n');
+            Ok(text)
         }
     }
 }
@@ -1451,6 +1594,7 @@ where
                 &rule,
                 &project_config,
                 Some(&project_id),
+                context,
                 false,
             );
         }
@@ -1701,6 +1845,7 @@ fn execute_remote_mine(
     rule: &agentpalace_config::ResolvedRouteRule,
     project_config: &ProjectConfig,
     project_id: Option<&str>,
+    context: &CliContext,
     dual_write: bool,
 ) -> Result<CliOutput, clap::Error> {
     // `--batch-size N` (N>0) caps files per remote request, letting low-spec
@@ -1799,16 +1944,10 @@ fn execute_remote_mine(
     }
 
     // ── 5. Build the remote client ───────────────────────────────────────────
-    let endpoint = RemoteEndpoint {
-        name: remote_name.to_owned(),
-        base_url: remote_url.clone(),
-        token: resolved_remote.token.clone(),
-        timeout: resolved_remote.timeout,
-    };
-    let client = match RemoteClient::new(endpoint) {
+    let client = match cli_remote_client(context, resolved_remote) {
         Ok(c) => c,
-        Err(e) => {
-            let msg = format!("failed to build remote client for '{}': {e}\n", remote_name);
+        Err(error) => {
+            let msg = format!("failed to build remote client for '{}': {error}\n", remote_name);
             let output = if dual_write {
                 format!("  Remote replication: failed — {msg}")
             } else {
@@ -2599,6 +2738,61 @@ fn load_runtime_config(
     Ok(config)
 }
 
+fn cli_oauth_store(
+    context: &CliContext,
+    allow_in_memory: bool,
+) -> agentpalace_remote::SharedTokenStore {
+    context.token_store.clone().unwrap_or_else(|| configured_token_store(allow_in_memory))
+}
+
+/// Build the one CLI-owned endpoint shape used by every CLI `RemoteClient` path.
+///
+/// Keeping store injection here is important: login and later commands run in separate CLI
+/// processes, so every command must address the same platform credential store. The explicit
+/// in-memory option remains per-process and is intended only for volatile/test use.
+fn cli_remote_endpoint(
+    context: &CliContext,
+    remote: &agentpalace_config::ResolvedRemote,
+) -> RemoteEndpoint {
+    let oauth = match remote.oauth.as_ref() {
+        Some(oauth) => {
+            let token_store = cli_oauth_store(context, oauth.allow_in_memory);
+            Some(OAuthConfig {
+                client_id: oauth.client_id.clone(),
+                account: oauth.account.clone(),
+                allow_in_memory: oauth.allow_in_memory,
+                allow_loopback_demo: oauth.allow_loopback_demo,
+                login_mode: oauth.login_mode,
+                token_store: Some(token_store),
+                interaction: None,
+                login_timeout_seconds: oauth.login_timeout_seconds,
+            })
+        }
+        None => None,
+    };
+
+    RemoteEndpoint {
+        name: remote.name.clone(),
+        base_url: remote.url.clone(),
+        token: remote.token.clone(),
+        oauth,
+        timeout: remote.timeout,
+    }
+}
+
+/// Construct every CLI remote client from the CLI-owned endpoint.
+///
+/// Keeping the `RemoteClient::new` call beside `cli_remote_endpoint` makes it
+/// difficult for a new CLI command to accidentally fall back to the remote
+/// crate's unavailable/default store instead of the initiating process's
+/// configured persistent or explicitly volatile store.
+fn cli_remote_client(
+    context: &CliContext,
+    remote: &agentpalace_config::ResolvedRemote,
+) -> Result<RemoteClient, RemoteError> {
+    RemoteClient::new(cli_remote_endpoint(context, remote))
+}
+
 fn write_global_config_override(
     paths: &ResolvedPaths,
     palace_path: &Path,
@@ -2976,14 +3170,273 @@ fn id_error(error: agentpalace_core::IdError) -> clap::Error {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use agentpalace_core::EmbeddingProfileMetadata;
     use agentpalace_embeddings::{
         EmbeddingRequest, EmbeddingResponse, StartupValidation, StartupValidationStatus,
     };
+    use std::sync::Arc;
+
+    use agentpalace_remote::{OAuthSession, TokenStore};
     use agentpalace_storage::{MaintenanceLeaseStore, StorageLayout};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    #[test]
+    fn auth_login_accepts_explicit_provider_neutral_mode() {
+        let cli = Cli::try_parse_from([
+            "agentpalace",
+            "auth",
+            "login",
+            "--remote",
+            "demo",
+            "--resource-metadata",
+            "https://hub.example/.well-known/oauth-protected-resource",
+            "--mode",
+            "device",
+        ])
+        .expect("auth login should parse");
+        match cli.command {
+            Some(Commands::Auth {
+                command: AuthCommands::Login { mode: Some(CliOAuthLoginMode::Device), .. },
+            }) => {}
+            _ => panic!("expected explicit device login mode"),
+        }
+    }
+
+    fn oauth_test_remote(allow_in_memory: bool) -> agentpalace_config::ResolvedRemote {
+        agentpalace_config::ResolvedRemote {
+            name: "demo".to_owned(),
+            url: "https://hub.example".to_owned(),
+            token: None,
+            oauth: Some(agentpalace_config::ResolvedOAuthConfig {
+                client_id: "cli-test".to_owned(),
+                account: Some("owner".to_owned()),
+                allow_in_memory,
+                allow_loopback_demo: false,
+                login_mode: OAuthLoginMode::Auto,
+                login_timeout_seconds: 300,
+            }),
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn test_oauth_session() -> OAuthSession {
+        OAuthSession {
+            access_token: "access-token".to_owned(),
+            refresh_token: Some("refresh-token".to_owned()),
+            expires_at: Some(123),
+            resource: "https://hub.example".to_owned(),
+            issuer: "https://issuer.example".to_owned(),
+            client_id: "cli-test".to_owned(),
+            account: Some("owner".to_owned()),
+        }
+    }
+
+    #[test]
+    fn cli_endpoint_selects_the_platform_keychain_without_touching_it() {
+        let config_root = temp_config_root("oauth-store");
+        let context = CliContext::for_tests(config_root.clone());
+        let endpoint = cli_remote_endpoint(&context, &oauth_test_remote(false));
+        let store = endpoint.oauth.expect("OAuth remote").token_store.expect("injected store");
+        // Only the backend choice is asserted: this test never reads or writes the user's
+        // real credential store.
+        let backend = format!("{store:?}");
+        if cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux")) {
+            assert!(backend.contains("KeyringTokenStore"), "{backend}");
+        } else {
+            assert!(backend.contains("UnavailableTokenStore"), "{backend}");
+        }
+        assert!(
+            !config_root.exists(),
+            "building a remote client must not create config or credential files"
+        );
+    }
+
+    fn scripted_context(store: Arc<agentpalace_remote::InMemoryTokenStore>) -> CliContext {
+        let mut context = CliContext::for_tests(temp_config_root("oauth-scripted"));
+        context.token_store = Some(store);
+        context
+    }
+
+    fn path_remote(url: &str) -> agentpalace_config::ResolvedRemote {
+        agentpalace_config::ResolvedRemote { url: url.to_owned(), ..oauth_test_remote(false) }
+    }
+
+    fn path_session(resource: &str, access: &str) -> OAuthSession {
+        OAuthSession {
+            resource: resource.to_owned(),
+            access_token: access.to_owned(),
+            ..test_oauth_session()
+        }
+    }
+
+    #[test]
+    fn auth_logout_clears_only_the_exact_resource_identity() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let store = Arc::new(agentpalace_remote::InMemoryTokenStore::default());
+        runtime.block_on(store.save(path_session("https://hub.example/api", "no-slash"))).unwrap();
+        runtime.block_on(store.save(path_session("https://hub.example/api/", "slash"))).unwrap();
+        let context = scripted_context(store.clone());
+        let stored = |resource: &str| {
+            runtime
+                .block_on(store.load(resource, "https://issuer.example", "cli-test", Some("owner")))
+                .expect("scripted store load")
+                .map(|session| session.access_token)
+        };
+
+        let client = cli_remote_client(&context, &path_remote("https://hub.example/api")).unwrap();
+        let text = runtime
+            .block_on(run_auth_operation(
+                &client,
+                AuthOperation::Logout("https://issuer.example".to_owned()),
+                false,
+            ))
+            .unwrap();
+        assert!(text.starts_with("OAuth session cleared."), "{text}");
+        assert_eq!(stored("https://hub.example/api"), None);
+        assert_eq!(
+            stored("https://hub.example/api/").as_deref(),
+            Some("slash"),
+            "the slash resource is a different grant"
+        );
+
+        let again = runtime
+            .block_on(run_auth_operation(
+                &client,
+                AuthOperation::Logout("https://issuer.example".to_owned()),
+                false,
+            ))
+            .unwrap();
+        assert!(again.starts_with("No stored OAuth session matched"), "{again}");
+
+        let slash_client =
+            cli_remote_client(&context, &path_remote("https://hub.example/api/")).unwrap();
+        let text = runtime
+            .block_on(run_auth_operation(
+                &slash_client,
+                AuthOperation::Logout("https://issuer.example".to_owned()),
+                false,
+            ))
+            .unwrap();
+        assert!(text.starts_with("OAuth session cleared."), "{text}");
+        assert_eq!(stored("https://hub.example/api/"), None);
+    }
+
+    #[test]
+    fn auth_logout_reports_an_unavailable_credential_store_as_a_failure() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut context = CliContext::for_tests(temp_config_root("oauth-unavailable"));
+        context.token_store = Some(Arc::new(agentpalace_remote::UnavailableTokenStore));
+        let client = cli_remote_client(&context, &path_remote("https://hub.example/api")).unwrap();
+        let error = runtime
+            .block_on(run_auth_operation(
+                &client,
+                AuthOperation::Logout("https://issuer.example".to_owned()),
+                false,
+            ))
+            .expect_err("an unavailable store is not 'nothing to clear'");
+        assert!(
+            matches!(
+                error,
+                RemoteError::CredentialStore {
+                    kind: agentpalace_remote::TokenStoreErrorKind::Unavailable,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cli_endpoint_keeps_explicit_in_memory_store_volatile() {
+        let config_root = temp_config_root("oauth-memory");
+        let context = CliContext::for_tests(config_root.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let session = test_oauth_session();
+
+        let first = cli_remote_endpoint(&context, &oauth_test_remote(true));
+        let first_store = first.oauth.unwrap().token_store.unwrap();
+        runtime.block_on(first_store.save(session.clone())).unwrap();
+
+        let second = cli_remote_endpoint(&context, &oauth_test_remote(true));
+        let second_store = second.oauth.unwrap().token_store.unwrap();
+        assert!(
+            runtime
+                .block_on(second_store.load(
+                    &session.resource,
+                    &session.issuer,
+                    &session.client_id,
+                    session.account.as_deref(),
+                ))
+                .expect("volatile load")
+                .is_none()
+        );
+        assert!(!config_root.join("oauth_tokens.json").exists());
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn cli_endpoint_injects_store_without_changing_oauth_policy() {
+        let config_root = temp_config_root("oauth-policy");
+        let context = CliContext::for_tests(config_root.clone());
+        let remote = oauth_test_remote(false);
+
+        let endpoint = cli_remote_endpoint(&context, &remote);
+        let oauth = endpoint.oauth.expect("OAuth remotes retain OAuth configuration");
+        assert_eq!(oauth.client_id, "cli-test");
+        assert_eq!(oauth.account.as_deref(), Some("owner"));
+        assert!(!oauth.allow_in_memory);
+        assert!(!oauth.allow_loopback_demo);
+        assert_eq!(oauth.login_mode, OAuthLoginMode::Auto);
+        assert_eq!(oauth.login_timeout_seconds, 300);
+        assert!(oauth.token_store.is_some(), "CLI must inject its initiating-process store");
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn cli_endpoint_preserves_static_bearer_and_offline_defaults() {
+        let config_root = temp_config_root("static-remote");
+        let context = CliContext::for_tests(config_root.clone());
+        let remote = agentpalace_config::ResolvedRemote {
+            name: "offline".to_owned(),
+            url: "https://hub.example".to_owned(),
+            token: Some("static-token".to_owned()),
+            oauth: None,
+            timeout: Duration::from_secs(5),
+        };
+
+        let endpoint = cli_remote_endpoint(&context, &remote);
+        assert_eq!(endpoint.name, remote.name);
+        assert_eq!(endpoint.base_url, remote.url);
+        assert_eq!(endpoint.token, remote.token);
+        assert!(endpoint.oauth.is_none(), "non-OAuth remotes must not receive a token store");
+        assert!(!config_root.join("oauth_tokens.json").exists());
+        remove_dir_all_if_exists(&config_root);
+    }
+
+    #[test]
+    fn cli_remote_client_constructs_oauth_and_static_paths_through_shared_builder() {
+        let config_root = temp_config_root("client-builder");
+        let context = CliContext::for_tests(config_root.clone());
+
+        let oauth_client = cli_remote_client(&context, &oauth_test_remote(false)).unwrap();
+        assert_eq!(oauth_client.base_url(), "https://hub.example/");
+
+        let static_remote = agentpalace_config::ResolvedRemote {
+            name: "offline".to_owned(),
+            url: "https://hub.example".to_owned(),
+            token: Some("static-token".to_owned()),
+            oauth: None,
+            timeout: Duration::from_secs(5),
+        };
+        let static_client = cli_remote_client(&context, &static_remote).unwrap();
+        assert_eq!(static_client.base_url(), "https://hub.example/");
+        assert!(!config_root.join("oauth_tokens.json").exists());
+        remove_dir_all_if_exists(&config_root);
+    }
 
     #[derive(Debug, Clone)]
     struct StubProvider {

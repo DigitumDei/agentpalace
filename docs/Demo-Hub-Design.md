@@ -1,8 +1,11 @@
 # Demo hub design
 
-Status: proposal, 2026-09-17. The hub, API examples, and new provenance fields
-below are not implemented. The accompanying release-series change starts 0.2;
-it does not mean the demo has shipped or AgentPalace is ready for 1.0.
+Status: implementation in progress, 2026-09-22. The gateway protocol slice,
+including the Google ID-token verifier adapter, is implemented in
+`agentpalace-demo-hub` and exercised end to end against a mock provider. The
+hosting binary does not yet start a listener, grants are held in memory, and
+no live Google sign-in has been verified. The demo has not shipped and
+AgentPalace is not ready for 1.0.
 
 A tester supplies their own Google OAuth credentials and admin email, starts
 the Docker example, and connects a local palace. Public hosting, retention,
@@ -185,6 +188,15 @@ unavailable, provide the device-code flow below without repeatedly launching
 browsers. An unattended agent surfaces the user-facing login action; it does
 not approve its own grant.
 
+The shared client exposes `login_mode` as `browser`, `device`, or `auto` (default
+`auto`), and `auth login` accepts the same values through `--mode`. The command
+starts from the protected-resource `resource_metadata` URL in the authentication
+challenge; it does not discover from an unrelated hub URL. An explicit mode is
+honored once. Automatic mode makes one browser/callback usability decision and
+selects device authorization when that path is unavailable, so a headless or WSL
+client does not repeatedly launch a browser. Bearer-token remotes and offline
+defaults remain unchanged.
+
 ### Device-code login for WSL, SSH, and headless clients
 
 Device authorization is also a **demo launch requirement**. Offer normal
@@ -229,6 +241,14 @@ Reuse the same token storage, refresh, revocation, and retry rules for both
 flows. Tokens belong to the initiating Linux/WSL process, not the browser's
 Windows account. Device login does not imply a Linux credential store is
 available: retain the explicit secure-store/in-memory behavior below.
+The CLI and background federation use the platform OS credential store; embedding
+applications may inject another secure backend. If that backend is unavailable,
+the operation reports the unavailable outcome (distinct from a corrupt record,
+a backend failure, or no stored grant). `allow_in_memory` remains an explicit
+volatile outcome and is never selected implicitly. After recovering from a
+definite 401, the implemented client re-sends the identical request once —
+reads and mutations alike, a mutation keeping its operation ID and body — and
+never replays a mutation whose outcome is unknown.
 
 ### Tokens, permissions, and retries
 

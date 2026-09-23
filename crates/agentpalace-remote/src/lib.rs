@@ -18,6 +18,7 @@
 //!     name: "friend-palace".to_owned(),
 //!     base_url: "https://palace.example".to_owned(),
 //!     token: Some("secret-token".to_owned()),
+//!     oauth: None,
 //!     timeout: DEFAULT_TIMEOUT,
 //! };
 //! let client = RemoteClient::new(endpoint)?;
@@ -29,9 +30,33 @@
 
 mod client;
 mod error;
+mod oauth;
 
+pub use agentpalace_config::OAuthLoginMode;
 pub use client::RemoteClient;
+pub use client::{LogoutOutcome, RevocationOutcome};
 pub use error::{RemoteError, Result};
+pub use oauth::{
+    AuthorizationServerMetadata, ClearOutcome, FileTokenStore, InMemoryTokenStore,
+    KeyringTokenStore, LoginInteraction, OAuthConfig, OAuthSession, ProtectedResourceMetadata,
+    SharedTokenStore, SystemLoginInteraction, TokenEndpointFailure, TokenStore, TokenStoreError,
+    TokenStoreErrorKind, UnavailableTokenStore, authorization_url, browser_callback_usable,
+    browser_login, device_login, discover_metadata, fetch_authorization_server_metadata,
+    new_pkce_pair, new_state, refresh, resource_key, revoke, select_login_mode,
+    validate_callback_state, validate_metadata, validate_oauth_url, well_known_url,
+};
+
+/// Construct the shared secure credential backend used by foreground and background clients.
+pub fn configured_token_store(allow_in_memory: bool) -> SharedTokenStore {
+    if allow_in_memory {
+        return std::sync::Arc::new(InMemoryTokenStore::default());
+    }
+    if cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux")) {
+        std::sync::Arc::new(KeyringTokenStore::new("agentpalace/oauth"))
+    } else {
+        std::sync::Arc::new(UnavailableTokenStore)
+    }
+}
 
 use agentpalace_federation::{
     AckMessageRequest, AddDrawerRequest, AddDrawerResponse, ChangesQuery, ChangesResponse,
@@ -109,8 +134,29 @@ pub struct RemoteEndpoint {
     pub base_url: String,
     /// Bearer token, if the remote requires authentication.
     pub token: Option<String>,
+    /// Optional provider-neutral OAuth configuration. When set, it is used only after a
+    /// protected-resource challenge; it never silently replaces an explicitly configured token.
+    pub oauth: Option<OAuthConfig>,
     /// Per-request timeout applied to every call made through this endpoint.
     pub timeout: std::time::Duration,
+}
+
+impl RemoteEndpoint {
+    /// Construct an endpoint using explicit provider-neutral OAuth public-client mode.
+    pub fn with_oauth(
+        name: impl Into<String>,
+        base_url: impl Into<String>,
+        config: OAuthConfig,
+        timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            base_url: base_url.into(),
+            token: None,
+            oauth: Some(config),
+            timeout,
+        }
+    }
 }
 
 /// One method per `/v1` endpoint of the federation REST API.
