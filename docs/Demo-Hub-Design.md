@@ -23,7 +23,7 @@ and backup operations are outside the package.
   LLM's owner, separately from the LLM's claimed agent name.
 - HTTPS, login, and deployment-specific identity policy belong to the hosting
   layer. An enterprise deployment can use its own layer, such as Okta.
-- This pass prepares the version bump and design, without implementation or deployment.
+- The local package is implemented for testing; no deployment or live Google-account validation is performed by this work.
 
 ## Current foundations and gaps
 

@@ -33,7 +33,7 @@ The final command deletes the demo volumes and cannot be undone. It does not tou
 
 ## Connect a local client
 
-Add this remote to your local `~/.agentpalace/config.json` (merge it with your existing configuration rather than replacing your other settings):
+Merge [client-config.example.json](client-config.example.json) into your local `~/.agentpalace/config.json` (preserve your existing settings). Its remote and route are:
 
 ```json
 {
