@@ -456,6 +456,8 @@ struct DeviceGrant {
     polls: u32,
     verify_attempts: u32,
     denied: bool,
+    /// Allocation order, used to evict the oldest decided grant first.
+    issued: u64,
 }
 #[derive(Debug, Clone)]
 struct RefreshGrant {
@@ -512,6 +514,8 @@ struct GatewayState {
     refresh: BTreeMap<String, RefreshGrant>,
     access: BTreeMap<String, AccessGrant>,
     sessions: BTreeMap<String, BrowserSession>,
+    /// Next `DeviceGrant::issued` value.
+    device_seq: u64,
 }
 
 /// A hub browser session. The CSRF secret is never serialized or returned.
@@ -760,22 +764,59 @@ impl Gateway {
         }
         let device_code = secret("device", client_id, resource);
         let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
-        // Only grants still awaiting a decision count toward the per-client cap; denied or
+        let timestamp = now();
+        // Records are kept briefly past expiry so a late poll still reads `expired_token`,
+        // then dropped: no device record outlives its lifetime by more than the grace period.
+        let stale: Vec<String> = state
+            .devices
+            .iter()
+            .filter(|(_, grant)| {
+                grant.expires.saturating_add(DEVICE_RECORD_GRACE_SECONDS) < timestamp
+            })
+            .map(|(code, _)| code.clone())
+            .collect();
+        for code in stale {
+            remove_device_grant(&mut state, &code);
+        }
+        // Only grants still awaiting a decision count toward the pending cap; denied or
         // approved grants must not lock other users out of device login until they expire.
         if state
             .devices
             .values()
             .filter(|grant| {
                 grant.client_id == client_id
-                    && grant.expires >= now()
+                    && grant.expires >= timestamp
                     && !grant.denied
                     && grant.owner.is_none()
             })
             .count()
-            >= 5
+            >= MAX_PENDING_DEVICE_GRANTS
         {
             return Err(ProtocolError::SlowDown);
         }
+        // Independently, the number of stored records per client is hard-bounded whatever their
+        // state, so repeated anonymous denials cannot grow memory. Making room evicts the oldest
+        // denied or expired record: its outcome is terminal, and its client either already read
+        // it or now reads `invalid_grant`, which is also terminal. Undecided and approved grants
+        // are never evicted; if only those remain, allocation is refused.
+        while state.devices.values().filter(|grant| grant.client_id == client_id).count()
+            >= MAX_STORED_DEVICE_GRANTS
+        {
+            let victim = state
+                .devices
+                .iter()
+                .filter(|(_, grant)| {
+                    grant.client_id == client_id && (grant.denied || grant.expires < timestamp)
+                })
+                .min_by_key(|(_, grant)| grant.issued)
+                .map(|(code, _)| code.clone());
+            match victim {
+                Some(code) => remove_device_grant(&mut state, &code),
+                None => return Err(ProtocolError::SlowDown),
+            }
+        }
+        let issued = state.device_seq;
+        state.device_seq = state.device_seq.saturating_add(1);
         // The user code is independent of the private device code, uses an unambiguous
         // consonant alphabet, and is unique among live grants.
         let user_code = loop {
@@ -802,6 +843,7 @@ impl Gateway {
                 polls: 0,
                 verify_attempts: 0,
                 denied: false,
+                issued,
             },
         );
         let mut verification_uri =
@@ -1145,6 +1187,21 @@ impl Gateway {
     }
 }
 
+/// Undecided device grants allowed per client at once.
+const MAX_PENDING_DEVICE_GRANTS: usize = 5;
+/// Hard bound on stored device records per client, in any state.
+const MAX_STORED_DEVICE_GRANTS: usize = 32;
+/// How long an expired device record is kept so a late poll still reads `expired_token`.
+const DEVICE_RECORD_GRACE_SECONDS: u64 = 60;
+
+/// Remove a device record together with any upstream claims parked for its verification.
+fn remove_device_grant(state: &mut GatewayState, device_code: &str) {
+    if let Some(grant) = state.devices.remove(device_code)
+        && let Some(verify_state) = grant.verify_state
+    {
+        state.pending_device.remove(&verify_state);
+    }
+}
 fn new_user_code() -> String {
     const ALPHABET: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ";
     let mut bytes = [0_u8; 8];
@@ -2554,6 +2611,62 @@ mod tests {
         gateway.revoke_own_grant("s", "csrf", &token.access_token).expect("owner revoke");
         assert!(gateway.authorize_rest(&token.access_token, "http://localhost:8080/api").is_err());
         assert!(gateway.refresh(&token.refresh_token).is_err());
+    }
+
+    #[test]
+    fn repeated_denials_stay_within_a_hard_bound_and_never_block_new_grants() {
+        let (gateway, _) = gateway();
+        let mut last = None;
+        for _ in 0..(MAX_STORED_DEVICE_GRANTS * 4) {
+            let grant = gateway
+                .device_authorize("agentpalace-native", "http://localhost:8080/api")
+                .expect("a legitimate client can always start a grant");
+            gateway.deny_device(&grant.user_code).expect("deny");
+            last = Some(grant);
+        }
+        assert!(gateway.state.lock().expect("state").devices.len() <= MAX_STORED_DEVICE_GRANTS);
+        let last = last.expect("at least one grant");
+        assert_eq!(
+            gateway.poll_device(&last.device_code),
+            Err(ProtocolError::AccessDenied),
+            "recent denials stay readable"
+        );
+        // Undecided grants are never evicted; the pending cap still applies to them.
+        let pending: Vec<_> = (0..MAX_PENDING_DEVICE_GRANTS)
+            .map(|_| {
+                gateway
+                    .device_authorize("agentpalace-native", "http://localhost:8080/api")
+                    .expect("pending")
+            })
+            .collect();
+        assert!(gateway.state.lock().expect("state").devices.len() <= MAX_STORED_DEVICE_GRANTS);
+        for grant in &pending {
+            assert_eq!(
+                gateway.poll_device(&grant.device_code),
+                Err(ProtocolError::AuthorizationPending)
+            );
+        }
+    }
+
+    #[test]
+    fn device_records_are_pruned_after_expiry() {
+        let (gateway, _) = gateway();
+        let grant = gateway
+            .device_authorize("agentpalace-native", "http://localhost:8080/api")
+            .expect("device");
+        gateway.deny_device(&grant.user_code).expect("deny");
+        gateway
+            .state
+            .lock()
+            .expect("state")
+            .devices
+            .get_mut(&grant.device_code)
+            .expect("grant")
+            .expires = now() - DEVICE_RECORD_GRACE_SECONDS - 1;
+        gateway
+            .device_authorize("agentpalace-native", "http://localhost:8080/api")
+            .expect("device");
+        assert!(!gateway.state.lock().expect("state").devices.contains_key(&grant.device_code));
     }
 
     #[test]

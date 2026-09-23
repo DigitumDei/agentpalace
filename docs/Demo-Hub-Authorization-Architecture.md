@@ -51,6 +51,9 @@ atomically before deployment:
   resource, and consent, then consumed once and expired quickly;
 * RFC 8628 device grants that are expiring, client-bound, rate-limited to five
   undecided grants per client (denied or approved grants do not count), and
+  hard-bounded to 32 stored records per client in any state (making room
+  evicts the oldest denied or expired record; records are dropped 60 seconds
+  after expiry), and
   return `authorization_pending`, `slow_down` (adding five seconds to the
   interval), `access_denied`, and `expired_token`. The user code is drawn
   independently of the private device code from an unambiguous consonant

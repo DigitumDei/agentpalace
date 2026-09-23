@@ -1212,6 +1212,67 @@ async fn json_device_verification_denies_on_rejected_tokens_but_retries_upstream
 }
 
 #[tokio::test]
+async fn anonymous_repeated_denials_are_bounded_and_do_not_block_device_login() {
+    let idp = Idp::start().await;
+    let hub = Hub::start(&idp, "/api", FAST_DEVICE).await;
+    // Request a code, open its verification URI, and deny it at the device callback without
+    // ever signing in upstream — repeatedly, past the hub's per-client record bound (32).
+    let mut device_codes = Vec::new();
+    for _ in 0..40 {
+        let grant = hub.raw_device_grant().await;
+        assert!(grant["device_code"].is_string(), "a new grant is always issued: {grant}");
+        let browser = Browser::new();
+        let google = location(&browser.get(grant["verification_uri"].as_str().expect("URI")).await);
+        let state = query(&google, "state").expect("state");
+        let denied =
+            browser
+                .get(&hub.url(&format!(
+                    "/auth/google/device-callback?state={state}&error=access_denied"
+                )))
+                .await;
+        assert_eq!(denied.status(), StatusCode::NO_CONTENT);
+        device_codes.push(grant["device_code"].as_str().expect("device code").to_owned());
+    }
+    // The oldest denials were evicted to stay within the bound; recent ones are still readable.
+    assert_eq!(
+        hub.raw_device_poll(&device_codes[0]).await,
+        (StatusCode::BAD_REQUEST, "invalid_grant".to_owned())
+    );
+    let latest = device_codes.last().expect("latest denial");
+    assert_eq!(
+        hub.raw_device_poll(latest).await,
+        (StatusCode::BAD_REQUEST, "access_denied".to_owned())
+    );
+
+    // A legitimate device login still completes.
+    let store: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::default());
+    let (user, mut prompts) = ScriptedUser::new(&idp, &hub, Account::owner(), Decision::Approve);
+    let client = Arc::new(client_for(&format!("{}/api", hub.base), Arc::clone(&store), user, 30));
+    let metadata = challenge(&client).await;
+    let login = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move {
+            client.login_from_challenge_with_mode(&metadata, Some(OAuthLoginMode::Device)).await
+        })
+    };
+    let (verification_uri, _) = next_prompt(&mut prompts).await;
+    assert_eq!(
+        device_verify(
+            &Browser::new(),
+            &idp,
+            &hub.base,
+            &verification_uri,
+            Account::owner(),
+            Decision::Approve
+        )
+        .await,
+        StatusCode::OK
+    );
+    login.await.expect("device login task").expect("device login after a denial flood");
+    read(&client).await.expect("authorized read");
+}
+
+#[tokio::test]
 async fn mixed_device_transactions_are_rejected_and_unrelated_grants_are_preserved() {
     let idp = Idp::start().await;
     let hub = Hub::start(&idp, "/api", FAST_DEVICE).await;
