@@ -1,6 +1,6 @@
 # Local demo hub
 
-This example runs a Google-backed authorization gateway and a pinned AgentPalace engine on one computer. The engine source is fixed at commit `ba2bb3d74845314d4f4031047101ad861dc49fb9` in [Dockerfile](Dockerfile); the gateway is built from this checkout. Only `127.0.0.1:8080` is published. The engine's REST and MCP ports stay on the Compose network. The example uses deterministic stub embeddings so no model download is needed.
+This example runs a Google-backed authorization gateway and a pinned AgentPalace engine on one computer. The engine source is fixed at commit `ba2bb3d74845314d4f4031047101ad861dc49fb9` in [Dockerfile](Dockerfile); the gateway is built from this checkout. Only `127.0.0.1:8080` is published. The engine's REST and MCP ports stay on the Compose network. The engine uses real local embeddings by default. First boot downloads model assets into the persistent `palace_data` volume; no note content is sent to an embedding API.
 
 ## Prepare
 
@@ -14,13 +14,14 @@ For example, from this directory:
 cp .env.example .env
 mkdir -p secrets
 # Paste the real secret into secrets/google-client-secret using your local editor.
+chmod 600 secrets/google-client-secret
 docker compose up --build --wait -d
 curl --fail http://localhost:8080/v1/health
 ```
 
 On Windows PowerShell, the preparation commands are `Copy-Item .env.example .env`, `New-Item -ItemType Directory -Force secrets`, and `notepad secrets/google-client-secret`; then use the same `docker compose up --build --wait -d` command. The browser on the Windows host must reach `http://localhost:8080`.
 
-The build fetches the pinned engine commit and locked Rust dependencies. Run `docker compose ps` to inspect health and `docker compose logs -f gateway engine` for startup diagnostics. The first boot creates three named volumes: `palace_data` (engine config and data), `engine_tokens` (private owner-scoped engine credentials), and `hub_state` (access policy, identity bindings, audit). The gateway creates the admin entry **only if** the policy file is absent. Existing policy and role edits are never overwritten by a restart.
+The build fetches the pinned engine commit and locked Rust dependencies. The first engine start downloads a real embedding model, so it needs outbound access and may take several minutes. Its cache lives under `palace_data` and survives container restarts; after a successful first start, set `AGENTPALACE_EMBED_ALLOW_DOWNLOADS=0` in `.env` to require offline starts. Set `AGENTPALACE_STUB_EMBEDDINGS=1` only for offline auth/packaging tests: its placeholder vectors do not give representative search relevance. Do not mix stub and real embeddings in the same palace; reset this demo's volumes before switching modes. Run `docker compose ps` to inspect health and `docker compose logs -f gateway engine` for startup diagnostics. The first boot creates three named volumes: `palace_data` (engine config and data), `engine_tokens` (private owner-scoped engine credentials), and `hub_state` (access policy, identity bindings, audit). The gateway creates the admin entry **only if** the policy file is absent. Existing policy and role edits are never overwritten by a restart.
 
 ```sh
 docker compose stop                   # keep containers and volumes

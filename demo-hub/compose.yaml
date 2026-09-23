@@ -9,7 +9,9 @@ services:
     environment:
       AGENTPALACE_CONFIG_DIR: /var/lib/agentpalace/config
       AGENTPALACE_PALACE_PATH: /var/lib/agentpalace/palace
-      AGENTPALACE_STUB_EMBEDDINGS: "1"
+      XDG_CACHE_HOME: /var/lib/agentpalace/cache
+      AGENTPALACE_STUB_EMBEDDINGS: ${AGENTPALACE_STUB_EMBEDDINGS:-0}
+      AGENTPALACE_EMBED_ALLOW_DOWNLOADS: ${AGENTPALACE_EMBED_ALLOW_DOWNLOADS:-1}
     volumes:
       - palace_data:/var/lib/agentpalace
       - engine_tokens:/var/lib/agentpalace-tokens
@@ -18,7 +20,7 @@ services:
       interval: 10s
       timeout: 3s
       retries: 12
-      start_period: 30s
+      start_period: 300s
     restart: unless-stopped
 
   gateway:
