@@ -1273,6 +1273,70 @@ async fn anonymous_repeated_denials_are_bounded_and_do_not_block_device_login() 
 }
 
 #[tokio::test]
+async fn restarted_device_verification_invalidates_earlier_verified_callbacks() {
+    let idp = Idp::start().await;
+    let hub = Hub::start(&idp, "/api", FAST_DEVICE).await;
+    let grant = hub.raw_device_grant().await;
+    let verification_uri = grant["verification_uri"].as_str().expect("URI");
+    let device_code = grant["device_code"].as_str().expect("device code");
+    let browser = Browser::new();
+    // Repeatedly complete the verified Google callback on one grant, then restart verification
+    // before consenting. Each restart supersedes the parked claims of the previous attempt.
+    let mut abandoned_forms = Vec::new();
+    for _ in 0..5 {
+        let google = location(&browser.get(verification_uri).await);
+        let state = query(&google, "state").expect("state");
+        let (code, _) = idp.authorize(&google, Account::owner());
+        let page = browser
+            .get(&hub.url(&format!("/auth/google/device-callback?state={state}&code={code}")))
+            .await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let page = page.text().await.expect("device consent page");
+        abandoned_forms.push([
+            form_value(&page, "user_code"),
+            form_value(&page, "state"),
+            form_value(&page, "csrf_token"),
+        ]);
+    }
+    // The last attempt is the live one; every earlier form is dead, even with valid CSRF.
+    let live = abandoned_forms.pop().expect("live form");
+    for [user_code, state, csrf] in &abandoned_forms {
+        let stale = browser
+            .post(
+                &hub.url("/auth/google/device-consent"),
+                &[
+                    ("user_code", user_code),
+                    ("state", state),
+                    ("csrf_token", csrf),
+                    ("consent", "true"),
+                ],
+            )
+            .await;
+        assert_eq!(
+            stale.status(),
+            StatusCode::BAD_REQUEST,
+            "a superseded verification cannot be consented"
+        );
+    }
+    assert_eq!(hub.raw_device_poll(device_code).await.1, "authorization_pending");
+    let [user_code, state, csrf] = &live;
+    let approved = browser
+        .post(
+            &hub.url("/auth/google/device-consent"),
+            &[
+                ("user_code", user_code),
+                ("state", state),
+                ("csrf_token", csrf),
+                ("consent", "true"),
+            ],
+        )
+        .await;
+    assert_eq!(approved.status(), StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert_eq!(hub.raw_device_poll(device_code).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn mixed_device_transactions_are_rejected_and_unrelated_grants_are_preserved() {
     let idp = Idp::start().await;
     let hub = Hub::start(&idp, "/api", FAST_DEVICE).await;

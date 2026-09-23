@@ -636,7 +636,9 @@ impl Gateway {
         }
         let owner = self.policy.admit(&identity).ok_or(ProtocolError::AccessDenied)?;
         let code = secret("code", client_id, challenge);
-        self.state.lock().map_err(|_| ProtocolError::ServerError)?.codes.insert(
+        let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+        prune_expired(&mut state, now());
+        state.codes.insert(
             code.clone(),
             CodeGrant {
                 client_id: client_id.into(),
@@ -673,7 +675,22 @@ impl Gateway {
         }
         let transaction = secret("browser", client_id, state);
         let csrf = secret("browser-csrf", &transaction, state);
-        self.state.lock().map_err(|_| ProtocolError::ServerError)?.browser.insert(
+        let mut gateway_state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+        prune_expired(&mut gateway_state, now());
+        // `/authorize` is reachable without signing in, so outstanding transactions are
+        // hard-bounded; making room evicts the transaction closest to expiry (its browser can
+        // simply start again).
+        while gateway_state.browser.len() >= MAX_BROWSER_TRANSACTIONS {
+            let oldest = gateway_state
+                .browser
+                .iter()
+                .min_by_key(|(_, transaction)| transaction.expires)
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else { break };
+            gateway_state.browser.remove(&oldest);
+            gateway_state.pending_browser.remove(&oldest);
+        }
+        gateway_state.browser.insert(
             transaction.clone(),
             BrowserTransaction {
                 client_id: client_id.into(),
@@ -767,17 +784,7 @@ impl Gateway {
         let timestamp = now();
         // Records are kept briefly past expiry so a late poll still reads `expired_token`,
         // then dropped: no device record outlives its lifetime by more than the grace period.
-        let stale: Vec<String> = state
-            .devices
-            .iter()
-            .filter(|(_, grant)| {
-                grant.expires.saturating_add(DEVICE_RECORD_GRACE_SECONDS) < timestamp
-            })
-            .map(|(code, _)| code.clone())
-            .collect();
-        for code in stale {
-            remove_device_grant(&mut state, &code);
-        }
+        prune_expired(&mut state, timestamp);
         // Only grants still awaiting a decision count toward the pending cap; denied or
         // approved grants must not lock other users out of device login until they expire.
         if state
@@ -912,9 +919,15 @@ impl Gateway {
         if grant.expires < now() {
             return Err(ProtocolError::ExpiredToken);
         }
-        grant.verify_state = Some(state_value.clone());
+        // Restarting verification supersedes the previous attempt: claims parked under the
+        // replaced state can never be consumed again, so they are dropped now rather than
+        // accumulating for the life of the grant.
+        let replaced = grant.verify_state.replace(state_value.clone());
         grant.verify_nonce = Some(nonce.clone());
         grant.browser_id = Some(secret("device-browser-id", user_code, &state_value));
+        if let Some(replaced) = replaced {
+            state.pending_device.remove(&replaced);
+        }
         Ok((state_value, nonce))
     }
 
@@ -1091,7 +1104,9 @@ impl Gateway {
         if session_id.is_empty() || csrf.is_empty() {
             return Err(ProtocolError::InvalidRequest);
         }
-        self.state.lock().map_err(|_| ProtocolError::ServerError)?.sessions.insert(
+        let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+        prune_expired(&mut state, now());
+        state.sessions.insert(
             session_id.into(),
             BrowserSession { owner, csrf: csrf.into(), authenticated_at: now(), admin: false },
         );
@@ -1108,7 +1123,9 @@ impl Gateway {
         if session_id.is_empty() || csrf.is_empty() {
             return Err(ProtocolError::InvalidRequest);
         }
-        self.state.lock().map_err(|_| ProtocolError::ServerError)?.sessions.insert(
+        let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
+        prune_expired(&mut state, now());
+        state.sessions.insert(
             session_id.into(),
             BrowserSession { owner, csrf: csrf.into(), authenticated_at: now(), admin: true },
         );
@@ -1123,7 +1140,7 @@ impl Gateway {
         token: &str,
     ) -> Result<(), ProtocolError> {
         let mut state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
-        let session = state.sessions.get(session_id).ok_or(ProtocolError::AccessDenied)?;
+        let session = live_session(&state, session_id)?;
         if session.csrf != csrf {
             return Err(ProtocolError::InvalidRequest);
         }
@@ -1152,7 +1169,7 @@ impl Gateway {
         max_age: Duration,
     ) -> Result<AdmissionIdentity, ProtocolError> {
         let state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
-        let session = state.sessions.get(session_id).ok_or(ProtocolError::AccessDenied)?;
+        let session = live_session(&state, session_id)?;
         if !session.admin || now().saturating_sub(session.authenticated_at) > max_age.as_secs() {
             return Err(ProtocolError::AccessDenied);
         }
@@ -1162,7 +1179,7 @@ impl Gateway {
     /// List only the authenticated owner's active grant resources.
     pub fn own_connections(&self, session_id: &str) -> Result<Vec<String>, ProtocolError> {
         let state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
-        let session = state.sessions.get(session_id).ok_or(ProtocolError::AccessDenied)?;
+        let session = live_session(&state, session_id)?;
         Ok(state
             .refresh
             .values()
@@ -1177,7 +1194,7 @@ impl Gateway {
         session_id: &str,
     ) -> Result<Vec<serde_json::Value>, ProtocolError> {
         let state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
-        let session = state.sessions.get(session_id).ok_or(ProtocolError::AccessDenied)?;
+        let session = live_session(&state, session_id)?;
         Ok(state
             .refresh
             .values()
@@ -1193,6 +1210,58 @@ const MAX_PENDING_DEVICE_GRANTS: usize = 5;
 const MAX_STORED_DEVICE_GRANTS: usize = 32;
 /// How long an expired device record is kept so a late poll still reads `expired_token`.
 const DEVICE_RECORD_GRACE_SECONDS: u64 = 60;
+
+/// Hard bound on outstanding browser authorization transactions.
+const MAX_BROWSER_TRANSACTIONS: usize = 1024;
+/// Browser sessions end this long after sign-in.
+const SESSION_LIFETIME_SECONDS: u64 = 8 * 60 * 60;
+
+/// Look up a browser session that has not outlived `SESSION_LIFETIME_SECONDS`.
+fn live_session<'a>(
+    state: &'a GatewayState,
+    session_id: &str,
+) -> Result<&'a BrowserSession, ProtocolError> {
+    state
+        .sessions
+        .get(session_id)
+        .filter(|session| {
+            now().saturating_sub(session.authenticated_at) <= SESSION_LIFETIME_SECONDS
+        })
+        .ok_or(ProtocolError::AccessDenied)
+}
+
+/// Drop every record that can no longer be used, so gateway memory is bounded by live grants
+/// rather than by history. Called at every allocation point. Used authorization codes are kept
+/// until expiry (for replay rejection), rotated refresh tokens until their grant expires (for
+/// reuse detection), and device records for a short grace period (so late polls read
+/// `expired_token`).
+fn prune_expired(state: &mut GatewayState, timestamp: u64) {
+    let stale_transactions: Vec<String> = state
+        .browser
+        .iter()
+        .filter(|(_, t)| t.expires < timestamp)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for transaction in stale_transactions {
+        state.browser.remove(&transaction);
+        state.pending_browser.remove(&transaction);
+    }
+    state.codes.retain(|_, grant| grant.expires >= timestamp);
+    state.access.retain(|_, grant| grant.expires >= timestamp);
+    state.refresh.retain(|_, grant| grant.expires >= timestamp);
+    state.sessions.retain(|_, session| {
+        timestamp.saturating_sub(session.authenticated_at) <= SESSION_LIFETIME_SECONDS
+    });
+    let stale_devices: Vec<String> = state
+        .devices
+        .iter()
+        .filter(|(_, grant)| grant.expires.saturating_add(DEVICE_RECORD_GRACE_SECONDS) < timestamp)
+        .map(|(code, _)| code.clone())
+        .collect();
+    for code in stale_devices {
+        remove_device_grant(state, &code);
+    }
+}
 
 /// Remove a device record together with any upstream claims parked for its verification.
 fn remove_device_grant(state: &mut GatewayState, device_code: &str) {
@@ -1232,6 +1301,7 @@ fn revoke_family(state: &mut GatewayState, family: &str) {
     }
 }
 fn issue(state: &mut GatewayState, owner: AdmissionIdentity, resource: &str) -> TokenResponse {
+    prune_expired(state, now());
     issue_with_family(
         state,
         secret("family", owner.owner.id.as_str(), resource),
@@ -1975,9 +2045,12 @@ async fn session(State(g): State<Gateway>, headers: HeaderMap) -> impl IntoRespo
     else {
         return ProtocolError::AccessDenied.into_response();
     };
-    match g.state.lock().map_err(|_| ProtocolError::ServerError).and_then(|state| {
-        state.sessions.get(session_id).cloned().ok_or(ProtocolError::AccessDenied)
-    }) {
+    match g
+        .state
+        .lock()
+        .map_err(|_| ProtocolError::ServerError)
+        .and_then(|state| live_session(&state, session_id).cloned())
+    {
         Ok(session) => Json(
             serde_json::json!({"owner": session.owner.owner.id.as_str(), "admin": session.admin}),
         )
@@ -2611,6 +2684,111 @@ mod tests {
         gateway.revoke_own_grant("s", "csrf", &token.access_token).expect("owner revoke");
         assert!(gateway.authorize_rest(&token.access_token, "http://localhost:8080/api").is_err());
         assert!(gateway.refresh(&token.refresh_token).is_err());
+    }
+
+    #[test]
+    fn restarting_device_verification_drops_previously_parked_claims() {
+        let (gateway, _) = gateway();
+        let grant = gateway
+            .device_authorize("agentpalace-native", "http://localhost:8080/api")
+            .expect("device");
+        let claims = GoogleIdClaims {
+            iss: "https://accounts.google.com".into(),
+            aud: "google-client".into(),
+            sub: "subject-1".into(),
+            email: "person@example.com".into(),
+            email_verified: true,
+            exp: now() + 60,
+            nonce: "nonce".into(),
+            additional: BTreeMap::new(),
+        };
+        for _ in 0..50 {
+            let (verify_state, _) =
+                gateway.begin_device_verification(&grant.user_code).expect("restart");
+            // What a verified device callback does before consent.
+            gateway
+                .state
+                .lock()
+                .expect("state")
+                .pending_device
+                .insert(verify_state, claims.clone());
+            assert!(
+                gateway.state.lock().expect("state").pending_device.len() <= 1,
+                "parked claims must not accumulate"
+            );
+        }
+    }
+
+    #[test]
+    fn anonymous_browser_transactions_are_bounded_and_expired_records_are_pruned() {
+        let (gateway, identity) = gateway();
+        for i in 0..(MAX_BROWSER_TRANSACTIONS + 50) {
+            gateway
+                .begin_browser_authorization(
+                    "agentpalace-native",
+                    "http://127.0.0.1:49152/callback",
+                    "challenge",
+                    "http://localhost:8080/api",
+                    &format!("state-{i}"),
+                    "nonce",
+                )
+                .expect("authorize is never refused");
+        }
+        assert!(gateway.state.lock().expect("state").browser.len() <= MAX_BROWSER_TRANSACTIONS);
+
+        let code = gateway
+            .authorize_code(
+                "agentpalace-native",
+                "http://127.0.0.1:49152/callback",
+                &pkce("v"),
+                "http://localhost:8080/api",
+                identity.clone(),
+                true,
+                "state",
+                "state",
+                "nonce",
+                "nonce",
+            )
+            .expect("code");
+        let token = gateway
+            .exchange_code(
+                &code,
+                "agentpalace-native",
+                "http://127.0.0.1:49152/callback",
+                "v",
+                "http://localhost:8080/api",
+            )
+            .expect("token");
+        let owner = gateway.policy.admit(&identity).expect("admission");
+        gateway.create_session("old-session", owner.clone(), "csrf").expect("session");
+        {
+            let mut state = gateway.state.lock().expect("state");
+            for transaction in state.browser.values_mut() {
+                transaction.expires = now() - 1;
+            }
+            state.codes.get_mut(&code).expect("code").expires = now() - 1;
+            state.access.get_mut(&token.access_token).expect("access").expires = now() - 1;
+            state.refresh.get_mut(&token.refresh_token).expect("refresh").expires = now() - 1;
+            state.sessions.get_mut("old-session").expect("session").authenticated_at =
+                now() - SESSION_LIFETIME_SECONDS - 1;
+        }
+        assert_eq!(
+            gateway.own_connections("old-session"),
+            Err(ProtocolError::AccessDenied),
+            "sessions end after their lifetime"
+        );
+        gateway.create_session("new-session", owner, "csrf").expect("session");
+        let state = gateway.state.lock().expect("state");
+        assert!(
+            state.browser.is_empty()
+                && state.codes.is_empty()
+                && state.access.is_empty()
+                && state.refresh.is_empty()
+        );
+        assert!(
+            !state.sessions.contains_key("old-session")
+                && state.sessions.contains_key("new-session")
+        );
     }
 
     #[test]

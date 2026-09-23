@@ -61,9 +61,16 @@ atomically before deployment:
   (defaults: 5 seconds and 10 minutes);
 * hub access tokens lasting 15 minutes and rotating refresh tokens with a
   seven-day absolute grant expiry, reuse detection, and revocation;
-* browser sessions protected by CSRF, with connection lists/revocation limited
-  to the authenticated owner's grants (recent-authentication administration is
-  an open scope decision, below);
+* browser sessions protected by CSRF and ending eight hours after sign-in, with
+  connection lists/revocation limited to the authenticated owner's grants
+  (recent-authentication administration is an open scope decision, below);
+* bounded state: every record that can no longer be used is pruned whenever a
+  new one is created (expired browser transactions, authorization codes, access
+  tokens, refresh records past their grant expiry, and sessions); outstanding
+  browser authorization transactions, which `/authorize` creates without
+  sign-in, are hard-bounded at 1024 (making room evicts the one closest to
+  expiry); and restarting a device verification discards claims parked for the
+  superseded attempt;
 * a fail-closed admission-policy interface. The default denies every identity;
   an access-control adapter must admit only verified email plus stable
   issuer/subject and immutable owner ID. Verified email is evidence; the immutable owner ID and
