@@ -1090,6 +1090,7 @@ async fn device_login_polls_while_pending_then_completes_after_browser_approval(
     assert!(!login.is_finished(), "a pending grant must not complete the login");
 
     let phone = Browser::new();
+    assert_eq!(phone.get(&hub.url("/hub/connections")).await.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         device_verify(
             &phone,
@@ -1102,11 +1103,28 @@ async fn device_login_polls_while_pending_then_completes_after_browser_approval(
         .await,
         StatusCode::OK
     );
+    assert!(phone.cookie("agentpalace_session").is_some(), "device browser gets a session");
+    assert!(phone.cookie("agentpalace_csrf").is_some(), "device browser gets CSRF protection");
     login.await.expect("device login task").expect("device login");
     read(&client).await.expect("device-authorized read");
     let grant =
         stored(store.as_ref(), &hub.resource, &hub.base).await.expect("persisted device grant");
     assert_eq!(grant.resource, hub.resource);
+    let connections = phone.get(&hub.url("/hub/connections")).await;
+    assert_eq!(connections.status(), StatusCode::OK);
+    assert_eq!(connections.headers().get(header::CACHE_CONTROL).expect("cache policy"), "no-store");
+    let page = connections.text().await.expect("device browser connections");
+    assert!(page.contains(&hub.resource));
+    let token = form_value(&page, "token");
+    let csrf = form_value(&page, "csrf_token");
+    assert_eq!(
+        phone.post(&hub.url("/connections/revoke"), &[("token", &token), ("csrf_token", &csrf)])
+            .await.status(),
+        StatusCode::NO_CONTENT,
+    );
+    let after = phone.get(&hub.url("/hub/connections")).await;
+    assert_eq!(after.status(), StatusCode::OK);
+    assert!(after.text().await.expect("connections after revoke").contains("No active connections"));
 }
 
 #[tokio::test]
@@ -1134,8 +1152,9 @@ async fn device_refusals_end_polling_with_a_denial() {
             })
         };
         let (verification_uri, _) = next_prompt(&mut prompts).await;
+        let browser = Browser::new();
         let final_status = device_verify(
-            &Browser::new(),
+            &browser,
             &idp,
             &hub.base,
             &verification_uri,
@@ -1143,6 +1162,7 @@ async fn device_refusals_end_polling_with_a_denial() {
             decision,
         )
         .await;
+        assert!(browser.cookie("agentpalace_session").is_none(), "refused device login has no session");
         let expected = match decision {
             Decision::Deny => StatusCode::OK,
             Decision::UpstreamDenied => StatusCode::NO_CONTENT,
@@ -1153,6 +1173,32 @@ async fn device_refusals_end_polling_with_a_denial() {
         assert!(error.to_string().contains("denied"), "{decision:?}/{}: {error}", account.sub);
         assert!(stored(store.as_ref(), &hub.resource, &hub.base).await.is_none());
     }
+}
+
+#[tokio::test]
+async fn json_device_approval_creates_a_browser_session() {
+    let idp = Idp::start().await;
+    let hub = Hub::start(&idp, "/api", FAST_DEVICE).await;
+    let grant = hub.raw_device_grant().await;
+    let user_code = grant["user_code"].as_str().expect("user code");
+    let browser = Browser::new();
+    let google = location(&browser.get(grant["verification_uri"].as_str().expect("URI")).await);
+    let state = query(&google, "state").expect("device state");
+    let (callback_code, _) = idp.authorize(&google, Account::owner());
+    let page = browser
+        .get(&hub.url(&format!("/auth/google/device-callback?state={state}&code={callback_code}")))
+        .await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let csrf = form_value(&page.text().await.expect("device consent page"), "csrf_token");
+    let (code, _) = idp.authorize(&google, Account::owner());
+    let response = browser.attach(browser.http.post(hub.url("/device/verify")))
+        .json(&serde_json::json!({"user_code": user_code, "state": state, "code": code,
+            "consent": true, "csrf_token": csrf}))
+        .send().await.expect("JSON device approval");
+    browser.absorb(&response);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(browser.cookie("agentpalace_session").is_some());
+    assert_eq!(browser.get(&hub.url("/hub/connections")).await.status(), StatusCode::OK);
 }
 
 #[tokio::test]

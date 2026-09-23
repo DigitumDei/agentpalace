@@ -1070,7 +1070,7 @@ impl Gateway {
         user_code: &str,
         identity: VerifiedIdentity,
         consent: bool,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<AdmissionIdentity, ProtocolError> {
         if !consent {
             return Err(ProtocolError::AccessDenied);
         }
@@ -1089,9 +1089,10 @@ impl Gateway {
         }
         match self.resolve_identity(&identity)? {
             Some(decision) => {
-                grant.owner = Some(decision.admission);
+                let owner = decision.admission;
+                grant.owner = Some(owner.clone());
                 grant.role_ceiling = Some(decision.role);
-                Ok(())
+                Ok(owner)
             }
             None => {
                 // The polling client learns of the refusal instead of waiting for expiry.
@@ -1137,7 +1138,7 @@ impl Gateway {
         returned_state: &str,
         claims: &GoogleIdClaims,
         consent: bool,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<AdmissionIdentity, ProtocolError> {
         let (expected_state, expected_nonce) = {
             let state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
             let grant = state
@@ -2161,6 +2162,37 @@ async fn google_consent(
         Err(error) => error.into_response(),
     }
 }
+/// Give the Google-verified device browser the same owner-scoped session as browser login.
+/// The device cookie, state, and CSRF have already been checked by the calling handler.
+fn device_browser_session_response(
+    g: &Gateway,
+    owner: AdmissionIdentity,
+    transaction_state: &str,
+    mut response: Response,
+) -> Response {
+    let session_id = secret("session", transaction_state, &owner.owner.id.to_string());
+    let csrf = secret("csrf", &session_id, transaction_state);
+    let create = match g.role_for_owner(&owner.owner.id) {
+        Ok(Some(AccessRole::Admin)) => g.create_admin_session(&session_id, owner, &csrf),
+        Ok(Some(_)) => g.create_session(&session_id, owner, &csrf),
+        Ok(None) => Err(ProtocolError::AccessDenied),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = create {
+        return error.into_response();
+    }
+    let secure = secure_attribute(g);
+    if let Ok(value) =
+        format!("agentpalace_session={session_id}; HttpOnly; SameSite=Lax; Path=/{secure}").parse()
+    {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    if let Ok(value) = format!("agentpalace_csrf={csrf}; SameSite=Lax; Path=/{secure}").parse() {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
 /// `; Secure` for every cookie except in the explicit HTTP loopback demo mode.
 fn secure_attribute(g: &Gateway) -> &'static str {
     if g.config.mode == GatewayMode::Secure { "; Secure" } else { "" }
@@ -2407,12 +2439,17 @@ async fn google_device_consent(
     }
     let result = g.complete_device_verification(&r.user_code, &r.state, &claims, true);
     match result {
-        Ok(()) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            "Device authorization approved; you may close this window.",
-        )
-            .into_response(),
+        Ok(owner) => device_browser_session_response(
+            &g,
+            owner,
+            &r.state,
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                "Device authorization approved; <a href=\"/hub/connections\">view your connections</a>.",
+            )
+                .into_response(),
+        ),
         Err(error) => error.into_response(),
     }
 }
@@ -2472,7 +2509,12 @@ async fn verify_device(
         Err(error) => return g.fail_device_verification(&r.user_code, error).into_response(),
     };
     match g.complete_device_verification(&r.user_code, &r.state, &claims, r.consent) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(owner) => device_browser_session_response(
+            &g,
+            owner,
+            &r.state,
+            StatusCode::NO_CONTENT.into_response(),
+        ),
         Err(e) => e.into_response(),
     }
 }
