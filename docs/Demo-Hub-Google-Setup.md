@@ -1,8 +1,6 @@
 # Google OAuth setup for the local demo
 
-Status: tester-owned setup guide, 2026-09-21. The gateway supports the
-documented loopback protocol endpoints; no Google Cloud resources have been
-created by this work.
+Status: local Compose package. The gateway serves the documented loopback protocol endpoints; no Google Cloud resources have been created by this work.
 
 The tester performs this setup in their own Google Cloud project. It provides
 Google sign-in for containers running on their machine; it does not deploy
@@ -27,7 +25,7 @@ use OAuth applications.
 ## 2. Create the Google OAuth client
 
 Under Clients, create a **Web application** client for the demo gateway.
-Register this exact proposed authorized redirect URI:
+Register this exact authorized redirect URI:
 
 ~~~text
 http://localhost:8080/auth/google/callback
@@ -50,9 +48,8 @@ registration that the demo gateway supplies for connecting local palaces.
 Both desktop and device-code login use this same gateway-to-Google web login;
 do not create a Google TV/device client.
 
-The proposed gateway uses server-side redirects, so browser JavaScript origins
-are not needed for this flow. The gateway's `GoogleOidcVerifierAdapter` (wired
-in by the hosting layer, which is not yet packaged) exchanges Google's
+The gateway uses server-side redirects, so browser JavaScript origins
+are not needed for this flow. The gateway's `GoogleOidcVerifierAdapter` (wired by the Compose gateway binary) exchanges Google's
 authorization code server-side at the callback that received it and validates
 the returned ID token's RS256 signature against Google's published keys, plus
 its issuer, audience, expiry, verified-email flag, and nonce, after the hub has
@@ -61,8 +58,7 @@ update this guide to match before use.
 
 ## 3. Supply the tester's local settings
 
-The gateway configuration supplies these inputs (the package does not provide
-credentials or a maintainer-owned account):
+Copy `demo-hub/.env.example` to `demo-hub/.env` and put the Google web client secret in `demo-hub/secrets/google-client-secret`. The package does not provide credentials or a maintainer-owned account. It needs:
 
 | Setting | Value |
 |---|---|
@@ -79,8 +75,7 @@ palace access. The package must not contain the maintainer's email or credential
 
 ## 4. Run and exercise the example
 
-Once implemented, the package's README will provide its exact Docker Compose
-start, stop, and deliberate reset commands. The intended walkthrough is:
+The [package README](../demo-hub/README.md) gives exact Docker Compose start, stop, deliberate reset and client commands. The walkthrough is:
 
 1. Start the local containers and open the local hub in your browser.
 2. Sign in with your admin account.
@@ -113,8 +108,7 @@ For real-browser validation, first confirm Docker Desktop is running, WSL can
 resolve and reach the configured hub origin, and the browser can reach that same
 origin. Keep the demo loopback-only. Run CLI login once with `--mode browser`,
 make an authenticated read, then repeat with `--mode device` from WSL or a
-headless client. These are instructions only; this repository does not claim
-live Google-account or Google-resource evidence.
+headless client. These are instructions only; automated fixtures do not claim live Google-account or Google-resource evidence.
 
 ## Troubleshooting
 

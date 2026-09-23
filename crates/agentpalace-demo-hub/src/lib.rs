@@ -774,6 +774,8 @@ impl Gateway {
     /// Build documented metadata, OAuth, access administration, and explicit REST routes.
     pub fn router(&self) -> Router {
         register_rest_routes(Router::new()
+            .route("/", get(home_page))
+            .route("/hub/connections", get(connections_page))
             .route("/.well-known/oauth-protected-resource", get(protected_metadata))
             .route("/.well-known/oauth-authorization-server", get(authorization_metadata))
             .route("/register", post(register))
@@ -2490,6 +2492,46 @@ async fn verify_upstream(
     verifier.exchange_and_verify(&code, &nonce, &redirect_uri).await
 }
 
+fn html_escape(value: &str) -> String {
+    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        .replace('"', "&quot;").replace("'", "&#39;")
+}
+
+async fn home_page() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        "<!doctype html><html lang=en><meta charset=utf-8><title>AgentPalace demo hub</title><h1>AgentPalace demo hub</h1><p>Local test hub. Connect your AgentPalace client to http://localhost:8080 and sign in through its browser authorization flow.</p><p>Using a headless client? <a href=\"/device/verify\">Verify a device code</a>.</p><p><a href=\"/hub/connections\">Your connections</a></p></html>")
+}
+
+async fn connections_page(State(g): State<Gateway>, headers: HeaderMap) -> Response {
+    let Some(session_id) = cookie_value(&headers, "agentpalace_session") else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let handles = match g.own_connection_handles(&session_id) {
+        Ok(handles) => handles,
+        Err(error) => return error.into_response(),
+    };
+    let csrf = match g.state.lock().map_err(|_| ProtocolError::ServerError)
+        .and_then(|state| live_session(&state, &session_id).map(|session| session.csrf.clone()))
+    {
+        Ok(csrf) => csrf,
+        Err(error) => return error.into_response(),
+    };
+    let mut page = String::from("<!doctype html><html lang=en><meta charset=utf-8><title>Your connections</title><h1>Your connections</h1>");
+    if handles.is_empty() {
+        page.push_str("<p>No active connections.</p>");
+    }
+    for handle in handles {
+        let Some(resource) = handle.get("resource").and_then(serde_json::Value::as_str) else { continue };
+        let Some(token) = handle.get("token").and_then(serde_json::Value::as_str) else { continue };
+        page.push_str(&format!("<form method=post action=\"/connections/revoke\"><span>{}</span><input type=hidden name=\"token\" value=\"{}\"><input type=hidden name=\"csrf_token\" value=\"{}\"><button type=submit>Revoke</button></form>",
+            html_escape(resource), html_escape(token), html_escape(&csrf)));
+    }
+    page.push_str("<p><a href=\"/\">Home</a></p></html>");
+    let mut response = ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], page).into_response();
+    response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().expect("static header"));
+    response
+}
+
 async fn session(State(g): State<Gateway>, headers: HeaderMap) -> impl IntoResponse {
     let Some(cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) else {
         return ProtocolError::AccessDenied.into_response();
@@ -2547,7 +2589,15 @@ async fn revoke_connection(
         .or(r.csrf_token.as_deref())
         .unwrap_or_default();
     match g.revoke_own_grant(session_id, csrf, &r.token) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            if headers.get(header::ACCEPT).and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("text/html"))
+            {
+                Redirect::to("/hub/connections").into_response()
+            } else {
+                StatusCode::NO_CONTENT.into_response()
+            }
+        },
         Err(e) => e.into_response(),
     }
 }

@@ -66,7 +66,7 @@ async fn forwarding_writes_and_reads_back_authenticated_owner_provenance() {
     };
     let tokens = TokenRegistry::load(token_file.clone()).expect("load real engine token registry");
     let (engine_router, _engine_state) =
-        build_router(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced), tokens)
+        build_router(config.clone(), DeterministicStubProvider::new(EmbeddingProfile::Balanced), tokens)
             .await
             .expect("build real engine router");
     let engine_task = tokio::spawn(async move {
@@ -136,4 +136,29 @@ async fn forwarding_writes_and_reads_back_authenticated_owner_provenance() {
     assert_eq!(record["provenance"]["authenticated_submitter"]["id"], expected_owner_id);
 
     engine_task.abort();
+    let _ = engine_task.await;
+    drop(_engine_state);
+
+    let restarted_listener = TcpListener::bind(engine_addr).await.expect("restarted engine listener");
+    let restarted_tokens = TokenRegistry::load(token_file).expect("reload owner tokens");
+    let (restarted_router, _restarted_state) =
+        build_router(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced), restarted_tokens)
+            .await.expect("reopen persistent palace");
+    let restarted_task = tokio::spawn(async move {
+        axum::serve(restarted_listener, restarted_router).await.expect("serve restarted engine")
+    });
+    let restarted_forwarder =
+        Forwarder::new(&format!("http://{engine_addr}")).expect("private restarted engine origin");
+    let persisted = restarted_forwarder.forward(&trusted_owner, ForwardRequest {
+        method: Method::GET,
+        path_and_query: "/v1/drawers/drawer_hub_provenance_1".into(),
+        headers: HeaderMap::new(),
+        body: Vec::new(),
+    }).await.expect("read persisted drawer after restart");
+    assert_eq!(persisted.status, StatusCode::OK, "{}", String::from_utf8_lossy(&persisted.body));
+    let persisted_record: Value = serde_json::from_slice(&persisted.body).expect("persisted record");
+    assert_eq!(persisted_record["provenance"]["creator"]["id"], expected_owner_id);
+    assert_eq!(persisted_record["provenance"]["authenticated_submitter"]["id"], expected_owner_id);
+    assert_eq!(persisted_record["provenance"]["creator"]["email_at_write"], "provenance@example.com");
+    restarted_task.abort();
 }

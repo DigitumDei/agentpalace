@@ -1,0 +1,71 @@
+name: Demo hub Compose smoke
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/demo-hub.yml"
+      - ".dockerignore"
+      - "demo-hub/**"
+      - "crates/agentpalace-demo-hub/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/demo-hub.yml"
+      - ".dockerignore"
+      - "demo-hub/**"
+      - "crates/agentpalace-demo-hub/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+jobs:
+  compose-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: demo-hub
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure fixture-only credentials
+        run: |
+          cp .env.example .env
+          mkdir -p secrets
+          printf 'fixture-secret\n' > secrets/google-client-secret
+      - name: Validate network and secret contract
+        run: |
+          docker compose config --quiet
+          docker compose config --format json | jq -e '
+            (.services.gateway.ports | length == 1) and .services.gateway.ports[0].host_ip == "127.0.0.1" and .services.gateway.ports[0].target == 8080
+            and ((.services.engine.ports // []) | length == 0)
+            and ((.services.gateway.secrets // []) | length == 1)
+          '
+      - name: Build and start the local stack
+        run: docker compose up --build --wait -d
+      - name: Check health and private route boundary
+        run: |
+          curl --fail --silent http://localhost:8080/v1/health | jq -e '.status == "ok"'
+          curl --fail --silent http://localhost:8080/.well-known/oauth-protected-resource | jq -e '.resource == "http://localhost:8080"'
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://localhost:8080/mcp)" = 404
+          docker compose exec -T engine curl --fail --silent http://127.0.0.1:8765/v1/health | jq -e '.status == "ok"'
+      - name: Check policy, token and data volumes survive restart
+        run: |
+          docker compose exec -T gateway cat /var/lib/demo-hub/access-policy.json > policy-before.json
+          docker compose exec -T engine sh -c 'printf preserved > /var/lib/agentpalace/palace/.compose-smoke'
+          docker compose restart
+          docker compose up --wait -d
+          docker compose exec -T gateway cat /var/lib/demo-hub/access-policy.json > policy-after.json
+          cmp policy-before.json policy-after.json
+          docker compose exec -T engine sh -c 'test "$(cat /var/lib/agentpalace/palace/.compose-smoke)" = preserved'
+          docker compose exec -T engine test -f /var/lib/agentpalace-tokens/tokens.json
+          curl --fail --silent http://localhost:8080/v1/health | jq -e '.status == "ok"'
+      - name: Diagnostics
+        if: failure()
+        run: docker compose logs --no-color gateway engine
+      - name: Tear down fixture stack
+        if: always()
+        run: docker compose down --volumes --remove-orphans

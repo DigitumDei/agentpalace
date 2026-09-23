@@ -393,3 +393,23 @@ async fn health_is_public_without_an_attached_access_store() {
     let head = client.head(format!("{base}/v1/health")).send().await.expect("HEAD health");
     assert_eq!(head.status(), StatusCode::OK);
 }
+#[tokio::test]
+async fn demo_pages_expose_only_local_guidance_and_owner_connections() {
+    let (base, client, _temp, _gateway, _access_path) = start_gateway().await;
+    let home = client.get(&base).send().await.expect("home");
+    assert_eq!(home.status(), StatusCode::OK);
+    let body = home.text().await.expect("home body");
+    assert!(body.contains("/device/verify"));
+    assert!(body.contains("/hub/connections"));
+    assert!(!body.contains("/mcp"));
+
+    let anonymous = client.get(format!("{base}/hub/connections")).send().await.expect("connections");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let (cookies, _csrf) = admin_browser(&base, &client).await;
+    let own = client.get(format!("{base}/hub/connections"))
+        .header(header::COOKIE, cookies).send().await.expect("owner connections");
+    assert_eq!(own.status(), StatusCode::OK);
+    assert_eq!(own.headers().get(header::CACHE_CONTROL).expect("cache policy"), "no-store");
+    assert!(own.text().await.expect("connections page").contains("Your connections"));
+}

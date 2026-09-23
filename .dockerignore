@@ -1,0 +1,7 @@
+.git
+.worktrees
+target
+.claude
+demo-hub/.env
+demo-hub/secrets
+demo-hub/local
