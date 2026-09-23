@@ -1,0 +1,22 @@
+{
+  "federation": {
+    "remotes": [
+      {
+        "name": "demo",
+        "url": "http://localhost:8080",
+        "oauth": {
+          "client_id": "agentpalace-local-demo",
+          "allow_loopback_demo": true,
+          "login_mode": "auto"
+        }
+      }
+    ],
+    "default_mode": "local",
+    "wings": {
+      "wing_demo": {
+        "mode": "remote",
+        "remote": "demo"
+      }
+    }
+  }
+}

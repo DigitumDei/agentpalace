@@ -1,0 +1,68 @@
+name: agentpalace-demo
+services:
+  engine:
+    build:
+      context: ..
+      dockerfile: demo-hub/Dockerfile
+      target: engine
+    image: agentpalace-demo-engine:ba2bb3d
+    environment:
+      AGENTPALACE_CONFIG_DIR: /var/lib/agentpalace/config
+      AGENTPALACE_PALACE_PATH: /var/lib/agentpalace/palace
+      XDG_CACHE_HOME: /var/lib/agentpalace/cache
+      AGENTPALACE_STUB_EMBEDDINGS: ${AGENTPALACE_STUB_EMBEDDINGS:-0}
+      AGENTPALACE_EMBED_ALLOW_DOWNLOADS: ${AGENTPALACE_EMBED_ALLOW_DOWNLOADS:-1}
+    volumes:
+      - palace_data:/var/lib/agentpalace
+      - engine_tokens:/var/lib/agentpalace-tokens
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8765/v1/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 300s
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: demo-hub/Dockerfile
+      target: gateway
+    image: agentpalace-demo-gateway:local
+    depends_on:
+      engine:
+        condition: service_healthy
+    environment:
+      DEMO_HUB_BIND: 0.0.0.0:8080
+      DEMO_HUB_ORIGIN: http://localhost:8080
+      DEMO_HUB_LOOPBACK_AUTH: "true"
+      DEMO_HUB_ENGINE_ORIGIN: http://engine:8765
+      DEMO_HUB_ENGINE_TOKEN_FILE: /var/lib/agentpalace-tokens/tokens.json
+      DEMO_HUB_STATE_DIR: /var/lib/demo-hub
+      DEMO_HUB_GOOGLE_CLIENT_ID: ${DEMO_HUB_GOOGLE_CLIENT_ID:?Set in demo-hub/.env}
+      DEMO_HUB_BOOTSTRAP_ADMIN_EMAIL: ${DEMO_HUB_BOOTSTRAP_ADMIN_EMAIL:?Set in demo-hub/.env}
+      DEMO_HUB_ADMIN_MAILBOX_PROVEN: ${DEMO_HUB_ADMIN_MAILBOX_PROVEN:-false}
+      DEMO_HUB_GOOGLE_CLIENT_SECRET_FILE: /run/secrets/google_client_secret
+    secrets:
+      - google_client_secret
+    volumes:
+      - hub_state:/var/lib/demo-hub
+      - engine_tokens:/var/lib/agentpalace-tokens
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/v1/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+secrets:
+  google_client_secret:
+    file: ./secrets/google-client-secret
+
+volumes:
+  palace_data:
+  engine_tokens:
+  hub_state:

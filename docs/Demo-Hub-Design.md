@@ -1,7 +1,6 @@
 # Demo hub design
 
-Status: gateway, persistent access policy, and explicit REST forwarding are implemented in `agentpalace-demo-hub`; the hosting binary does not yet start a listener and no live Google sign-in has been verified. The demo has not shipped and
-AgentPalace is not ready for 1.0.
+Status: gateway, persistent access policy, REST forwarding, and a local Compose package are implemented in `agentpalace-demo-hub` and `demo-hub/`. Live Google sign-in still requires tester-owned credentials and has not been verified here. AgentPalace is not ready for 1.0.
 
 A tester supplies their own Google OAuth credentials and admin email, starts
 the Docker example, and connects a local palace. Public hosting, retention,
@@ -24,7 +23,7 @@ and backup operations are outside the package.
   LLM's owner, separately from the LLM's claimed agent name.
 - HTTPS, login, and deployment-specific identity policy belong to the hosting
   layer. An enterprise deployment can use its own layer, such as Okta.
-- This pass prepares the version bump and design, without implementation or deployment.
+- The local package is implemented for testing; no deployment or live Google-account validation is performed by this work.
 
 ## Current foundations and gaps
 
@@ -94,8 +93,7 @@ Include:
 
 The sample includes no predefined person, real credential, or shared demo
 Google OAuth application. Each tester creates their own Google application.
-Document the actual commands and filenames when the package is implemented;
-this proposal does not claim runnable Compose files already exist.
+The runnable package and exact commands are in [demo-hub/README.md](../demo-hub/README.md).
 
 Google-specific code and access-list administration remain in the gateway.
 Provider-neutral OAuth client and owner-provenance support belong in AgentPalace,

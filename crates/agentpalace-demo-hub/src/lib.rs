@@ -774,6 +774,8 @@ impl Gateway {
     /// Build documented metadata, OAuth, access administration, and explicit REST routes.
     pub fn router(&self) -> Router {
         register_rest_routes(Router::new()
+            .route("/", get(home_page))
+            .route("/hub/connections", get(connections_page))
             .route("/.well-known/oauth-protected-resource", get(protected_metadata))
             .route("/.well-known/oauth-authorization-server", get(authorization_metadata))
             .route("/register", post(register))
@@ -1068,7 +1070,7 @@ impl Gateway {
         user_code: &str,
         identity: VerifiedIdentity,
         consent: bool,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<AdmissionIdentity, ProtocolError> {
         if !consent {
             return Err(ProtocolError::AccessDenied);
         }
@@ -1087,9 +1089,10 @@ impl Gateway {
         }
         match self.resolve_identity(&identity)? {
             Some(decision) => {
-                grant.owner = Some(decision.admission);
+                let owner = decision.admission;
+                grant.owner = Some(owner.clone());
                 grant.role_ceiling = Some(decision.role);
-                Ok(())
+                Ok(owner)
             }
             None => {
                 // The polling client learns of the refusal instead of waiting for expiry.
@@ -1135,7 +1138,7 @@ impl Gateway {
         returned_state: &str,
         claims: &GoogleIdClaims,
         consent: bool,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<AdmissionIdentity, ProtocolError> {
         let (expected_state, expected_nonce) = {
             let state = self.state.lock().map_err(|_| ProtocolError::ServerError)?;
             let grant = state
@@ -2159,6 +2162,37 @@ async fn google_consent(
         Err(error) => error.into_response(),
     }
 }
+/// Give the Google-verified device browser the same owner-scoped session as browser login.
+/// The device cookie, state, and CSRF have already been checked by the calling handler.
+fn device_browser_session_response(
+    g: &Gateway,
+    owner: AdmissionIdentity,
+    transaction_state: &str,
+    mut response: Response,
+) -> Response {
+    let session_id = secret("session", transaction_state, &owner.owner.id.to_string());
+    let csrf = secret("csrf", &session_id, transaction_state);
+    let create = match g.role_for_owner(&owner.owner.id) {
+        Ok(Some(AccessRole::Admin)) => g.create_admin_session(&session_id, owner, &csrf),
+        Ok(Some(_)) => g.create_session(&session_id, owner, &csrf),
+        Ok(None) => Err(ProtocolError::AccessDenied),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = create {
+        return error.into_response();
+    }
+    let secure = secure_attribute(g);
+    if let Ok(value) =
+        format!("agentpalace_session={session_id}; HttpOnly; SameSite=Lax; Path=/{secure}").parse()
+    {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    if let Ok(value) = format!("agentpalace_csrf={csrf}; SameSite=Lax; Path=/{secure}").parse() {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
 /// `; Secure` for every cookie except in the explicit HTTP loopback demo mode.
 fn secure_attribute(g: &Gateway) -> &'static str {
     if g.config.mode == GatewayMode::Secure { "; Secure" } else { "" }
@@ -2405,12 +2439,17 @@ async fn google_device_consent(
     }
     let result = g.complete_device_verification(&r.user_code, &r.state, &claims, true);
     match result {
-        Ok(()) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            "Device authorization approved; you may close this window.",
-        )
-            .into_response(),
+        Ok(owner) => device_browser_session_response(
+            &g,
+            owner,
+            &r.state,
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                "Device authorization approved; <a href=\"/hub/connections\">view your connections</a>.",
+            )
+                .into_response(),
+        ),
         Err(error) => error.into_response(),
     }
 }
@@ -2470,7 +2509,12 @@ async fn verify_device(
         Err(error) => return g.fail_device_verification(&r.user_code, error).into_response(),
     };
     match g.complete_device_verification(&r.user_code, &r.state, &claims, r.consent) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(owner) => device_browser_session_response(
+            &g,
+            owner,
+            &r.state,
+            StatusCode::NO_CONTENT.into_response(),
+        ),
         Err(e) => e.into_response(),
     }
 }
@@ -2488,6 +2532,46 @@ async fn verify_upstream(
     redirect_uri: String,
 ) -> Result<GoogleIdClaims, GoogleClaimError> {
     verifier.exchange_and_verify(&code, &nonce, &redirect_uri).await
+}
+
+fn html_escape(value: &str) -> String {
+    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        .replace('"', "&quot;").replace("'", "&#39;")
+}
+
+async fn home_page() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        "<!doctype html><html lang=en><meta charset=utf-8><title>AgentPalace demo hub</title><h1>AgentPalace demo hub</h1><p>Local test hub. Connect your AgentPalace client to http://localhost:8080 and sign in through its browser authorization flow.</p><p>Using a headless client? <a href=\"/device/verify\">Verify a device code</a>.</p><p><a href=\"/hub/connections\">Your connections</a></p></html>")
+}
+
+async fn connections_page(State(g): State<Gateway>, headers: HeaderMap) -> Response {
+    let Some(session_id) = cookie_value(&headers, "agentpalace_session") else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let handles = match g.own_connection_handles(&session_id) {
+        Ok(handles) => handles,
+        Err(error) => return error.into_response(),
+    };
+    let csrf = match g.state.lock().map_err(|_| ProtocolError::ServerError)
+        .and_then(|state| live_session(&state, &session_id).map(|session| session.csrf.clone()))
+    {
+        Ok(csrf) => csrf,
+        Err(error) => return error.into_response(),
+    };
+    let mut page = String::from("<!doctype html><html lang=en><meta charset=utf-8><title>Your connections</title><h1>Your connections</h1>");
+    if handles.is_empty() {
+        page.push_str("<p>No active connections.</p>");
+    }
+    for handle in handles {
+        let Some(resource) = handle.get("resource").and_then(serde_json::Value::as_str) else { continue };
+        let Some(token) = handle.get("token").and_then(serde_json::Value::as_str) else { continue };
+        page.push_str(&format!("<form method=post action=\"/connections/revoke\"><span>{}</span><input type=hidden name=\"token\" value=\"{}\"><input type=hidden name=\"csrf_token\" value=\"{}\"><button type=submit>Revoke</button></form>",
+            html_escape(resource), html_escape(token), html_escape(&csrf)));
+    }
+    page.push_str("<p><a href=\"/\">Home</a></p></html>");
+    let mut response = ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], page).into_response();
+    response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().expect("static header"));
+    response
 }
 
 async fn session(State(g): State<Gateway>, headers: HeaderMap) -> impl IntoResponse {
@@ -2547,7 +2631,15 @@ async fn revoke_connection(
         .or(r.csrf_token.as_deref())
         .unwrap_or_default();
     match g.revoke_own_grant(session_id, csrf, &r.token) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            if headers.get(header::ACCEPT).and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("text/html"))
+            {
+                Redirect::to("/hub/connections").into_response()
+            } else {
+                StatusCode::NO_CONTENT.into_response()
+            }
+        },
         Err(e) => e.into_response(),
     }
 }
