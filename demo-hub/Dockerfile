@@ -1,5 +1,6 @@
 # The engine is built from this immutable, merged source revision. Update it deliberately.
-FROM rust:1.93.0-bookworm AS engine-builder
+# ONNX Runtime in the locked engine needs C23 glibc symbols supplied by Debian Trixie.
+FROM rust:1.93.0-trixie AS engine-builder
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev libdbus-1-dev pkg-config git && test -f /usr/include/google/protobuf/empty.proto && rm -rf /var/lib/apt/lists/*
 WORKDIR /engine
 RUN git clone --filter=blob:none https://github.com/DigitumDei/agentpalace.git . \
@@ -7,13 +8,13 @@ RUN git clone --filter=blob:none https://github.com/DigitumDei/agentpalace.git .
     && test "$(git rev-parse HEAD)" = "ba2bb3d74845314d4f4031047101ad861dc49fb9"
 RUN cargo build --release --locked -p agentpalace-cli
 
-FROM rust:1.93.0-bookworm AS gateway-builder
+FROM rust:1.93.0-trixie AS gateway-builder
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev libdbus-1-dev pkg-config && test -f /usr/include/google/protobuf/empty.proto && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p agentpalace-demo-hub
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libdbus-1-3 && rm -rf /var/lib/apt/lists/*
 
 FROM runtime AS engine
