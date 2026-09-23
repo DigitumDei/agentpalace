@@ -15,7 +15,7 @@ COPY . .
 RUN cargo build --release --locked -p agentpalace-demo-hub
 
 FROM debian:trixie-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libdbus-1-3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libdbus-1-3 libstdc++6 && rm -rf /var/lib/apt/lists/*
 
 FROM runtime AS engine
 COPY --from=engine-builder /engine/target/release/agentpalace /usr/local/bin/agentpalace
