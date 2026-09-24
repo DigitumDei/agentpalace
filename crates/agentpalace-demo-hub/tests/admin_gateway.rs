@@ -125,7 +125,7 @@ async fn admin_browser(base: &str, client: &reqwest::Client) -> (String, String)
         .header(header::COOKIE, format!("agentpalace_browser={browser}"))
         .form(&[("transaction", transaction.as_str()), ("csrf_token", csrf.as_str()), ("consent", "true")])
         .send().await.expect("consent");
-    assert_eq!(consent.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(consent.status(), StatusCode::SEE_OTHER);
     let session = response_cookie(&consent, "agentpalace_session").expect("session cookie");
     let csrf_cookie = response_cookie(&consent, "agentpalace_csrf").expect("csrf cookie");
     (format!("agentpalace_session={session}; agentpalace_csrf={csrf_cookie}"), csrf_cookie)
