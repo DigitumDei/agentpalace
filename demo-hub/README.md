@@ -34,7 +34,7 @@ The final command deletes the demo volumes and cannot be undone. It does not tou
 
 ## Connect a local client
 
-Merge [client-config.example.json](client-config.example.json) into your local `~/.agentpalace/config.json` (preserve your existing settings). Its remote and route are:
+Merge [client-config.example.json](client-config.example.json) into the configuration used by your local AgentPalace MCP server. Append the `demo` entry to `federation.remotes` and add `wing_demo` to `federation.wings`; keep every existing remote, route, and other setting. Restart the MCP connection to load the changed configuration. The added remote and route are:
 
 ```json
 {
@@ -56,12 +56,11 @@ Merge [client-config.example.json](client-config.example.json) into your local `
 }
 ```
 
-The exact `allow_loopback_demo` opt-in is necessary for this localhost issuer. It does not permit other HTTP OAuth servers. Use the same URL spelling in the remote and login command. A desktop login opens the browser; a WSL/headless client can use device verification:
+If you are adding `demo` to a config that already has one remote and uses `default_mode: combined` or `remote`, set `federation.default_remote` to the **existing** remote. Also give every existing remote/combined wing or coordination rule an explicit `remote` name; single-remote inference becomes ambiguous once `demo` is added. This preserves the existing routes while only `wing_demo` points to the demo.
 
-```sh
-agentpalace auth login --remote demo --resource-metadata http://localhost:8080/.well-known/oauth-protected-resource --mode browser
-agentpalace auth login --remote demo --resource-metadata http://localhost:8080/.well-known/oauth-protected-resource --mode device
-```
+The exact `allow_loopback_demo` opt-in is necessary for this localhost issuer. It does not permit other HTTP OAuth servers. The MCP server uses the configured remote directly; the public gateway's `/mcp` path remains private/404.
+
+Ask the connected MCP agent to read `wing_demo`. On the first protected request it receives `authentication_required` and should immediately call `agentpalace_remote_auth_start` with `{"remote":"demo"}`. With `login_mode: auto`, a desktop MCP process opens the system browser for a loopback callback and returns `authorization_url` as a manual link if no tab appears. When a browser/callback is unavailable or launching the browser fails, it returns `verification_uri` and `user_code` instead; open that link and enter the code. The agent calls `agentpalace_remote_auth_status` until it reports `authenticated`, then retries the original MCP request. For WSL or other headless clients, set `login_mode: device` if you need to sign in from a different browser profile without an inbound callback. Do not paste private device codes, bearer tokens, or client secrets into a tool response.
 
 For device mode, enter the displayed user code at [http://localhost:8080/device/verify](http://localhost:8080/device/verify). The browser consent page confirms a login, and [your connections](http://localhost:8080/hub/connections) lists and revokes only grants associated with your signed-in browser session. A gateway restart preserves policy and data but ends in-memory browser/OAuth sessions; sign in again afterward.
 

@@ -1,5 +1,6 @@
 #![allow(missing_docs)]
 
+mod auth;
 mod federation;
 mod maintenance;
 mod metrics;
@@ -263,6 +264,8 @@ pub enum ToolRoutingCategory {
 enum ToolName {
     WakeUp,
     Status,
+    RemoteAuthStart,
+    RemoteAuthStatus,
     ListWings,
     CoordinationWings,
     ListRooms,
@@ -333,10 +336,12 @@ enum ToolName {
 }
 
 impl ToolName {
-    fn all() -> [Self; 69] {
+    fn all() -> [Self; 71] {
         [
             Self::WakeUp,
             Self::Status,
+            Self::RemoteAuthStart,
+            Self::RemoteAuthStatus,
             Self::ListWings,
             Self::CoordinationWings,
             Self::ListRooms,
@@ -411,6 +416,8 @@ impl ToolName {
         match self {
             Self::WakeUp => "agentpalace_wake_up",
             Self::Status => "agentpalace_status",
+            Self::RemoteAuthStart => "agentpalace_remote_auth_start",
+            Self::RemoteAuthStatus => "agentpalace_remote_auth_status",
             Self::ListWings => "agentpalace_list_wings",
             Self::CoordinationWings => "agentpalace_coordination_wings",
             Self::ListRooms => "agentpalace_list_rooms",
@@ -504,6 +511,16 @@ impl ToolName {
                         "diary_since":{"type":"string","description":"Return wake-up diary entries filed at or after this RFC 3339 timestamp (optional, default: 24 hours ago)"}
                     }
                 }),
+            },
+            Self::RemoteAuthStart => ToolDefinition {
+                name: self.as_str(),
+                description: "Start OAuth sign-in for a configured federation remote. Desktop auto/browser mode opens the system browser and returns its authorization URL as a fallback; headless/device mode returns a verification link and one-time code. The MCP server waits for approval and saves the grant.",
+                input_schema: json!({"type":"object","properties":{"remote":{"type":"string"}},"required":["remote"]}),
+            },
+            Self::RemoteAuthStatus => ToolDefinition {
+                name: self.as_str(),
+                description: "Check an MCP-started remote sign-in. When authenticated, retry the original remote request.",
+                input_schema: json!({"type":"object","properties":{"remote":{"type":"string"}},"required":["remote"]}),
             },
             Self::Status => ToolDefinition {
                 name: self.as_str(),
@@ -1088,6 +1105,8 @@ impl ToolName {
     fn routing(self) -> ToolRoutingCategory {
         match self {
             Self::WakeUp
+            | Self::RemoteAuthStart
+            | Self::RemoteAuthStatus
             | Self::DiaryWrite
             | Self::DiaryRead
             | Self::GetChangesSince
@@ -1267,6 +1286,7 @@ pub struct McpServer<P> {
     runtime: Arc<Mutex<McpRuntime<P>>>,
     memory_executor: MemoryExecutor,
     leases: Arc<LeaseRuntime>,
+    auth: Arc<auth::RemoteAuth>,
     lease_queue_limit: Arc<Semaphore>,
     queue_limit: Arc<Semaphore>,
 }
@@ -1277,6 +1297,7 @@ impl<P> Clone for McpServer<P> {
             runtime: self.runtime.clone(),
             memory_executor: self.memory_executor.clone(),
             leases: self.leases.clone(),
+            auth: self.auth.clone(),
             lease_queue_limit: self.lease_queue_limit.clone(),
             queue_limit: self.queue_limit.clone(),
         }
@@ -1388,6 +1409,9 @@ where
             (!router.remotes.is_empty())
                 .then(|| (runtime.outbox.clone(), router.remotes.clone(), runtime.metrics.clone()))
         });
+        let auth = Arc::new(auth::RemoteAuth::new(
+            runtime.federation.as_ref().map_or_else(BTreeMap::new, |router| router.oauth_remotes.clone()),
+        ));
         let leases = Arc::new(LeaseRuntime::from_runtime(&runtime));
         let runtime = Arc::new(Mutex::new(runtime));
         if let Some((outbox, remotes, metrics)) = federation_worker {
@@ -1398,6 +1422,7 @@ where
             memory_executor: MemoryExecutor::new()?,
             runtime,
             leases,
+            auth,
             lease_queue_limit: Arc::new(Semaphore::new(queue_limit)),
             queue_limit: Arc::new(Semaphore::new(queue_limit)),
         })
@@ -1493,7 +1518,22 @@ where
             }
         };
 
-        let result = if lease_call {
+        let result = if matches!(tool, ToolName::RemoteAuthStart | ToolName::RemoteAuthStatus) {
+            let name = call.arguments.get("remote").and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| ToolError::InvalidParams("remote must be a nonempty string".to_owned()));
+            match name {
+                Ok(name) => {
+                    let result = if matches!(tool, ToolName::RemoteAuthStart) {
+                        self.auth.start(name).await
+                    } else {
+                        self.auth.status(name).await
+                    };
+                    result.map_err(|message| ToolError::Internal(McpError::Execution(message)))
+                }
+                Err(error) => Err(error),
+            }
+        } else if lease_call {
             match tool {
                 ToolName::TaskGet => self.leases.tool_task_get(&call.arguments).await,
                 ToolName::TaskClaim => self.leases.tool_task_claim(&call.arguments).await,
@@ -13455,6 +13495,7 @@ mod tests {
         let server = McpServer {
             memory_executor: MemoryExecutor::new().unwrap(),
             leases: Arc::new(LeaseRuntime::from_runtime(&runtime)),
+            auth: Arc::new(auth::RemoteAuth::new(BTreeMap::new())),
             lease_queue_limit: Arc::new(Semaphore::new(8)),
             runtime: Arc::new(Mutex::new(runtime)),
             queue_limit: Arc::new(Semaphore::new(8)),
@@ -15451,6 +15492,7 @@ mod tests {
             memory_executor: MemoryExecutor::new().unwrap(),
             runtime: Arc::new(Mutex::new(runtime)),
             leases,
+            auth: Arc::new(auth::RemoteAuth::new(BTreeMap::new())),
             lease_queue_limit: Arc::new(Semaphore::new(queue_limit)),
             queue_limit: Arc::new(Semaphore::new(queue_limit)),
         };

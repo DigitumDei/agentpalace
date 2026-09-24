@@ -195,15 +195,16 @@ retrieved. The provenance crosswalk is intentionally bounded:
   the response fields but currently returns those provenance fields as `null`.
   The change feed exposes the current actor for drawer writes/deletes.
 - KG writes and invalidations expose their result and actor through the change
-  feed; KG query/timeline/stats do not fabricate an owner envelope.
+  feed. KG query and timeline return stored provenance when available; stats
+  remain aggregate counts without an owner envelope.
 - Ingest returns per-file status only; attribution is retrieved from the
   resulting drawer rows and change feed after a successful batch.
 - Coordination DTOs and coordination events expose namespaced agent/actor,
   creator, sender, recipient, worker, or owner strings as specified in the
   route rows. They do not yet expose verified human-owner metadata.
 - Health and info have no durable resource provenance. Token owner introspection
-  remains a gateway/storage-slice concern, and no route in this inventory claims
-  durable human-owner attribution before that slice lands.
+  remains a gateway concern; KG query and timeline return stored fact provenance
+  when available.
 
 This audit deliberately does not count local-only diaries, the local HTTP MCP
 transport, MCP-only operations, or test-helper routes. A method/path absent from
@@ -430,12 +431,13 @@ delegation/telemetry surfaces remain excluded.
     - `confidence`: f32 (e.g., `1.0`)
     - `source_closet`: Option<string> (source drawer/closet ID if tracked)
     - `current`: bool (whether the fact is currently active as of query date)
+    - `provenance`: Option<ProvenanceResponse> (stored creator and authenticated submitter when available; omitted for facts without provenance)
   - `count`: usize (number of matching facts returned)
   *(An unknown entity returns `facts: []` and `count: 0`)*.
 - **Durable Store:** SQLite operational store (`kg_facts`, `kg_entities`).
 - **Idempotency & Receipts:** Naturally idempotent read.
 - **Crash Recovery:** Read-only SQLite query.
-- **Provenance Status:** `KnowledgeQueryRow` returns graph attributes (`direction`, `subject`, `predicate`, `object`, validity dates `valid_from`/`valid_to`, `confidence`, `source_closet`, `current`). It does not include an authenticated human owner envelope (`owner.id`, `email_at_write`). Durable owner attribution and query-time owner envelope retrieval are deferred to the storage slice.
+- **Provenance Status:** `KnowledgeQueryRow` returns stored `ProvenanceResponse` when available, including creator and authenticated submitter owner summaries. Facts without stored provenance omit the optional field.
 
 #### 10. `POST /v1/kg/facts`
 - **Operation Gate:** `write`.
@@ -502,12 +504,13 @@ delegation/telemetry surfaces remain excluded.
     - `valid_from`: Option<string>
     - `valid_to`: Option<string>
     - `current`: bool
+    - `provenance`: Option<ProvenanceResponse> (stored creator and authenticated submitter when available; omitted for facts without provenance)
   - `count`: usize (number of timeline rows returned after limit)
   - `total_count`: usize (total timeline events available before limit truncation)
 - **Durable Store:** SQLite operational store (`kg_facts`).
 - **Idempotency & Receipts:** Naturally idempotent read.
 - **Crash Recovery:** Read-only SQLite query.
-- **Provenance Status:** Chronological validity timeline; owner provenance deferred to storage slice.
+- **Provenance Status:** Timeline rows include stored `ProvenanceResponse` when available; facts without stored provenance omit the optional field.
 
 #### 13. `GET /v1/kg/stats`
 - **Operation Gate:** `read`.

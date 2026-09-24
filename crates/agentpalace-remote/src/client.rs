@@ -238,6 +238,22 @@ impl RemoteClient {
         self.execute(self.http.get(url), CallKind::Read).await
     }
 
+    /// Recheck the protected resource when an MCP caller requests sign-in. This bypasses the
+    /// cached version handshake so a grant revoked after an earlier success is not mistaken for
+    /// an authenticated session.
+    pub async fn login_challenge(&self) -> Result<Option<String>> {
+        match self.fetch_info().await {
+            Ok(_) => Ok(None),
+            Err(error @ RemoteError::AuthenticationRequired { resource_metadata: None, .. }) => {
+                Err(error)
+            }
+            Err(RemoteError::AuthenticationRequired { resource_metadata: Some(url), .. }) => {
+                Ok(Some(url))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Ensure the version handshake has been performed, returning a reference
     /// to the cached [`InfoResponse`].
     ///
@@ -461,7 +477,7 @@ impl RemoteClient {
         if self.oauth.is_some() {
             RemoteError::AuthenticationRequired {
                 remote: self.name.clone(),
-                action: "run the explicit remote OAuth login command".to_owned(),
+                action: "start OAuth sign-in for this remote (MCP: agentpalace_remote_auth_start)".to_owned(),
                 resource_metadata: challenge,
             }
         } else {
@@ -816,13 +832,25 @@ impl RemoteClient {
         resource_metadata: &str,
         mode: Option<agentpalace_config::OAuthLoginMode>,
     ) -> Result<()> {
+        self.login_from_challenge_with_interaction(resource_metadata, mode, None).await
+    }
+
+    /// Discover a challenged issuer using a host-provided prompt surface. MCP can return a
+    /// device verification link to its caller instead of printing it to hidden stderr.
+    pub async fn login_from_challenge_with_interaction(
+        &self,
+        resource_metadata: &str,
+        mode: Option<agentpalace_config::OAuthLoginMode>,
+        interaction: Option<std::sync::Arc<dyn crate::LoginInteraction>>,
+    ) -> Result<()> {
         let config = self.oauth_config()?;
         let (protected, metadata) = self.discover(resource_metadata).await?;
         let mode = crate::select_login_mode(
             mode.unwrap_or(config.login_mode),
             crate::browser_callback_usable(),
         );
-        self.interactive_login(&metadata, &protected.resource, mode).await
+        self.interactive_login_with_interaction(&metadata, &protected.resource, mode, interaction)
+            .await
     }
 
     async fn interactive_login(
@@ -831,7 +859,20 @@ impl RemoteClient {
         resource: &str,
         mode: agentpalace_config::OAuthLoginMode,
     ) -> Result<()> {
-        let config = self.oauth_config()?;
+        self.interactive_login_with_interaction(metadata, resource, mode, None).await
+    }
+
+    async fn interactive_login_with_interaction(
+        &self,
+        metadata: &crate::AuthorizationServerMetadata,
+        resource: &str,
+        mode: agentpalace_config::OAuthLoginMode,
+        interaction: Option<std::sync::Arc<dyn crate::LoginInteraction>>,
+    ) -> Result<()> {
+        let mut config = self.oauth_config()?.clone();
+        if let Some(interaction) = interaction {
+            config.interaction = Some(interaction);
+        }
         let observed = self.session_generation.load(Ordering::SeqCst);
         let _guard = self.login_lock.lock().await;
         // A caller that waited while another caller committed a grant for the same identity
@@ -849,9 +890,9 @@ impl RemoteClient {
         }
         let session = match mode {
             agentpalace_config::OAuthLoginMode::Device => {
-                crate::device_login(&self.http, metadata, config, resource).await
+                crate::device_login(&self.http, metadata, &config, resource).await
             }
-            _ => crate::browser_login(&self.http, metadata, config, resource).await,
+            _ => crate::browser_login(&self.http, metadata, &config, resource).await,
         }
         .map_err(|message| self.login_failed(message))?;
         *self.trusted_metadata.lock().await = Some(metadata.clone());
@@ -880,7 +921,7 @@ impl RemoteClient {
     pub async fn refresh(&self, metadata: &crate::AuthorizationServerMetadata) -> Result<()> {
         let _guard = self.login_lock.lock().await;
         let current = self.oauth_session.lock().await.clone().ok_or_else(|| {
-            self.login_failed("run the explicit remote OAuth login command".to_owned())
+            self.login_failed("start OAuth sign-in for this remote (MCP: agentpalace_remote_auth_start)".to_owned())
         })?;
         match crate::refresh(&self.http, metadata, &current).await {
             Ok(session) => self.commit_locked(session).await,

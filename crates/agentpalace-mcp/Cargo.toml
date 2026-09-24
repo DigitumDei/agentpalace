@@ -31,6 +31,7 @@ async-trait = "0.1.89"
 axum = { version = "0.8", default-features = true }
 agentpalace-server = { path = "../agentpalace-server" }
 rusqlite = "0.39.0"
+reqwest = { version = "0.12", default-features = false }
 tempfile = "3.23.0"
 
 [lints]

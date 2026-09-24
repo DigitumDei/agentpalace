@@ -25,6 +25,8 @@ use crate::{McpError, ToolError, ToolResult};
 pub struct FederationRouter {
     pub rules: FederationRuntimeConfig,
     pub remotes: BTreeMap<String, Arc<dyn RemoteApi>>,
+    /// Concrete OAuth clients used only by the explicit MCP sign-in flow.
+    pub oauth_remotes: BTreeMap<String, Arc<RemoteClient>>,
 }
 
 impl fmt::Debug for FederationRouter {
@@ -39,6 +41,7 @@ impl fmt::Debug for FederationRouter {
 impl FederationRouter {
     pub fn new(rules: FederationRuntimeConfig) -> Self {
         let mut remotes = BTreeMap::new();
+        let mut oauth_remotes = BTreeMap::new();
         for (name, remote) in &rules.remotes {
             let endpoint = RemoteEndpoint {
                 name: remote.name.clone(),
@@ -58,7 +61,11 @@ impl FederationRouter {
             };
             match RemoteClient::new(endpoint) {
                 Ok(client) => {
-                    remotes.insert(name.clone(), Arc::new(client) as Arc<dyn RemoteApi>);
+                    let client = Arc::new(client);
+                    if remote.oauth.is_some() {
+                        oauth_remotes.insert(name.clone(), client.clone());
+                    }
+                    remotes.insert(name.clone(), client as Arc<dyn RemoteApi>);
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -69,7 +76,7 @@ impl FederationRouter {
                 }
             }
         }
-        Self { rules, remotes }
+        Self { rules, remotes, oauth_remotes }
     }
 
     /// Direct-construction entry point for tests and callers that provide
@@ -78,7 +85,7 @@ impl FederationRouter {
         rules: FederationRuntimeConfig,
         remotes: BTreeMap<String, Arc<dyn RemoteApi>>,
     ) -> Self {
-        Self { rules, remotes }
+        Self { rules, remotes, oauth_remotes: BTreeMap::new() }
     }
 
     pub fn has_remotes(&self) -> bool {
@@ -2612,13 +2619,18 @@ fn remote_error_classification(error: &RemoteError) -> &'static str {
 /// Structured partial-read degradation record (issue #127 requires machine-actionable
 /// degradation, not bare strings).
 fn structured_degradation(remote: &str, kind: &str, error: &RemoteError) -> Value {
-    json!({
+    let mut record = json!({
         "code": "remote_read_degraded",
         "remote": remote,
         "kind": kind,
         "error": error.to_string(),
         "classification": remote_error_classification(error),
-    })
+    });
+    if matches!(error, RemoteError::AuthenticationRequired { .. }) {
+        record["auth"] =
+            json!({ "tool": "agentpalace_remote_auth_start", "arguments": { "remote": remote } });
+    }
+    record
 }
 
 /// Attach a structured degradation to a combined-read payload while preserving the legacy
@@ -2857,6 +2869,24 @@ mod tests {
         ListDrawersResponse,
     };
     use agentpalace_remote::RemoteError;
+
+    #[test]
+    fn auth_required_degradation_points_to_mcp_sign_in_without_changing_other_errors() {
+        let auth = RemoteError::AuthenticationRequired {
+            remote: "demo".to_owned(),
+            action: "sign in".to_owned(),
+            resource_metadata: None,
+        };
+        let record = structured_degradation("demo", "search", &auth);
+        assert_eq!(record["classification"], "authentication_required");
+        assert_eq!(record["auth"]["tool"], "agentpalace_remote_auth_start");
+        assert_eq!(record["auth"]["arguments"]["remote"], "demo");
+        let unavailable = RemoteError::Unreachable {
+            remote: "demo".to_owned(),
+            message: "offline".to_owned(),
+        };
+        assert!(structured_degradation("demo", "search", &unavailable).get("auth").is_none());
+    }
 
     // ─── merge_search_results_nway unit tests ────────────────────────────────
 

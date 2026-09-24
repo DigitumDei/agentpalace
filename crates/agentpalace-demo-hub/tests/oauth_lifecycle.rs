@@ -585,13 +585,13 @@ async fn browser_authorize(
         let callback = browser
             .get(&format!("{hub}/auth/google/callback?state={transaction}&error=access_denied"))
             .await;
-        assert_eq!(callback.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(callback.status(), StatusCode::SEE_OTHER);
         return location(&callback);
     }
     let (code, _) = idp.authorize(&google, account);
     let callback =
         browser.get(&format!("{hub}/auth/google/callback?state={transaction}&code={code}")).await;
-    if callback.status() == StatusCode::TEMPORARY_REDIRECT {
+    if callback.status() == StatusCode::SEE_OTHER {
         // The hub refused the upstream assertion and told the native client directly.
         return location(&callback);
     }
@@ -610,8 +610,8 @@ async fn browser_authorize(
         .await;
     assert_eq!(
         submitted.status(),
-        StatusCode::TEMPORARY_REDIRECT,
-        "consent always returns to the native client"
+        StatusCode::SEE_OTHER,
+        "consent must redirect the browser to the native client with GET"
     );
     location(&submitted)
 }
@@ -814,6 +814,62 @@ async fn browser_login(
 // ── Browser authorization ────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn consent_post_redirects_with_get_to_native_loopback() {
+    let idp = Idp::start().await;
+    let hub = Hub::start(&idp, "/api", FAST_DEVICE).await;
+    let browser = Browser::new();
+    let (listener, callback_base) = bind().await;
+    let callback_url = format!("{callback_base}/callback");
+    let mut authorize = reqwest::Url::parse(&hub.url("/authorize")).expect("authorize URL");
+    authorize.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", NATIVE_CLIENT_ID)
+        .append_pair("redirect_uri", &callback_url)
+        .append_pair("code_challenge", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", "consent-get-regression")
+        .append_pair("resource", &hub.resource);
+
+    let start = browser.get(authorize.as_str()).await;
+    assert_eq!(start.status(), StatusCode::TEMPORARY_REDIRECT);
+    let google = location(&start);
+    let transaction = query(&google, "state").expect("hub transaction");
+    let (code, _) = idp.authorize(&google, Account::owner());
+    let consent = browser.get(&hub.url(&format!(
+        "/auth/google/callback?state={transaction}&code={code}"
+    ))).await;
+    assert_eq!(consent.status(), StatusCode::OK);
+    let page = consent.text().await.expect("consent page");
+
+    let callback = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("native callback");
+        let mut request = [0_u8; 2048];
+        let count = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await.expect("request");
+        let first_line = String::from_utf8_lossy(&request[..count])
+            .lines().next().unwrap_or_default().to_owned();
+        tokio::io::AsyncWriteExt::write_all(
+            &mut socket,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+        ).await.expect("callback response");
+        first_line
+    });
+    let following_browser = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build().expect("browser with redirects");
+    let finished = browser.attach(following_browser.post(hub.url("/auth/google/consent")))
+        .form(&[
+            ("transaction", form_value(&page, "transaction")),
+            ("csrf_token", form_value(&page, "csrf_token")),
+            ("consent", "true".to_owned()),
+        ])
+        .send().await.expect("consent submission and redirect");
+    assert_eq!(finished.status(), StatusCode::OK);
+    let request = callback.await.expect("native callback capture");
+    assert_eq!(request.split_whitespace().next(), Some("GET"), "callback must use GET");
+    assert!(request.starts_with("GET /callback?"), "callback must target /callback");
+}
+
+#[tokio::test]
 async fn browser_login_uses_a_dynamic_loopback_and_reaches_the_protected_resource() {
     let idp = Idp::start().await;
     let hub = Hub::start(&idp, "/api", FAST_DEVICE).await;
@@ -998,7 +1054,7 @@ async fn stolen_consent_forms_forged_csrf_replay_and_mismatched_exchanges_are_re
             &[("transaction", &transaction), ("csrf_token", &csrf), ("consent", "true")],
         )
         .await;
-    assert_eq!(approved.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(approved.status(), StatusCode::SEE_OTHER);
     let callback = location(&approved);
     assert!(callback.starts_with(redirect_uri));
     assert_eq!(query(&callback, "state").as_deref(), Some("victim-state"));

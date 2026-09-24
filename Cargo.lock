@@ -192,6 +192,7 @@ dependencies = [
  "axum",
  "blake3",
  "dirs",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

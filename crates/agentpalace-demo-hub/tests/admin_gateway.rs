@@ -125,7 +125,7 @@ async fn admin_browser(base: &str, client: &reqwest::Client) -> (String, String)
         .header(header::COOKIE, format!("agentpalace_browser={browser}"))
         .form(&[("transaction", transaction.as_str()), ("csrf_token", csrf.as_str()), ("consent", "true")])
         .send().await.expect("consent");
-    assert_eq!(consent.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(consent.status(), StatusCode::SEE_OTHER);
     let session = response_cookie(&consent, "agentpalace_session").expect("session cookie");
     let csrf_cookie = response_cookie(&consent, "agentpalace_csrf").expect("csrf cookie");
     (format!("agentpalace_session={session}; agentpalace_csrf={csrf_cookie}"), csrf_cookie)
@@ -339,6 +339,16 @@ async fn public_gateway_forwarding_is_closed_authenticated_and_owner_scoped() {
     assert_eq!(head_health.status(), StatusCode::OK);
     assert_eq!(client.get(format!("{base}/mcp")).send().await.expect("integration test setup").status(), StatusCode::NOT_FOUND);
     assert_eq!(client.get(format!("{base}/v1/unknown")).send().await.expect("integration test setup").status(), StatusCode::NOT_FOUND);
+
+    let challenge = format!("Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource\"");
+    for bearer in [None, Some("invalid-grant")] {
+        let mut request = client.get(format!("{base}/v1/info"));
+        if let Some(bearer) = bearer { request = request.bearer_auth(bearer); }
+        let denied = request.send().await.expect("integration test setup");
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(denied.headers().get(header::WWW_AUTHENTICATE).and_then(|value| value.to_str().ok()), Some(challenge.as_str()));
+    }
+    assert!(seen.lock().expect("integration test setup").is_empty(), "unauthenticated requests must not reach the engine");
 
     let read = client.get(format!("{base}/v1/info")).bearer_auth(&token).send().await.expect("integration test setup");
     assert_eq!(read.status(), StatusCode::OK);

@@ -449,6 +449,7 @@ Clients (the CLI and the MCP server) read `federation` from
   continues (falling back to inline `token`, or unauthenticated if neither is set)
   — local-only operation never breaks because of a missing remote token.
 - `url` must be `http://` or `https://`; any other scheme fails config load.
+- With multiple remotes, set `federation.default_remote` when `default_mode` is `remote` or `combined`, and name the remote explicitly on each non-local wing or coordination rule. This preserves routing that previously relied on single-remote inference.
 - Locator-backed ingestion requires a matching `server.checkouts` directory.
   Missing mappings reject new batches; previously stored stale rows are unchanged.
 
