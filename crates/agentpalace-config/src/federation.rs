@@ -6,8 +6,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use agentpalace_core::{
-    DIARY_ROOM, DIARY_TOPIC_PREFIX, AgentPalaceError, Result, SHARED_AGENT_DIARY_WING, UNSCOPED_WING,
-    WingId,
+    AgentPalaceError, DIARY_ROOM, DIARY_TOPIC_PREFIX, Result, SHARED_AGENT_DIARY_WING,
+    UNSCOPED_WING, WingId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,10 @@ pub struct FederationConfigV1 {
     /// Default routing mode when no per-wing or per-project rule matches.
     #[serde(default)]
     pub default_mode: Option<RouteMode>,
+    /// Named remote used by a non-local default route when multiple remotes are configured.
+    /// Omit for legacy single-remote inference.
+    #[serde(default)]
+    pub default_remote: Option<String>,
     /// Per-wing routing rules; key is the wing name.
     #[serde(default)]
     pub wings: BTreeMap<String, RouteRuleV1>,
@@ -106,7 +110,9 @@ pub enum OAuthLoginMode {
 }
 
 impl Default for OAuthLoginMode {
-    fn default() -> Self { Self::Auto }
+    fn default() -> Self {
+        Self::Auto
+    }
 }
 
 /// How requests for a particular resource are routed.
@@ -347,23 +353,32 @@ pub(crate) fn resolve_federation_config(
         let token = resolve_token(&raw.name, raw.token_env.as_deref(), raw.token, &env_lookup);
         let timeout = Duration::from_millis(raw.timeout_ms.unwrap_or(DEFAULT_REMOTE_TIMEOUT_MS));
 
-        let oauth = raw.oauth.map(|oauth| {
-            if oauth.client_id.trim().is_empty() {
-                return Err(AgentPalaceError::ConfigParse {
-                    path: config_path.to_path_buf(),
-                    message: format!("federation.remotes.{}.oauth.client_id must not be empty", raw.name),
-                });
-            }
-            Ok(ResolvedOAuthConfig {
-            client_id: oauth.client_id,
-            account: oauth.account,
-            allow_in_memory: oauth.allow_in_memory,
-            allow_loopback_demo: oauth.allow_loopback_demo,
-            login_mode: oauth.login_mode,
-            login_timeout_seconds: oauth.login_timeout_seconds.unwrap_or(300),
+        let oauth = raw
+            .oauth
+            .map(|oauth| {
+                if oauth.client_id.trim().is_empty() {
+                    return Err(AgentPalaceError::ConfigParse {
+                        path: config_path.to_path_buf(),
+                        message: format!(
+                            "federation.remotes.{}.oauth.client_id must not be empty",
+                            raw.name
+                        ),
+                    });
+                }
+                Ok(ResolvedOAuthConfig {
+                    client_id: oauth.client_id,
+                    account: oauth.account,
+                    allow_in_memory: oauth.allow_in_memory,
+                    allow_loopback_demo: oauth.allow_loopback_demo,
+                    login_mode: oauth.login_mode,
+                    login_timeout_seconds: oauth.login_timeout_seconds.unwrap_or(300),
+                })
             })
-        }).transpose()?;
-        remotes.insert(raw.name.clone(), ResolvedRemote { name: raw.name, url, token, oauth, timeout });
+            .transpose()?;
+        remotes.insert(
+            raw.name.clone(),
+            ResolvedRemote { name: raw.name, url, token, oauth, timeout },
+        );
     }
 
     // ── 2. Resolve wing rules ─────────────────────────────────────────────────
@@ -452,11 +467,28 @@ pub(crate) fn resolve_federation_config(
 
     // ── 5. Resolve default_mode ───────────────────────────────────────────────
     let default_mode = section.default_mode.unwrap_or(RouteMode::Local);
-    let default_remote = match default_mode {
-        RouteMode::Local => None,
-        RouteMode::Remote | RouteMode::Combined => {
-            let name = infer_single_remote("federation.default_mode", &remotes, config_path)?;
+    let default_remote = match (default_mode, section.default_remote) {
+        (RouteMode::Local, None) => None,
+        (RouteMode::Local, Some(_)) => {
+            return Err(AgentPalaceError::ConfigParse {
+                path: config_path.to_path_buf(),
+                message: "federation.default_remote requires default_mode: remote or combined"
+                    .to_owned(),
+            });
+        }
+        (RouteMode::Remote | RouteMode::Combined, Some(name)) => {
+            if !remotes.contains_key(&name) {
+                return Err(AgentPalaceError::ConfigParse {
+                    path: config_path.to_path_buf(),
+                    message: format!(
+                        "federation.default_remote references unknown remote `{name}`"
+                    ),
+                });
+            }
             Some(name)
+        }
+        (RouteMode::Remote | RouteMode::Combined, None) => {
+            Some(infer_single_remote("federation.default_mode", &remotes, config_path)?)
         }
     };
 
@@ -672,7 +704,10 @@ pub fn resolve_kg_route(federation: &FederationRuntimeConfig) -> ResolvedRouteRu
 ///   `ServerError::UnscopedNotFederated`). This function is the actual authorization gate for
 ///   coordination egress (see the note below), so it already fails closed on it, rather than
 ///   relying solely on the server-side refusal.
-pub fn resolve_coordination_route(federation: &FederationRuntimeConfig, wing: &str) -> ResolvedRouteRule {
+pub fn resolve_coordination_route(
+    federation: &FederationRuntimeConfig,
+    wing: &str,
+) -> ResolvedRouteRule {
     // Defence in depth: normalise here too, even though `agentpalace-mcp`'s `tool_task_create`
     // already normalises before calling in. This function is the actual authorization gate for
     // coordination egress (see the doc comment above), so it must not trust a caller to have
@@ -686,7 +721,8 @@ pub fn resolve_coordination_route(federation: &FederationRuntimeConfig, wing: &s
         return local_rule();
     };
     let wing = canonical.as_str();
-    if wing == SHARED_AGENT_DIARY_WING || wing == UNSCOPED_WING || wing == DEFAULT_COORDINATION_WING {
+    if wing == SHARED_AGENT_DIARY_WING || wing == UNSCOPED_WING || wing == DEFAULT_COORDINATION_WING
+    {
         return local_rule();
     }
     if let Some(rule) = federation.coordination.get(wing) {
@@ -882,6 +918,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: None,
+            default_remote: None,
             wings: {
                 let mut m = BTreeMap::new();
                 m.insert(
@@ -916,6 +953,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: None,
+            default_remote: None,
             wings: {
                 let mut m = BTreeMap::new();
                 m.insert(
@@ -954,6 +992,7 @@ mod tests {
                 },
             ],
             default_mode: None,
+            default_remote: None,
             wings: {
                 let mut m = BTreeMap::new();
                 m.insert(
@@ -974,6 +1013,7 @@ mod tests {
         let section = FederationConfigV1 {
             remotes: vec![],
             default_mode: None,
+            default_remote: None,
             wings: {
                 let mut m = BTreeMap::new();
                 m.insert(
@@ -1012,6 +1052,7 @@ mod tests {
                 },
             ],
             default_mode: Some(RouteMode::Remote),
+            default_remote: None,
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
@@ -1032,6 +1073,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: Some(RouteMode::Remote),
+            default_remote: None,
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
@@ -1039,6 +1081,36 @@ mod tests {
         let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
         assert_eq!(fed.default_mode, RouteMode::Remote);
         assert_eq!(fed.default_remote.as_deref(), Some("solo"));
+    }
+
+    #[test]
+    fn explicit_default_remote_preserves_combined_fallback_with_two_remotes() {
+        let section: FederationConfigV1 = serde_json::from_str(
+            r#"{"remotes":[{"name":"actuarius","url":"https://actuarius.example"},
+                            {"name":"demo","url":"https://demo.example"}],
+                "default_mode":"combined","default_remote":"actuarius"}"#,
+        )
+        .unwrap();
+        let fed = resolve_federation_config(Some(section), config_path(), no_env()).unwrap();
+        assert_eq!(fed.default_remote.as_deref(), Some("actuarius"));
+        let route = resolve_route(
+            &fed,
+            None,
+            RouteQuery { wing: Some("wing_unlisted"), room: None, source_file: None },
+        );
+        assert_eq!(route.mode, RouteMode::Combined);
+        assert_eq!(route.remote.as_deref(), Some("actuarius"));
+    }
+
+    #[test]
+    fn explicit_default_remote_must_name_a_configured_remote() {
+        let section: FederationConfigV1 = serde_json::from_str(
+            r#"{"remotes":[{"name":"actuarius","url":"https://actuarius.example"}],
+                "default_mode":"combined","default_remote":"missing"}"#,
+        )
+        .unwrap();
+        let err = resolve_federation_config(Some(section), config_path(), no_env()).unwrap_err();
+        assert!(err.to_string().contains("federation.default_remote"), "{err}");
     }
 
     // ── 6. Token resolution ───────────────────────────────────────────────────
@@ -1054,6 +1126,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: None,
+            default_remote: None,
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
@@ -1082,6 +1155,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: None,
+            default_remote: None,
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
@@ -1114,6 +1188,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: None,
+            default_remote: None,
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
@@ -1140,6 +1215,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: None,
+            default_remote: None,
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
@@ -1160,6 +1236,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: None,
+            default_remote: None,
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
@@ -1180,6 +1257,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: None,
+            default_remote: None,
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
@@ -1200,6 +1278,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: None,
+            default_remote: None,
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
@@ -1221,6 +1300,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: None,
+            default_remote: None,
             wings: BTreeMap::new(),
             kg: None,
             coordination: BTreeMap::new(),
@@ -1784,6 +1864,7 @@ mod tests {
         let section = FederationConfigV1 {
             remotes: vec![],
             default_mode: None,
+            default_remote: None,
             wings: {
                 let mut m = BTreeMap::new();
                 m.insert(
@@ -1818,6 +1899,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: None,
+            default_remote: None,
             wings: {
                 let mut m = BTreeMap::new();
                 m.insert(
@@ -1908,6 +1990,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: None,
+            default_remote: None,
             wings: BTreeMap::new(),
             kg: None,
             coordination: {
@@ -1944,6 +2027,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: None,
+            default_remote: None,
             wings: {
                 let mut m = BTreeMap::new();
                 m.insert(
@@ -2163,6 +2247,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: None,
+            default_remote: None,
             wings: BTreeMap::new(),
             kg: None,
             coordination: {
@@ -2197,6 +2282,7 @@ mod tests {
                 timeout_ms: None,
             }],
             default_mode: None,
+            default_remote: None,
             wings: BTreeMap::new(),
             kg: None,
             coordination: {

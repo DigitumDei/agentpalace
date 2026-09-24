@@ -56,6 +56,8 @@ Merge [client-config.example.json](client-config.example.json) into the configur
 }
 ```
 
+If you are adding `demo` to a config that already has one remote and uses `default_mode: combined` or `remote`, set `federation.default_remote` to the **existing** remote. Also give every existing remote/combined wing or coordination rule an explicit `remote` name; single-remote inference becomes ambiguous once `demo` is added. This preserves the existing routes while only `wing_demo` points to the demo.
+
 The exact `allow_loopback_demo` opt-in is necessary for this localhost issuer. It does not permit other HTTP OAuth servers. The MCP server uses the configured remote directly; the public gateway's `/mcp` path remains private/404.
 
 Ask the connected MCP agent to read `wing_demo`. On the first protected request it receives `authentication_required` and should immediately call `agentpalace_remote_auth_start` with `{"remote":"demo"}`. That MCP tool starts device authorization and returns `verification_uri` and `user_code`. Open the returned link and enter the code; the agent calls `agentpalace_remote_auth_status` until it reports `authenticated`, then retries the original MCP request. No CLI login or browser launch from the background server is required. The same flow works from WSL when its MCP server can reach the exact configured loopback URL. Do not paste the private device code, bearer tokens, or client secret into a tool response.

@@ -629,7 +629,13 @@ Validation:
 
 - Type: string enum: `local` | `remote` | `combined`
 - Optional. Default: `local`
-- `remote` or `combined` requires exactly one remote to be configured, or each routing rule must supply an explicit `remote` name; a missing or ambiguous remote reference fails config load.
+- `remote` or `combined` uses `federation.default_remote` when set; otherwise it infers the sole configured remote. An ambiguous or unknown remote fails config load.
+
+#### `federation.default_remote`
+
+- Type: string naming an entry in `federation.remotes`.
+- Optional for a single remote. Required with two or more remotes when `default_mode` is `remote` or `combined`.
+- Invalid with `default_mode: local`; this field does not override explicit wing, project, knowledge-graph, or coordination routes.
 
 #### `federation.wings`
 
