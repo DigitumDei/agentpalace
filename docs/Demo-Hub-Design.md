@@ -91,6 +91,13 @@ Include:
 - A [Google OAuth setup guide](Demo-Hub-Google-Setup.md) the tester follows
   themselves. No cloud deployment or Google account changes are performed for them.
 
+Project mining (`agentpalace mine` into `wing_demo`) is out of scope for this
+package. Mined drawers are locator-backed and need a matching server checkout
+(`server.checkouts`), which the pinned engine does not have, so mined batches are
+rejected with HTTP 409 `checkout_unavailable`. The demo exercises sign-in, roles
+and provenance through content-carrying writes such as drawers, KG facts and
+coordination records ([#183](https://github.com/DigitumDei/agentpalace/issues/183)).
+
 The sample includes no predefined person, real credential, or shared demo
 Google OAuth application. Each tester creates their own Google application.
 The runnable package and exact commands are in [demo-hub/README.md](../demo-hub/README.md).
