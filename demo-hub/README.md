@@ -45,7 +45,7 @@ Merge [client-config.example.json](client-config.example.json) into the configur
       "oauth": {
         "client_id": "agentpalace-local-demo",
         "allow_loopback_demo": true,
-        "login_mode": "device"
+        "login_mode": "auto"
       }
     }],
     "default_mode": "local",
@@ -60,7 +60,7 @@ If you are adding `demo` to a config that already has one remote and uses `defau
 
 The exact `allow_loopback_demo` opt-in is necessary for this localhost issuer. It does not permit other HTTP OAuth servers. The MCP server uses the configured remote directly; the public gateway's `/mcp` path remains private/404.
 
-Ask the connected MCP agent to read `wing_demo`. On the first protected request it receives `authentication_required` and should immediately call `agentpalace_remote_auth_start` with `{"remote":"demo"}`. That MCP tool starts device authorization and returns `verification_uri` and `user_code`. Open the returned link and enter the code; the agent calls `agentpalace_remote_auth_status` until it reports `authenticated`, then retries the original MCP request. No CLI login or browser launch from the background server is required. The same flow works from WSL when its MCP server can reach the exact configured loopback URL. Do not paste the private device code, bearer tokens, or client secret into a tool response.
+Ask the connected MCP agent to read `wing_demo`. On the first protected request it receives `authentication_required` and should immediately call `agentpalace_remote_auth_start` with `{"remote":"demo"}`. With `login_mode: auto`, a desktop MCP process opens the system browser for a loopback callback and returns `authorization_url` as a manual link if no tab appears. When a browser/callback is unavailable or launching the browser fails, it returns `verification_uri` and `user_code` instead; open that link and enter the code. The agent calls `agentpalace_remote_auth_status` until it reports `authenticated`, then retries the original MCP request. For WSL or other headless clients, set `login_mode: device` if you need to sign in from a different browser profile without an inbound callback. Do not paste private device codes, bearer tokens, or client secrets into a tool response.
 
 For device mode, enter the displayed user code at [http://localhost:8080/device/verify](http://localhost:8080/device/verify). The browser consent page confirms a login, and [your connections](http://localhost:8080/hub/connections) lists and revokes only grants associated with your signed-in browser session. A gateway restart preserves policy and data but ends in-memory browser/OAuth sessions; sign in again afterward.
 

@@ -2146,7 +2146,9 @@ async fn google_consent(
             };
             if let Err(error) = create { return error.into_response(); }
             let secure = secure_attribute(&g);
-            let mut response = Redirect::temporary(url.as_str()).into_response();
+            // Consent is a POST. A 307 would replay that POST to the native loopback
+            // callback, which only accepts GET and would close the connection.
+            let mut response = Redirect::to(url.as_str()).into_response();
             if let Ok(value) =
                 format!("agentpalace_session={session_id}; HttpOnly; SameSite=Lax; Path=/{secure}")
                     .parse()
@@ -2229,7 +2231,8 @@ fn client_error_redirect(
         return ProtocolError::InvalidRequest.into_response();
     };
     url.query_pairs_mut().append_pair("error", error).append_pair("state", client_state);
-    Redirect::temporary(url.as_str()).into_response()
+    // This helper also handles denied consent (a POST); redirect the browser with GET.
+    Redirect::to(url.as_str()).into_response()
 }
 fn token_result(g: &Gateway, r: TokenRequest) -> Result<TokenResponse, ProtocolError> {
     match r.grant_type.as_str() {

@@ -514,7 +514,7 @@ impl ToolName {
             },
             Self::RemoteAuthStart => ToolDefinition {
                 name: self.as_str(),
-                description: "Start OAuth sign-in for a configured federation remote. Returns a verification link and one-time code for the user; the MCP server polls and saves the grant.",
+                description: "Start OAuth sign-in for a configured federation remote. Desktop auto/browser mode opens the system browser and returns its authorization URL as a fallback; headless/device mode returns a verification link and one-time code. The MCP server waits for approval and saves the grant.",
                 input_schema: json!({"type":"object","properties":{"remote":{"type":"string"}},"required":["remote"]}),
             },
             Self::RemoteAuthStatus => ToolDefinition {

@@ -830,22 +830,30 @@ async fn write_callback_page(socket: &mut tokio::net::TcpStream, status: &str, b
 }
 
 /// Read one HTTP request line from a loopback connection and return its target path+query.
-/// Connections that close without a request (browser pre-connects) yield `None`.
+/// Browsers can leave speculative connections idle; bound each read so one such connection
+/// cannot prevent the real callback from being accepted. Ignore non-UTF-8 header bytes after
+/// the request line, since only that line is needed.
 async fn read_request_target(socket: &mut tokio::net::TcpStream) -> Option<String> {
-    let mut bytes = Vec::with_capacity(1024);
-    let mut chunk = [0_u8; 1024];
-    while !bytes.windows(2).any(|window| window == b"\r\n") && bytes.len() < 8192 {
-        let count = tokio::io::AsyncReadExt::read(socket, &mut chunk).await.ok()?;
-        if count == 0 {
-            break;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut bytes = Vec::with_capacity(1024);
+        let mut chunk = [0_u8; 1024];
+        while bytes.len() < 8192 {
+            let count = tokio::io::AsyncReadExt::read(socket, &mut chunk).await.ok()?;
+            if count == 0 {
+                return None;
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(end) = bytes.windows(2).position(|window| window == b"\r\n") {
+                let line = std::str::from_utf8(&bytes[..end]).ok()?;
+                let mut parts = line.split_whitespace();
+                (parts.next()? == "GET").then_some(())?;
+                return parts.next().map(str::to_owned);
+            }
         }
-        bytes.extend_from_slice(&chunk[..count]);
-    }
-    let text = std::str::from_utf8(&bytes).ok()?;
-    let line = text.lines().next()?;
-    let mut parts = line.split_whitespace();
-    (parts.next()? == "GET").then_some(())?;
-    parts.next().map(str::to_owned)
+        None
+    })
+    .await
+    .ok()?
 }
 
 /// Run one bounded native browser login. Callers decide whether this function is appropriate;

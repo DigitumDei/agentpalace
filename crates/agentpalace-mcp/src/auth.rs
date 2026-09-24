@@ -1,24 +1,27 @@
-//! Interactive device authorization for OAuth federation remotes exposed through MCP.
-//! The MCP server can run without a visible desktop, so login returns a public verification
-//! URI and user code to the caller while the private device code stays in the remote client.
+//! Interactive authorization for OAuth federation remotes exposed through MCP.
+//! A desktop host opens the system browser and returns its public authorization URL as a
+//! fallback. A headless host, or one whose browser cannot be opened, uses device authorization.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use agentpalace_remote::{LoginInteraction, OAuthLoginMode, RemoteClient};
+use agentpalace_remote::{LoginInteraction, OAuthLoginMode, RemoteClient, SystemLoginInteraction};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
 #[derive(Clone)]
-struct DevicePrompt {
-    verification_uri: String,
-    user_code: String,
+enum AuthPrompt {
+    Browser { authorization_url: String },
+    Device { verification_uri: String, user_code: String },
 }
 
 struct PromptInteraction {
-    sender: StdMutex<Option<oneshot::Sender<DevicePrompt>>>,
+    sender: StdMutex<Option<oneshot::Sender<AuthPrompt>>>,
+    browser_opener: Arc<dyn LoginInteraction>,
+    browser_open_failed: AtomicBool,
 }
 
 impl std::fmt::Debug for PromptInteraction {
@@ -28,13 +31,20 @@ impl std::fmt::Debug for PromptInteraction {
 }
 
 impl LoginInteraction for PromptInteraction {
-    fn open_browser(&self, _url: &str) -> Result<(), String> {
-        Err("MCP authorization requires the device flow".to_owned())
+    fn open_browser(&self, url: &str) -> Result<(), String> {
+        if let Err(error) = self.browser_opener.open_browser(url) {
+            self.browser_open_failed.store(true, Ordering::SeqCst);
+            return Err(error);
+        }
+        if let Some(sender) = self.sender.lock().expect("prompt lock poisoned").take() {
+            let _ = sender.send(AuthPrompt::Browser { authorization_url: url.to_owned() });
+        }
+        Ok(())
     }
 
     fn show_device_code(&self, verification_uri: &str, user_code: &str) {
         if let Some(sender) = self.sender.lock().expect("prompt lock poisoned").take() {
-            let _ = sender.send(DevicePrompt {
+            let _ = sender.send(AuthPrompt::Device {
                 verification_uri: verification_uri.to_owned(),
                 user_code: user_code.to_owned(),
             });
@@ -43,7 +53,7 @@ impl LoginInteraction for PromptInteraction {
 }
 
 struct AuthFlow {
-    prompt: DevicePrompt,
+    prompt: AuthPrompt,
     task: JoinHandle<agentpalace_remote::Result<()>>,
 }
 
@@ -58,12 +68,13 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// One in-flight login per named remote. The first MCP auth request starts RFC 8628; later
-/// calls inspect the same flow rather than issuing more device codes.
+/// One in-flight login per named remote. Later calls inspect the same flow rather than
+/// opening more browser tabs or issuing more device codes.
 pub struct RemoteAuth {
     clients: BTreeMap<String, Arc<RemoteClient>>,
     flows: Mutex<BTreeMap<String, AuthFlow>>,
     start_gate: Mutex<()>,
+    browser_opener: Arc<dyn LoginInteraction>,
 }
 
 impl std::fmt::Debug for RemoteAuth {
@@ -74,7 +85,19 @@ impl std::fmt::Debug for RemoteAuth {
 
 impl RemoteAuth {
     pub fn new(clients: BTreeMap<String, Arc<RemoteClient>>) -> Self {
-        Self { clients, flows: Mutex::new(BTreeMap::new()), start_gate: Mutex::new(()) }
+        Self::with_browser_opener(clients, Arc::new(SystemLoginInteraction))
+    }
+
+    fn with_browser_opener(
+        clients: BTreeMap<String, Arc<RemoteClient>>,
+        browser_opener: Arc<dyn LoginInteraction>,
+    ) -> Self {
+        Self {
+            clients,
+            flows: Mutex::new(BTreeMap::new()),
+            start_gate: Mutex::new(()),
+            browser_opener,
+        }
     }
 
     pub async fn start(&self, name: &str) -> Result<Value, String> {
@@ -92,15 +115,26 @@ impl RemoteAuth {
             None => return Ok(json!({ "remote": name, "status": "authenticated" })),
         };
         let (sender, receiver) = oneshot::channel();
-        let interaction = Arc::new(PromptInteraction { sender: StdMutex::new(Some(sender)) });
+        let interaction = Arc::new(PromptInteraction {
+            sender: StdMutex::new(Some(sender)),
+            browser_opener: Arc::clone(&self.browser_opener),
+            browser_open_failed: AtomicBool::new(false),
+        });
         let task = tokio::spawn(async move {
-            client
-                .login_from_challenge_with_interaction(
-                    &challenge,
-                    Some(OAuthLoginMode::Device),
-                    Some(interaction),
-                )
-                .await
+            let first = client
+                .login_from_challenge_with_interaction(&challenge, None, Some(interaction.clone()))
+                .await;
+            if first.is_err() && interaction.browser_open_failed.load(Ordering::SeqCst) {
+                client
+                    .login_from_challenge_with_interaction(
+                        &challenge,
+                        Some(OAuthLoginMode::Device),
+                        Some(interaction),
+                    )
+                    .await
+            } else {
+                first
+            }
         });
         let mut abort_on_drop = AbortOnDrop(Some(task.abort_handle()));
         let prompt = match tokio::time::timeout(Duration::from_secs(30), receiver).await {
@@ -158,14 +192,24 @@ impl RemoteAuth {
     }
 }
 
-fn prompt_value(name: &str, prompt: &DevicePrompt) -> Value {
-    json!({
-        "remote": name,
-        "status": "pending",
-        "verification_uri": prompt.verification_uri,
-        "user_code": prompt.user_code,
-        "next": "Open verification_uri, enter user_code, then call agentpalace_remote_auth_status."
-    })
+fn prompt_value(name: &str, prompt: &AuthPrompt) -> Value {
+    match prompt {
+        AuthPrompt::Browser { authorization_url } => json!({
+            "remote": name,
+            "status": "pending",
+            "mode": "browser",
+            "authorization_url": authorization_url,
+            "next": "Approve in the opened browser. If no tab appeared, open authorization_url manually. Then call agentpalace_remote_auth_status."
+        }),
+        AuthPrompt::Device { verification_uri, user_code } => json!({
+            "remote": name,
+            "status": "pending",
+            "mode": "device",
+            "verification_uri": verification_uri,
+            "user_code": user_code,
+            "next": "Open verification_uri, enter user_code, then call agentpalace_remote_auth_status."
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -176,7 +220,8 @@ mod tests {
     use std::time::Duration;
 
     use agentpalace_remote::{
-        InMemoryTokenStore, OAuthConfig, OAuthLoginMode, RemoteClient, RemoteEndpoint,
+        InMemoryTokenStore, LoginInteraction, OAuthConfig, OAuthLoginMode, RemoteClient,
+        RemoteEndpoint,
     };
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode, header};
@@ -236,6 +281,170 @@ mod tests {
         async fn token() -> impl IntoResponse {
             axum::Json(json!({"access_token":"access","token_type":"Bearer","expires_in":300}))
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct ScriptedBrowserOpener {
+        opens: AtomicUsize,
+        preconnect: bool,
+    }
+
+    impl LoginInteraction for ScriptedBrowserOpener {
+        fn open_browser(&self, url: &str) -> Result<(), String> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            let authorization_url = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
+            let parameter = |key| {
+                authorization_url
+                    .query_pairs()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.into_owned())
+                    .ok_or_else(|| format!("missing {key}"))
+            };
+            let redirect = parameter("redirect_uri")?;
+            let state = parameter("state")?;
+            let mut callback = reqwest::Url::parse(&redirect).map_err(|error| error.to_string())?;
+            callback.query_pairs_mut().append_pair("code", "approved").append_pair("state", &state);
+            if self.preconnect {
+                let address = format!(
+                    "127.0.0.1:{}",
+                    callback.port_or_known_default().ok_or("missing callback port")?
+                );
+                let idle =
+                    std::net::TcpStream::connect(address).map_err(|error| error.to_string())?;
+                tokio::spawn(async move {
+                    let _idle = idle;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+            tokio::spawn(async move {
+                let _ = reqwest::Client::new().get(callback).send().await;
+            });
+            Ok(())
+        }
+
+        fn show_device_code(&self, _verification_uri: &str, _user_code: &str) {
+            panic!("browser test should not request a device code");
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct UnavailableBrowserOpener {
+        opens: AtomicUsize,
+    }
+
+    impl LoginInteraction for UnavailableBrowserOpener {
+        fn open_browser(&self, _url: &str) -> Result<(), String> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Err("no desktop browser".to_owned())
+        }
+
+        fn show_device_code(&self, _verification_uri: &str, _user_code: &str) {}
+    }
+
+    async fn browser_test_remote() -> (Issuer, Arc<RemoteClient>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let issuer = Issuer { base: base.clone(), device_calls: Arc::new(AtomicUsize::new(0)) };
+        let app = axum::Router::new()
+            .route("/v1/info", get(Issuer::info))
+            .route("/.well-known/oauth-protected-resource", get(Issuer::protected))
+            .route("/.well-known/oauth-authorization-server", get(Issuer::metadata))
+            .route("/device", post(Issuer::device))
+            .route("/token", post(Issuer::token))
+            .with_state(issuer.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Arc::new(
+            RemoteClient::new(RemoteEndpoint {
+                name: "demo".to_owned(),
+                base_url: base,
+                token: None,
+                oauth: Some(OAuthConfig {
+                    client_id: "public-client".to_owned(),
+                    account: None,
+                    allow_in_memory: true,
+                    allow_loopback_demo: true,
+                    login_mode: OAuthLoginMode::Browser,
+                    token_store: Some(Arc::new(InMemoryTokenStore::default())),
+                    interaction: None,
+                    login_timeout_seconds: 30,
+                }),
+                timeout: Duration::from_secs(5),
+            })
+            .unwrap(),
+        );
+        (issuer, client, server)
+    }
+
+    async fn wait_for_login(auth: &RemoteAuth) -> serde_json::Value {
+        for _ in 0..50 {
+            let status = auth.status("demo").await.unwrap();
+            if status["status"] != "pending" {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("login did not finish");
+    }
+
+    #[tokio::test]
+    async fn mcp_browser_sign_in_opens_once_and_completes_callback() {
+        let (issuer, client, server) = browser_test_remote().await;
+        let opener = Arc::new(ScriptedBrowserOpener::default());
+        let auth = RemoteAuth::with_browser_opener(
+            [(String::from("demo"), client.clone())].into(),
+            opener.clone(),
+        );
+        let prompt = auth.start("demo").await.unwrap();
+        assert_eq!(prompt["mode"], "browser");
+        assert_eq!(prompt["status"], "pending");
+        assert!(
+            prompt["authorization_url"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{}/authorize?", issuer.base))
+        );
+        assert_eq!(auth.start("demo").await.unwrap(), prompt);
+        assert_eq!(opener.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(issuer.device_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(wait_for_login(&auth).await["status"], "authenticated");
+        assert!(client.login_challenge().await.unwrap().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_browser_callback_overtakes_idle_preconnection() {
+        let (_issuer, client, server) = browser_test_remote().await;
+        let opener =
+            Arc::new(ScriptedBrowserOpener { opens: AtomicUsize::new(0), preconnect: true });
+        let auth = RemoteAuth::with_browser_opener(
+            [(String::from("demo"), client.clone())].into(),
+            opener.clone(),
+        );
+        let prompt = auth.start("demo").await.unwrap();
+        assert_eq!(prompt["mode"], "browser");
+        assert_eq!(wait_for_login(&auth).await["status"], "authenticated");
+        assert_eq!(opener.opens.load(Ordering::SeqCst), 1);
+        assert!(client.login_challenge().await.unwrap().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_browser_launch_failure_falls_back_to_device_code() {
+        let (issuer, client, server) = browser_test_remote().await;
+        let opener = Arc::new(UnavailableBrowserOpener::default());
+        let auth = RemoteAuth::with_browser_opener(
+            [(String::from("demo"), client.clone())].into(),
+            opener.clone(),
+        );
+        let prompt = auth.start("demo").await.unwrap();
+        assert_eq!(prompt["mode"], "device");
+        assert_eq!(prompt["verification_uri"], format!("{}/verify", issuer.base));
+        assert_eq!(prompt["user_code"], "PUBLIC-123");
+        assert_eq!(opener.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(issuer.device_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wait_for_login(&auth).await["status"], "authenticated");
+        assert!(client.login_challenge().await.unwrap().is_none());
+        server.abort();
     }
 
     #[tokio::test]
