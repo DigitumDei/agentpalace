@@ -44,7 +44,11 @@ it all locally for dev testing.
 - **Rank-merge, not score-merge.** Combined search interleaves results by rank
   across origins (round-robin), because similarity scores are not comparable
   across embedding profiles. Every result is annotated with its `origin`
-  (`local` or `remote:<name>`).
+  (`local`, or the bare remote name such as `demo`). Remote results also carry
+  the server's `filed_at`, `added_by`, and redacted `provenance` (creator and
+  authenticated submitter owner ID and email-at-write; provider issuer and
+  subject are never returned) when the server supplies them; legacy rows omit
+  those fields. Local results do not include them.
 - **Reads degrade, writes do not (except `both`).** A remote that is unreachable
   during a read is reported as a warning and skipped — the local side still
   returns. Degradation is reported twice, side by side: the legacy `warnings`

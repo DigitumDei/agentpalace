@@ -643,7 +643,7 @@ impl ToolName {
             },
             Self::Search => ToolDefinition {
                 name: self.as_str(),
-                description: "Semantic search. Returns verbatim drawer content with similarity scores. Results from mined files include `stale: true` when the source file changed since mining. Use `view` to scope to a specific branch view (e.g. 'feature-x'), 'canonical' for the default branch, or 'full' for every stored repository view.",
+                description: "Semantic search. Returns verbatim drawer content with similarity scores. Results from mined files include `stale: true` when the source file changed since mining. Remote results also include the server's `filed_at`, `added_by`, and redacted `provenance` (authenticated creator/submitter owner ID and email-at-write) when available. Use `view` to scope to a specific branch view (e.g. 'feature-x'), 'canonical' for the default branch, or 'full' for every stored repository view.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
