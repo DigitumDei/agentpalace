@@ -7,7 +7,7 @@
         "oauth": {
           "client_id": "agentpalace-local-demo",
           "allow_loopback_demo": true,
-          "login_mode": "auto"
+          "login_mode": "device"
         }
       }
     ],
