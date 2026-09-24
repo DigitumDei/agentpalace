@@ -2722,12 +2722,6 @@ fn drawer_result_to_value(result: RemoteDrawerResult, origin: &str) -> Value {
     if let Some(c) = &result.content_hash {
         v["content_hash"] = json!(c);
     }
-    if let Some(filed_at) = &result.filed_at {
-        v["filed_at"] = json!(filed_at);
-    }
-    if let Some(added_by) = &result.added_by {
-        v["added_by"] = json!(added_by);
-    }
     // The server already redacts provider issuer/subject; pass its shape through
     // unchanged so the caller sees the hub's authenticated attribution.
     if let Some(provenance) = result.provenance {
@@ -5079,21 +5073,18 @@ mod tests {
 
     #[tokio::test]
     async fn search_passes_remote_attribution_through_unchanged() {
+        // Shape of the server's redacted `ProvenanceResponse`.
+        let owner =
+            json!({"id": "owner-a", "email_at_write": "a@example.test", "status": "authenticated"});
         let provenance = json!({
-            "creator": {
-                "action": "created",
-                "owner": {"id": "owner-a", "email_at_write": "a@example.test"},
-                "recorded_at": "2026-09-24T13:41:16Z"
-            },
-            "authenticated_submitter": {"id": "owner-a", "email_at_write": "a@example.test"},
+            "creator": owner.clone(),
+            "authenticated_submitter": owner,
             "storage_origin": {"kind": "local", "origin_id": "local"}
         });
         let mock = MockRemote {
             search_results: vec![
                 json!({
                     "wing":"w", "room":"r", "similarity":0.8, "text":"attributed",
-                    "filed_at":"2026-09-24T13:41:16Z",
-                    "added_by":"demo-hub-owner-owner-a:claimed-name",
                     "provenance": provenance.clone()
                 }),
                 json!({"wing":"w", "room":"r", "similarity":0.7, "text":"legacy"}),
@@ -5110,11 +5101,7 @@ mod tests {
         let results = result["results"].as_array().expect("results array");
 
         assert_eq!(results[0]["provenance"], provenance);
-        assert_eq!(results[0]["added_by"], "demo-hub-owner-owner-a:claimed-name");
-        assert_eq!(results[0]["filed_at"], "2026-09-24T13:41:16Z");
-        for absent in ["provenance", "added_by", "filed_at"] {
-            assert!(results[1].get(absent).is_none(), "legacy row must omit {absent}");
-        }
+        assert!(results[1].get("provenance").is_none(), "legacy row must omit provenance");
     }
 
     #[tokio::test]

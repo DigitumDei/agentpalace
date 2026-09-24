@@ -45,10 +45,10 @@ it all locally for dev testing.
   across origins (round-robin), because similarity scores are not comparable
   across embedding profiles. Every result is annotated with its `origin`
   (`local`, or the bare remote name such as `demo`). Remote results also carry
-  the server's `filed_at`, `added_by`, and redacted `provenance` (creator and
-  authenticated submitter owner ID and email-at-write; provider issuer and
-  subject are never returned) when the server supplies them; legacy rows omit
-  those fields. Local results do not include them.
+  the server's redacted `provenance` (creator and authenticated submitter owner
+  ID, email-at-write and status, plus any recorded history; provider issuer and
+  subject are never returned) when the drawer has one; legacy rows omit it.
+  Local results do not include it.
 - **Reads degrade, writes do not (except `both`).** A remote that is unreachable
   during a read is reported as a warning and skipped — the local side still
   returns. Degradation is reported twice, side by side: the legacy `warnings`
