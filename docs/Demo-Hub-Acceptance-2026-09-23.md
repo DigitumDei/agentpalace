@@ -37,7 +37,7 @@ On the clean issue-167 worktree, the targeted gateway suite passed 44 unit tests
 | Host loopback and private engine/MCP, secrets and CSRF | Compose smoke; `admin_gateway`; `forwarding` origin/spoof/redaction tests | Host networking is proved on CI's Docker runner, not Dion's machine. |
 | Google two admitted accounts and unlisted account, desktop plus WSL | Manual procedure below | **PENDING — launch blocker.** No credentials or Google resources are in this repository. |
 
-> **2026-09-24 annotation.** Live Google results for admin A, readonly B and writer D on desktop and WSL are recorded in [Live results — 2026-09-24](#live-results--2026-09-24). Every step of the live procedure has now been run: A, B, C and D on desktop and WSL, role boundaries, disable and re-enable, and a Compose restart with persistence. The last row's launch blocker is cleared for these paths, subject to the findings listed below, one of which (mining into `wing_demo`) is a package gap rather than a pass.
+> **2026-09-24 annotation.** Live Google results for admin A, readonly B and writer D on desktop and WSL are recorded in [Live results — 2026-09-24](#live-results--2026-09-24). Most of the live procedure has now been run: A, B, C and D on desktop and WSL, drawer-level role boundaries, disable and re-enable, and a Compose restart with persistence. Some required checks are still missing (see [Still pending](#still-pending)), so the last row **remains a launch blocker**. Mining into `wing_demo` is a package gap rather than a pass.
 
 The limitations above are explicit work remaining before anyone describes the full #159 design as accepted. Do not close #157, merge, release, deploy, or mark the demo complete on the strength of this record.
 
@@ -86,6 +86,7 @@ Tester: Dion, using tester-owned Google accounts and the local Compose stack (en
 | Step | UTC | Client | Result |
 | --- | --- | --- | --- |
 | 3 Health and privacy | 15:35 | WSL | Pass: `/v1/health` returned ok and `/mcp` returned 404. |
+| 3 Health and exposure, desktop | 20:01 | Windows shell, WSL shell | Pass: from Windows, `/v1/health` returned 200 ok and `/mcp` returned 404. `docker port` showed no published ports on the engine container and only `127.0.0.1:8080` on the gateway, and the engine's port 8765 was not reachable from the host. |
 | 4 Browser sign-in as A | before 13:40 | Windows MCP | Pass: `agentpalace_remote_auth_start` opened the system browser, Google consent and the hub's Continue page completed, status became `authenticated`, and a `wing_demo` search succeeded. |
 | 4 Mine into `wing_demo` | 13:40 | Windows CLI | **Fail (package gap):** HTTP 409 `checkout_unavailable`, because the engine has no `server.checkouts` entry for `wing_demo`. Nothing was stored. |
 | 4 Attribution via content-only drawer | 13:41:16 | Windows MCP | Pass: an `agentpalace_add_drawer` call with a deliberately false `added_by` was stored with `creator` and `authenticated_submitter` both bound to A's Google-backed owner ID (`owner-6a34c81a…`). The claimed name is kept only as a suffix after the authenticated identity, and the change log actor and the owner-scoped mutation receipt carry the same owner. Checked by reading the engine's stored drawer, change log and receipt records, because MCP search dropped these fields (fixed by #180). |
@@ -106,7 +107,7 @@ Tester: Dion, using tester-owned Google accounts and the local Compose stack (en
 | 8 Persistence after restart | 16:57–17:00 | Windows MCP, browser | Pass: all four `wing_demo` drawers were still searchable, and the stored `creator`/`authenticated_submitter` of each was unchanged: A's owner ID on the 13:41 attribution drawer and D's (`owner-2da70e6c…`) on the three WSL drawers; none belong to B. The access policy was still at revision 5 with A admin, B readonly and enabled, and D write. |
 | 7 Unlisted C, browser login | 17:01:36–17:01:53 | Windows CLI, C's browser profile | Pass: `agentpalace auth login --mode browser` was completed in a browser profile signed in as C. The hub returned `access_denied` to the CLI's loopback callback, whose page said only "Login was not completed; you may close this window." The CLI exited 1 with "OAuth authorization was denied" and stored nothing, and the existing A grant in the same credential store stayed `authenticated`. |
 | 5 D cannot hard-delete | after 17:02 | WSL MCP | Pass for the boundary, fail for the report: D's `agentpalace_delete_drawer` on one of D's own drawers left the drawer on the hub. The gateway refuses every REST `DELETE` without a recent admin browser session and CSRF token (`RecentAdminBrowser` policy), so any MCP grant, including an admin's, gets `403` with an empty body. MCP then reported `success: false`, "Drawer not found", with no classification; the 403 appeared only as a WARN in the MCP server log. |
-| 5 D cannot edit membership | after 17:06 | D's browser profile | Pass (tester-verified): from a browser signed in as D, `/hub/v1/access` was refused with `403`. `admin_actor` returns the same `403` for a stale session and for a non-admin role, so the status alone does not show which check refused it. |
+| 5 D cannot edit membership | after 17:06 | D's browser profile | **Not established.** From a browser signed in to Google as D, `/hub/v1/access` returned `403`. No fresh hub sign-in as D was recorded just before this, and the 16:56 restart ended all hub browser sessions. `admin_actor` returns the same `403` for a missing or stale hub session before it checks the role, so this does not show that D's role was refused. |
 | 8 WSL sign-in after restart | after 17:06 | WSL MCP | Pass (tester-verified): after the restart ended the WSL grants, a new device-code sign-in from WSL succeeded. |
 
 ### Findings from the live run
@@ -124,4 +125,9 @@ Tester: Dion, using tester-owned Google accounts and the local Compose stack (en
 
 ### Still pending
 
-Nothing in the live procedure. The findings above are open work: the demo package cannot support mining into `wing_demo` yet, and the client-side error reporting, installer and WSL issues need their own fixes. Whether they block launch is the maintainer's decision.
+These required checks have not been run or recorded:
+
+- **Step 5, B's other writes:** readonly B was only tested with `add_drawer`. B must also be refused for a KG fact, a coordination task and an ingest batch, and for an access-list edit.
+- **Step 5, D's membership edit:** repeat `/hub/v1/access` as D immediately after a fresh hub sign-in as D (for example `agentpalace auth login --mode browser` completed in D's profile), so that a `403` reflects D's role rather than a missing session.
+
+Real-Google acceptance stays **pending** until these are recorded. Separately, the findings above are open work: the demo package cannot support mining into `wing_demo` yet, and the client-side error reporting, installer and WSL issues need their own fixes. Whether they block launch is the maintainer's decision.
