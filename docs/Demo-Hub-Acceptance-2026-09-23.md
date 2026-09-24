@@ -37,7 +37,7 @@ On the clean issue-167 worktree, the targeted gateway suite passed 44 unit tests
 | Host loopback and private engine/MCP, secrets and CSRF | Compose smoke; `admin_gateway`; `forwarding` origin/spoof/redaction tests | Host networking is proved on CI's Docker runner, not Dion's machine. |
 | Google two admitted accounts and unlisted account, desktop plus WSL | Manual procedure below | **PENDING — launch blocker.** No credentials or Google resources are in this repository. |
 
-> **2026-09-24 annotation.** Live Google results for admin A, readonly B and writer D on desktop and WSL are recorded in [Live results — 2026-09-24](#live-results--2026-09-24). The unlisted account C, disable-B, D's delete/membership limits and the Compose restart checks are still pending, so the last row remains a launch blocker.
+> **2026-09-24 annotation.** Live Google results for admin A, readonly B and writer D on desktop and WSL are recorded in [Live results — 2026-09-24](#live-results--2026-09-24). The unlisted account C was refused through device login; C's browser login, disable-B, D's delete/membership limits and the Compose restart checks are still pending, so the last row remains a launch blocker.
 
 The limitations above are explicit work remaining before anyone describes the full #159 design as accepted. Do not close #157, merge, release, deploy, or mark the demo complete on the strength of this record.
 
@@ -81,7 +81,7 @@ Until the live record has A/B/C, desktop browser and WSL device outcomes, mark r
 
 ## Live results — 2026-09-24
 
-Tester: Dion, using tester-owned Google accounts and the local Compose stack (engine image `agentpalace-demo-engine:ba2bb3d`, gateway built from #179). Clients: Windows desktop MCP running candidate `v0.2.11-nightly.a2541eeced6c594ffb3e96e6a8aa4ff39008b8f3`, and a separate WSL (Ubuntu 24.04) install of the same candidate. Docker Engine runs inside the WSL distribution, and the gateway on `127.0.0.1:8080` was reachable from both Windows and WSL. Accounts are labelled as in step 2: A is the bootstrap admin (a Gmail address), B is admitted `readonly` and D is admitted `write`; B and D are non-Gmail Google accounts admitted with `mailbox_proven: true` (policy revisions 2 and 3). C was not tested. Times are UTC. No credentials, codes or email addresses are recorded here.
+Tester: Dion, using tester-owned Google accounts and the local Compose stack (engine image `agentpalace-demo-engine:ba2bb3d`, gateway built from #179). Clients: Windows desktop MCP running candidate `v0.2.11-nightly.a2541eeced6c594ffb3e96e6a8aa4ff39008b8f3`, and a separate WSL (Ubuntu 24.04) install of the same candidate. Docker Engine runs inside the WSL distribution, and the gateway on `127.0.0.1:8080` was reachable from both Windows and WSL. Accounts are labelled as in step 2: A is the bootstrap admin (a Gmail address), B is admitted `readonly` and D is admitted `write`; B and D are non-Gmail Google accounts admitted with `mailbox_proven: true` (policy revisions 2 and 3). C is a Google test user deliberately not on the hub list. Times are UTC. No credentials, codes or email addresses are recorded here.
 
 | Step | UTC | Client | Result |
 | --- | --- | --- | --- |
@@ -98,6 +98,7 @@ Tester: Dion, using tester-owned Google accounts and the local Compose stack (en
 | 5/6 D writer | 16:03–16:04 | WSL MCP | Pass: D signed in by device code, searched, and `add_drawer` succeeded. D's delete and membership-edit limits were not tested. |
 | 6 Device denial | 16:10 | WSL MCP | Pass: status `failed`, "device authorization was denied". An earlier attempt (16:04–16:09) ended as "expired" before the Deny was clicked. |
 | 6 Device timeout | 16:10–16:16 | WSL MCP | Pass: `pending`, then `failed` with "device authorization expired", and no session was left behind. |
+| 7 Unlisted C, device login | 16:39–16:42 | WSL MCP | Pass: C, a Google test user not on the hub list, approved in the browser and the hub page showed access denied. No grant or session was created, and the next search still returned `authentication_required`. The client reported status `failed`, "device authorization was denied", with no classification. |
 
 ### Findings from the live run
 
@@ -105,10 +106,10 @@ Tester: Dion, using tester-owned Google accounts and the local Compose stack (en
 - **MCP search hid attribution.** The hub stored and returned redacted provenance, but MCP search dropped it. Fixed in [#180](https://github.com/DigitumDei/agentpalace/pull/180).
 - **Installer migration** blocks on any process named `agentpalace`, including a container's, and on a cache symlink pointing outside the migrated home; it cannot be skipped. [#181](https://github.com/DigitumDei/agentpalace/issues/181).
 - **WSL needs a Secret Service keyring** such as gnome-keyring for any OAuth sign-in, because the Linux credential store has no file fallback. The README's WSL guidance now says so.
-- **Error classification is uneven.** `credential_store` is classified on search but not on `remote_auth_start`/`remote_auth_status`; denial, expiry and the readonly write rejection (`403`, empty body) carry no classification, so clients must match message text.
+- **Error classification is uneven.** `credential_store` is classified on search but not on `remote_auth_start`/`remote_auth_status`; denial, expiry and the readonly write rejection (`403`, empty body) carry no classification, so clients must match message text. A hub refusal of an unlisted account reaches the client as exactly the same "device authorization was denied" as the user clicking Deny, so only the browser page tells the user their account is not admitted.
 - **Device-code timing.** The client stops polling at the lower of `oauth.login_timeout_seconds` (default 300) and the hub's `expires_in` (600), and reports its own deadline as "device authorization expired", the same message as a server-side `expired_token`. A tester who takes more than five minutes sees "expired" whatever they clicked.
 - **Setup and WSL interop.** `agentpalace setup` in WSL tried to register with a Windows `gemini` executable found on `PATH` through interop; the call failed and nothing on Windows changed.
 
 ### Still pending
 
-Account C (unlisted) refusal through browser and device login; disabling B and confirming its existing grant is rejected on the next request; D's delete and membership-edit rejection; and the step 8 Compose restart, persistence and revocation checks. Real-Google acceptance stays **pending** until these are recorded.
+Account C (unlisted) refusal through browser login (device login is recorded above); disabling B and confirming its existing grant is rejected on the next request; D's delete and membership-edit rejection; and the step 8 Compose restart, persistence and revocation checks. Real-Google acceptance stays **pending** until these are recorded.
