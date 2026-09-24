@@ -37,7 +37,7 @@ On the clean issue-167 worktree, the targeted gateway suite passed 44 unit tests
 | Host loopback and private engine/MCP, secrets and CSRF | Compose smoke; `admin_gateway`; `forwarding` origin/spoof/redaction tests | Host networking is proved on CI's Docker runner, not Dion's machine. |
 | Google two admitted accounts and unlisted account, desktop plus WSL | Manual procedure below | **PENDING — launch blocker.** No credentials or Google resources are in this repository. |
 
-> **2026-09-24 annotation.** Live Google results for admin A, readonly B and writer D on desktop and WSL are recorded in [Live results — 2026-09-24](#live-results--2026-09-24). The unlisted account C was refused through device and browser login; disabling B cut off its active grant; and a Compose restart kept the policy, content and attribution. A WSL device sign-in after the restart is still pending, so the last row remains a launch blocker.
+> **2026-09-24 annotation.** Live Google results for admin A, readonly B and writer D on desktop and WSL are recorded in [Live results — 2026-09-24](#live-results--2026-09-24). Every step of the live procedure has now been run: A, B, C and D on desktop and WSL, role boundaries, disable and re-enable, and a Compose restart with persistence. The last row's launch blocker is cleared for these paths, subject to the findings listed below, one of which (mining into `wing_demo`) is a package gap rather than a pass.
 
 The limitations above are explicit work remaining before anyone describes the full #159 design as accepted. Do not close #157, merge, release, deploy, or mark the demo complete on the strength of this record.
 
@@ -107,6 +107,7 @@ Tester: Dion, using tester-owned Google accounts and the local Compose stack (en
 | 7 Unlisted C, browser login | 17:01:36–17:01:53 | Windows CLI, C's browser profile | Pass: `agentpalace auth login --mode browser` was completed in a browser profile signed in as C. The hub returned `access_denied` to the CLI's loopback callback, whose page said only "Login was not completed; you may close this window." The CLI exited 1 with "OAuth authorization was denied" and stored nothing, and the existing A grant in the same credential store stayed `authenticated`. |
 | 5 D cannot hard-delete | after 17:02 | WSL MCP | Pass for the boundary, fail for the report: D's `agentpalace_delete_drawer` on one of D's own drawers left the drawer on the hub. The gateway refuses every REST `DELETE` without a recent admin browser session and CSRF token (`RecentAdminBrowser` policy), so any MCP grant, including an admin's, gets `403` with an empty body. MCP then reported `success: false`, "Drawer not found", with no classification; the 403 appeared only as a WARN in the MCP server log. |
 | 5 D cannot edit membership | after 17:06 | D's browser profile | Pass (tester-verified): from a browser signed in as D, `/hub/v1/access` was refused with `403`. `admin_actor` returns the same `403` for a stale session and for a non-admin role, so the status alone does not show which check refused it. |
+| 8 WSL sign-in after restart | after 17:06 | WSL MCP | Pass (tester-verified): after the restart ended the WSL grants, a new device-code sign-in from WSL succeeded. |
 
 ### Findings from the live run
 
@@ -123,4 +124,4 @@ Tester: Dion, using tester-owned Google accounts and the local Compose stack (en
 
 ### Still pending
 
-A WSL device sign-in after the restart. Real-Google acceptance stays **pending** until these are recorded.
+Nothing in the live procedure. The findings above are open work: the demo package cannot support mining into `wing_demo` yet, and the client-side error reporting, installer and WSL issues need their own fixes. Whether they block launch is the maintainer's decision.
