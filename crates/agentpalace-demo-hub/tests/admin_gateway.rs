@@ -340,6 +340,16 @@ async fn public_gateway_forwarding_is_closed_authenticated_and_owner_scoped() {
     assert_eq!(client.get(format!("{base}/mcp")).send().await.expect("integration test setup").status(), StatusCode::NOT_FOUND);
     assert_eq!(client.get(format!("{base}/v1/unknown")).send().await.expect("integration test setup").status(), StatusCode::NOT_FOUND);
 
+    let challenge = format!("Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource\"");
+    for bearer in [None, Some("invalid-grant")] {
+        let mut request = client.get(format!("{base}/v1/info"));
+        if let Some(bearer) = bearer { request = request.bearer_auth(bearer); }
+        let denied = request.send().await.expect("integration test setup");
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(denied.headers().get(header::WWW_AUTHENTICATE).and_then(|value| value.to_str().ok()), Some(challenge.as_str()));
+    }
+    assert!(seen.lock().expect("integration test setup").is_empty(), "unauthenticated requests must not reach the engine");
+
     let read = client.get(format!("{base}/v1/info")).bearer_auth(&token).send().await.expect("integration test setup");
     assert_eq!(read.status(), StatusCode::OK);
     let body: Value = read.json().await.expect("integration test setup");

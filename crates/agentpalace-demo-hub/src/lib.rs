@@ -1801,6 +1801,11 @@ fn if_match_revision(headers: &HeaderMap) -> Result<u64, Response> {
     Ok(revision)
 }
 
+fn rest_auth_challenge(g: &Gateway) -> Response {
+    let metadata = format!("{}/.well-known/oauth-protected-resource", g.config.issuer.trim_end_matches('/'));
+    (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, format!("Bearer resource_metadata=\"{metadata}\""))]).into_response()
+}
+
 async fn forward_rest(State(g): State<Gateway>, request: Request) -> Response {
     // Health is a public hub liveness response and does not contact the private palace.
     if matches!(request.method(), &axum::http::Method::GET | &axum::http::Method::HEAD)
@@ -1825,7 +1830,7 @@ async fn forward_rest(State(g): State<Gateway>, request: Request) -> Response {
     } else {
         let Some(token) = headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer ")) else {
-                return StatusCode::UNAUTHORIZED.into_response();
+                return rest_auth_challenge(&g);
             };
         match g.authorize_rest_role(token, &g.config.resource) {
             Ok((owner, role)) => (owner, match role {
@@ -1833,6 +1838,7 @@ async fn forward_rest(State(g): State<Gateway>, request: Request) -> Response {
                 AccessRole::Write => DemoRole::Write,
                 AccessRole::Admin => DemoRole::Write,
             }),
+            Err(ProtocolError::InvalidGrant) => return rest_auth_challenge(&g),
             Err(error) => return error.into_response(),
         }
     };
