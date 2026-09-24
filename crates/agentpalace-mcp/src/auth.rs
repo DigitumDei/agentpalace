@@ -73,7 +73,7 @@ impl Drop for AbortOnDrop {
 pub struct RemoteAuth {
     clients: BTreeMap<String, Arc<RemoteClient>>,
     flows: Mutex<BTreeMap<String, AuthFlow>>,
-    start_gate: Mutex<()>,
+    start_gates: BTreeMap<String, Mutex<()>>,
     browser_opener: Arc<dyn LoginInteraction>,
 }
 
@@ -92,21 +92,23 @@ impl RemoteAuth {
         clients: BTreeMap<String, Arc<RemoteClient>>,
         browser_opener: Arc<dyn LoginInteraction>,
     ) -> Self {
+        let start_gates = clients.keys().map(|name| (name.clone(), Mutex::new(()))).collect();
         Self {
             clients,
             flows: Mutex::new(BTreeMap::new()),
-            start_gate: Mutex::new(()),
+            start_gates,
             browser_opener,
         }
     }
 
     pub async fn start(&self, name: &str) -> Result<Value, String> {
-        let _guard = self.start_gate.lock().await;
         let client = self
             .clients
             .get(name)
             .ok_or_else(|| format!("remote `{name}` is not configured for OAuth"))?
             .clone();
+        let gate = self.start_gates.get(name).ok_or_else(|| format!("remote `{name}` has no sign-in gate"))?;
+        let _guard = gate.lock().await;
         if let Some(prompt) = self.flows.lock().await.get(name).map(|flow| flow.prompt.clone()) {
             return Ok(prompt_value(name, &prompt));
         }
@@ -384,6 +386,71 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("login did not finish");
+    }
+
+    #[tokio::test]
+    async fn slow_remote_sign_in_does_not_block_another_remote() {
+        let (_issuer, fast_client, fast_server) = browser_test_remote().await;
+        let slow_started = Arc::new(tokio::sync::Notify::new());
+        let release_slow = Arc::new(tokio::sync::Notify::new());
+        let app = axum::Router::new().route(
+            "/v1/info",
+            get({
+                let slow_started = Arc::clone(&slow_started);
+                let release_slow = Arc::clone(&release_slow);
+                move || {
+                    let slow_started = Arc::clone(&slow_started);
+                    let release_slow = Arc::clone(&release_slow);
+                    async move {
+                        slow_started.notify_one();
+                        release_slow.notified().await;
+                        StatusCode::UNAUTHORIZED
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_base = format!("http://{}", listener.local_addr().unwrap());
+        let slow_server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let slow_client = Arc::new(
+            RemoteClient::new(RemoteEndpoint {
+                name: "slow".to_owned(),
+                base_url: slow_base,
+                token: None,
+                oauth: Some(OAuthConfig {
+                    client_id: "public-client".to_owned(),
+                    account: None,
+                    allow_in_memory: true,
+                    allow_loopback_demo: true,
+                    login_mode: OAuthLoginMode::Browser,
+                    token_store: Some(Arc::new(InMemoryTokenStore::default())),
+                    interaction: None,
+                    login_timeout_seconds: 30,
+                }),
+                timeout: Duration::from_secs(5),
+            })
+            .unwrap(),
+        );
+        let auth = Arc::new(RemoteAuth::with_browser_opener(
+            [("slow".to_owned(), slow_client), ("demo".to_owned(), fast_client)].into(),
+            Arc::new(ScriptedBrowserOpener::default()),
+        ));
+        let slow_task = {
+            let auth = Arc::clone(&auth);
+            tokio::spawn(async move { auth.start("slow").await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), slow_started.notified())
+            .await
+            .expect("slow remote should enter its challenge request");
+        let fast = tokio::time::timeout(Duration::from_secs(2), auth.start("demo")).await;
+        release_slow.notify_one();
+        let _ = slow_task.await.expect("slow start task");
+        assert_eq!(
+            fast.expect("other remote should not wait for slow remote").unwrap()["mode"],
+            "browser"
+        );
+        fast_server.abort();
+        slow_server.abort();
     }
 
     #[tokio::test]

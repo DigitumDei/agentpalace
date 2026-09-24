@@ -47,10 +47,12 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `balanced`
 - `low_cpu`
 
-### MCP tool surface (69 tools)
+### MCP tool surface (71 tools)
 
 - `agentpalace_wake_up`
 - `agentpalace_status`
+- `agentpalace_remote_auth_start`
+- `agentpalace_remote_auth_status`
 - `agentpalace_list_wings`
 - `agentpalace_coordination_wings`
 - `agentpalace_list_rooms`
