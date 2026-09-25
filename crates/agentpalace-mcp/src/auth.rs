@@ -102,19 +102,30 @@ impl RemoteAuth {
     }
 
     pub async fn start(&self, name: &str) -> Result<Value, String> {
-        let client = self
-            .clients
-            .get(name)
-            .ok_or_else(|| format!("remote `{name}` is not configured for OAuth"))?
-            .clone();
-        let gate = self.start_gates.get(name).ok_or_else(|| format!("remote `{name}` has no sign-in gate"))?;
+        let Some(client) = self.clients.get(name).cloned() else {
+            return Ok(local_auth_failure(
+                name,
+                "remote_auth_start",
+                "invalid_config",
+                &format!("remote `{name}` is not configured for OAuth"),
+            ));
+        };
+        let Some(gate) = self.start_gates.get(name) else {
+            return Ok(local_auth_failure(
+                name,
+                "remote_auth_start",
+                "invalid_config",
+                &format!("remote `{name}` has no sign-in gate"),
+            ));
+        };
         let _guard = gate.lock().await;
         if let Some(prompt) = self.flows.lock().await.get(name).map(|flow| flow.prompt.clone()) {
             return Ok(prompt_value(name, &prompt));
         }
-        let challenge = match client.login_challenge().await.map_err(|error| error.to_string())? {
-            Some(url) => url,
-            None => return Ok(json!({ "remote": name, "status": "authenticated" })),
+        let challenge = match client.login_challenge().await {
+            Err(error) => return Ok(remote_auth_failure(name, "remote_auth_start", &error)),
+            Ok(None) => return Ok(json!({ "remote": name, "status": "authenticated" })),
+            Ok(Some(url)) => url,
         };
         let (sender, receiver) = oneshot::channel();
         let interaction = Arc::new(PromptInteraction {
@@ -143,14 +154,34 @@ impl RemoteAuth {
             Ok(Ok(prompt)) => prompt,
             _ => {
                 if task.is_finished() {
-                    let result = task.await.map_err(|_| "remote login task stopped".to_owned())?;
-                    return Err(result.err().map_or_else(
-                        || "remote login ended without a device prompt".to_owned(),
-                        |error| error.to_string(),
-                    ));
+                    let result = match task.await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            return Ok(local_auth_failure(
+                                name,
+                                "remote_auth_start",
+                                "local_failure",
+                                "remote login task stopped",
+                            ));
+                        }
+                    };
+                    return Ok(match result {
+                        Ok(()) => local_auth_failure(
+                            name,
+                            "remote_auth_start",
+                            "invalid_response",
+                            "remote login ended without a device prompt",
+                        ),
+                        Err(error) => remote_auth_failure(name, "remote_auth_start", &error),
+                    });
                 }
                 task.abort();
-                return Err("remote did not provide a device prompt within 30 seconds".to_owned());
+                return Ok(local_auth_failure(
+                    name,
+                    "remote_auth_start",
+                    "local_timeout",
+                    "remote did not provide a device prompt within 30 seconds",
+                ));
             }
         };
         let response = prompt_value(name, &prompt);
@@ -161,7 +192,12 @@ impl RemoteAuth {
 
     pub async fn status(&self, name: &str) -> Result<Value, String> {
         if !self.clients.contains_key(name) {
-            return Err(format!("remote `{name}` is not configured for OAuth"));
+            return Ok(local_auth_failure(
+                name,
+                "remote_auth_status",
+                "invalid_config",
+                &format!("remote `{name}` is not configured for OAuth"),
+            ));
         }
         let mut flows = self.flows.lock().await;
         let Some(flow) = flows.get(name) else {
@@ -175,12 +211,13 @@ impl RemoteAuth {
         drop(flows);
         match flow.task.await {
             Ok(Ok(())) => self.probe_status(name).await,
-            Ok(Err(error)) => {
-                Ok(json!({ "remote": name, "status": "failed", "error": error.to_string() }))
-            }
-            Err(_) => {
-                Ok(json!({ "remote": name, "status": "failed", "error": "login task stopped" }))
-            }
+            Ok(Err(error)) => Ok(auth_status_failure(name, &error)),
+            Err(_) => Ok(local_auth_failure(
+                name,
+                "remote_auth_status",
+                "local_failure",
+                "remote login task stopped",
+            )),
         }
     }
 
@@ -189,9 +226,45 @@ impl RemoteAuth {
         match client.login_challenge().await {
             Ok(None) => Ok(json!({ "remote": name, "status": "authenticated" })),
             Ok(Some(_)) => Ok(json!({ "remote": name, "status": "not_authenticated" })),
-            Err(error) => Err(error.to_string()),
+            Err(error) => Ok(auth_status_failure(name, &error)),
         }
     }
+}
+
+fn local_auth_failure(name: &str, kind: &str, classification: &str, message: &str) -> Value {
+    json!({
+        "success": false,
+        "outcome": "failed",
+        "remote": name,
+        "kind": kind,
+        "status": "failed",
+        "classification": classification,
+        "error": message,
+    })
+}
+
+fn auth_status_failure(name: &str, error: &agentpalace_remote::RemoteError) -> Value {
+    let mut value = remote_auth_failure(name, "remote_auth_status", error);
+    if matches!(
+        error,
+        agentpalace_remote::RemoteError::AuthenticationRequired { .. }
+            | agentpalace_remote::RemoteError::RemoteRejected { status: 401 | 403, .. }
+    ) {
+        value["next"] = json!(format!(
+            "Run `agentpalace auth logout --remote {name}` to clear the refused grant, then start sign-in again."
+        ));
+    }
+    value
+}
+
+fn remote_auth_failure(
+    name: &str,
+    kind: &str,
+    error: &agentpalace_remote::RemoteError,
+) -> Value {
+    let mut value = crate::federation::structured_remote_failure(name, kind, error);
+    value["status"] = json!("failed");
+    value
 }
 
 fn prompt_value(name: &str, prompt: &AuthPrompt) -> Value {
@@ -567,6 +640,110 @@ mod tests {
         assert!(client.login_challenge().await.unwrap().is_none());
         assert_eq!(auth.start("demo").await.unwrap()["status"], "authenticated");
         assert_eq!(issuer.device_calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_auth_start_returns_a_structured_failure_instead_of_a_tool_error() {
+        let client = Arc::new(
+            RemoteClient::new(RemoteEndpoint {
+                name: "demo".to_owned(),
+                base_url: "http://127.0.0.1:1".to_owned(),
+                token: None,
+                oauth: Some(OAuthConfig {
+                    client_id: "public-client".to_owned(),
+                    account: None,
+                    allow_in_memory: true,
+                    allow_loopback_demo: true,
+                    login_mode: OAuthLoginMode::Device,
+                    token_store: Some(Arc::new(InMemoryTokenStore::default())),
+                    interaction: None,
+                    login_timeout_seconds: 1,
+                }),
+                timeout: Duration::from_millis(100),
+            })
+            .unwrap(),
+        );
+        let auth = RemoteAuth::new([("demo".to_owned(), client)].into());
+
+        let result = auth.start("demo").await.expect("failure should be returned as data");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["outcome"], "failed");
+        assert_eq!(result["status"], "failed");
+        assert_eq!(result["classification"], "unreachable");
+        assert_eq!(result["kind"], "remote_auth_start");
+    }
+
+    #[tokio::test]
+    async fn mcp_auth_tools_return_structured_invalid_config_for_an_unknown_remote() {
+        let auth = RemoteAuth::new(Default::default());
+
+        for result in [auth.start("missing").await.unwrap(), auth.status("missing").await.unwrap()] {
+            assert_eq!(result["success"], false);
+            assert_eq!(result["outcome"], "failed");
+            assert_eq!(result["status"], "failed");
+            assert_eq!(result["remote"], "missing");
+            assert_eq!(result["classification"], "invalid_config");
+        }
+    }
+
+    #[test]
+    fn auth_status_only_recommends_logout_for_a_refused_grant() {
+        let rate_limited = agentpalace_remote::RemoteError::RemoteRejected {
+            remote: "demo".to_owned(),
+            status: 429,
+            body: "try later".to_owned(),
+        };
+        let server_error = agentpalace_remote::RemoteError::RemoteRejected {
+            remote: "demo".to_owned(),
+            status: 503,
+            body: "unavailable".to_owned(),
+        };
+
+        assert!(super::auth_status_failure("demo", &rate_limited).get("next").is_none());
+        assert!(super::auth_status_failure("demo", &server_error).get("next").is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_auth_status_reports_a_refused_grant_and_sign_out_guidance() {
+        let app = axum::Router::new().route(
+            "/v1/info",
+            get(|| async {
+                (
+                    StatusCode::FORBIDDEN,
+                    axum::Json(json!({"error": "access_denied"})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Arc::new(
+            RemoteClient::new(RemoteEndpoint {
+                name: "demo".to_owned(),
+                base_url: base,
+                token: None,
+                oauth: Some(OAuthConfig {
+                    client_id: "public-client".to_owned(),
+                    account: None,
+                    allow_in_memory: true,
+                    allow_loopback_demo: true,
+                    login_mode: OAuthLoginMode::Device,
+                    token_store: Some(Arc::new(InMemoryTokenStore::default())),
+                    interaction: None,
+                    login_timeout_seconds: 1,
+                }),
+                timeout: Duration::from_secs(1),
+            })
+            .unwrap(),
+        );
+        let auth = RemoteAuth::new([("demo".to_owned(), client)].into());
+
+        let result = auth.status("demo").await.expect("refusal should be returned as data");
+        assert_eq!(result["status"], "failed");
+        assert_eq!(result["classification"], "rejected");
+        assert_eq!(result["http_status"], 403);
+        assert!(result["next"].as_str().unwrap().contains("auth logout --remote demo"));
         server.abort();
     }
 }

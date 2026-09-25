@@ -114,12 +114,21 @@ Tester: Dion, using tester-owned Google accounts and the local Compose stack (en
 
 ### Findings from the live run
 
+> **2026-09-25 correction for the disable/re-enable rows.** Those rows accurately
+> record the 2026-09-24 build, but they are not the current contract. Issue #184
+> changed a disabled account's next protected request to a 401 challenge. The
+> client's one bounded refresh is then refused, the hub revokes the grant family,
+> and the client clears its stored grant. Re-enabling the account therefore
+> requires a new sign-in. The automated
+> `disabling_an_account_revokes_its_grant_and_reenable_requires_new_sign_in`
+> regression test now covers disable → request → re-enable.
+
 - **Mining against the demo hub** returns HTTP 409 because the package provides no `wing_demo` checkout. Resolved by scope: project mining is now documented as outside the demo package (#183), and step 4 and the package README use a content-only drawer write instead.
 - **MCP search hid attribution.** The hub stored and returned redacted provenance, but MCP search dropped it. Fixed in [#180](https://github.com/DigitumDei/agentpalace/pull/180).
 - **Installer migration** blocks on any process named `agentpalace`, including a container's, and on a cache symlink pointing outside the migrated home; it cannot be skipped. [#181](https://github.com/DigitumDei/agentpalace/issues/181).
 - **WSL needs a Secret Service keyring** such as gnome-keyring for any OAuth sign-in, because the Linux credential store has no file fallback. The README's WSL guidance now says so.
 - **Error classification is uneven.** `credential_store` is classified on search but not on `remote_auth_start`/`remote_auth_status`; denial, expiry and the readonly write rejection (`403`, empty body) carry no classification, so clients must match message text. A hub refusal of an unlisted account reaches the client as exactly the same "device authorization was denied" as the user clicking Deny, so only the browser page tells the user their account is not admitted. In the browser flow even that is missing: the loopback callback page says only "Login was not completed", so an unlisted user gets no indication of why.
-- **Disabled accounts get OAuth-style 400s.** Every gateway REST refusal of a disabled owner is HTTP 400 `{"error":"access_denied"}`, where a protected resource would normally use 401/403. MCP reports it as `rejected` without saying the account was disabled or suggesting signing out, `agentpalace_remote_auth_status` errors instead of reporting the grant's state, and the unusable grant stays in the credential store.
+- **Disabled-account refusal was corrected after this live run.** The recorded build returned OAuth-style 400s and retained the grant. The current contract is the fail-closed 401/refresh-revocation flow described in the correction above; auth tools return structured status data and the client clears the refused grant.
 - **`agentpalace_delete_drawer` hides remote refusals.** For a drawer that is not in the local palace it tries each remote, skips every error except an unconfirmed outcome (only `Unreachable` counts as degradable, but other errors are also skipped after a WARN), and returns "Drawer not found" when none succeeds. A `403` refusal, and by the same path a `401` from a grant ended by a gateway restart, is therefore reported as a missing drawer instead of `rejected` or `authentication_required`.
 - **Admin console origin.** The admin session cookie belongs to `http://localhost:8080`; running the admin snippet from `http://127.0.0.1:8080` returns `403`.
 - **Device-code timing.** The client stops polling at the lower of `oauth.login_timeout_seconds` (default 300) and the hub's `expires_in` (600), and reports its own deadline as "device authorization expired", the same message as a server-side `expired_token`. A tester who takes more than five minutes sees "expired" whatever they clicked.

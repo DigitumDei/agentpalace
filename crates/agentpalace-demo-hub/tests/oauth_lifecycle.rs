@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentpalace_core::{AuthenticatedOwner, Issuer, OwnerId};
 use agentpalace_demo_hub::{
+    access_policy::{AccessEntry, AccessPolicyStore, AccessRole, BootstrapAdmin},
     AdmissionIdentity, AdmissionPolicy, DeviceTiming, Gateway, GatewayConfig, GatewayMode,
     GoogleClaimError, GoogleOidcConfig, GoogleOidcVerifier, GoogleOidcVerifierAdapter,
     NativeClient, VerifiedIdentity,
@@ -340,6 +341,24 @@ struct Hub {
 
 impl Hub {
     async fn start(idp: &Idp, resource_path: &str, timing: DeviceTiming) -> Self {
+        Self::start_configured(idp, resource_path, timing, None).await
+    }
+
+    async fn start_with_access_policy(
+        idp: &Idp,
+        resource_path: &str,
+        timing: DeviceTiming,
+        access: Arc<AccessPolicyStore>,
+    ) -> Self {
+        Self::start_configured(idp, resource_path, timing, Some(access)).await
+    }
+
+    async fn start_configured(
+        idp: &Idp,
+        resource_path: &str,
+        timing: DeviceTiming,
+        access: Option<Arc<AccessPolicyStore>>,
+    ) -> Self {
         let (listener, base) = bind().await;
         let resource = format!("{base}{resource_path}");
         let config = GatewayConfig {
@@ -352,10 +371,13 @@ impl Hub {
                 redirect_uri: "http://127.0.0.1:49152/callback".to_owned(),
             },
         };
-        let gateway = Gateway::new(config, Arc::new(AllowSubjects))
+        let mut gateway = Gateway::new(config, Arc::new(AllowSubjects))
             .expect("gateway configuration")
             .with_google_verifier(Arc::new(idp.adapter()))
             .with_device_timing(timing);
+        if let Some(access) = access {
+            gateway = gateway.with_access_policy_store(access);
+        }
         let hub = Self {
             base,
             resource,
@@ -958,14 +980,22 @@ async fn browser_and_device_verification_exchange_upstream_codes_at_distinct_red
 async fn browser_refusals_reach_the_waiting_client_as_denied_and_store_nothing() {
     let idp = Idp::start().await;
     let hub = Hub::start(&idp, "/api", FAST_DEVICE).await;
-    for (account, decision) in [
-        (Account::owner(), Decision::Deny),
-        (Account::owner(), Decision::UpstreamDenied),
+    for (account, decision, expected_message) in [
+        (Account::owner(), Decision::Deny, "denied by the user"),
+        (Account::owner(), Decision::UpstreamDenied, "denied by the user"),
         // Signs in successfully upstream but is not admitted by the hub policy.
-        (Account::named("stranger"), Decision::Approve),
+        (Account::named("stranger"), Decision::Approve, "not admitted"),
         // An ID token Google would never issue: the hub refuses it before consent.
-        (Account::owner().claim("email_verified", serde_json::json!(false)), Decision::Approve),
-        (Account::owner().signed(Signing::UnpublishedKey), Decision::Approve),
+        (
+            Account::owner().claim("email_verified", serde_json::json!(false)),
+            Decision::Approve,
+            "denied by the user",
+        ),
+        (
+            Account::owner().signed(Signing::UnpublishedKey),
+            Decision::Approve,
+            "denied by the user",
+        ),
     ] {
         let store: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::default());
         let (user, _) = ScriptedUser::new(&idp, &hub, account.clone(), decision);
@@ -977,7 +1007,11 @@ async fn browser_refusals_reach_the_waiting_client_as_denied_and_store_nothing()
             .await
             .expect_err("refused login");
         user.finish_browser().await;
-        assert!(error.to_string().contains("denied"), "{decision:?}/{}: {error}", account.sub);
+        assert!(
+            error.to_string().contains(expected_message),
+            "{decision:?}/{}: {error}",
+            account.sub
+        );
         assert!(stored(store.as_ref(), &hub.resource, &hub.base).await.is_none());
         assert!(matches!(client.info().await, Err(RemoteError::AuthenticationRequired { .. })));
     }
@@ -1187,14 +1221,26 @@ async fn device_login_polls_while_pending_then_completes_after_browser_approval(
 async fn device_refusals_end_polling_with_a_denial() {
     let idp = Idp::start().await;
     let hub = Hub::start(&idp, "/api", FAST_DEVICE).await;
-    for (account, decision) in [
-        (Account::owner(), Decision::Deny),
-        (Account::owner(), Decision::UpstreamDenied),
-        (Account::named("stranger"), Decision::Approve),
+    for (account, decision, expected_message) in [
+        (Account::owner(), Decision::Deny, "denied by the user"),
+        (Account::owner(), Decision::UpstreamDenied, "denied by the user"),
+        (Account::named("stranger"), Decision::Approve, "not admitted"),
         // ID tokens that fail verification at the device callback end the grant, too.
-        (Account::owner().signed(Signing::UnpublishedKey), Decision::Approve),
-        (Account::owner().claim("email_verified", serde_json::json!(false)), Decision::Approve),
-        (Account::owner().claim("nonce", serde_json::json!("replayed-nonce")), Decision::Approve),
+        (
+            Account::owner().signed(Signing::UnpublishedKey),
+            Decision::Approve,
+            "denied by the user",
+        ),
+        (
+            Account::owner().claim("email_verified", serde_json::json!(false)),
+            Decision::Approve,
+            "denied by the user",
+        ),
+        (
+            Account::owner().claim("nonce", serde_json::json!("replayed-nonce")),
+            Decision::Approve,
+            "denied by the user",
+        ),
     ] {
         let store: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::default());
         let (user, mut prompts) = ScriptedUser::new(&idp, &hub, account.clone(), decision);
@@ -1226,7 +1272,11 @@ async fn device_refusals_end_polling_with_a_denial() {
         };
         assert_eq!(final_status, expected, "{decision:?}/{}", account.sub);
         let error = login.await.expect("device login task").expect_err("refused device login");
-        assert!(error.to_string().contains("denied"), "{decision:?}/{}: {error}", account.sub);
+        assert!(
+            error.to_string().contains(expected_message),
+            "{decision:?}/{}: {error}",
+            account.sub
+        );
         assert!(stored(store.as_ref(), &hub.resource, &hub.base).await.is_none());
     }
 }
@@ -1570,7 +1620,11 @@ async fn device_expiry_and_client_cancellation_store_no_credential() {
             .login_from_challenge_with_mode(&metadata, Some(OAuthLoginMode::Device))
             .await
             .expect_err("unapproved device login");
-        assert!(error.to_string().contains("expired"), "{error}");
+        if hub.base == short_hub.base {
+            assert!(error.to_string().contains("expired"), "{error}");
+        } else {
+            assert!(error.to_string().contains("timed out locally"), "{error}");
+        }
         let (verification_uri, _) = next_prompt(&mut prompts).await;
         if hub.base == long_hub.base {
             // Approval after the client stopped polling cannot deliver a credential to it.
@@ -1630,6 +1684,59 @@ async fn refresh_rotates_and_reuse_revokes_the_family_including_issued_access() 
     assert!(matches!(read(&client).await, Err(RemoteError::AuthenticationRequired { .. })));
     assert_eq!(hub.token_hits.load(Ordering::SeqCst), token_hits + 1);
     assert!(stored(store.as_ref(), &hub.resource, &hub.base).await.is_none());
+}
+
+#[tokio::test]
+async fn disabling_an_account_revokes_its_grant_and_reenable_requires_new_sign_in() {
+    let idp = Idp::start().await;
+    let temp = tempfile::tempdir().expect("access-policy tempdir");
+    let access = Arc::new(
+        AccessPolicyStore::open(
+            temp.path().join("access.json"),
+            temp.path().join("bindings.json"),
+            temp.path().join("audit.jsonl"),
+            Some(BootstrapAdmin {
+                email: Account::owner().email,
+                mailbox_proven: true,
+            }),
+        )
+        .expect("access policy"),
+    );
+    let snapshot = access.snapshot().expect("initial policy");
+    let mut users = snapshot.users;
+    users.insert(
+        "backup-admin@example.test".to_owned(),
+        AccessEntry { role: AccessRole::Admin, enabled: true, mailbox_proven: true },
+    );
+    access.replace(snapshot.revision, "fixture", users).expect("backup administrator");
+
+    let hub =
+        Hub::start_with_access_policy(&idp, "/api", FAST_DEVICE, Arc::clone(&access)).await;
+    let store: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::default());
+    let (user, _) = ScriptedUser::new(&idp, &hub, Account::owner(), Decision::Approve);
+    let client =
+        client_for(&format!("{}/api", hub.base), Arc::clone(&store), Arc::clone(&user), 30);
+    let grant = browser_login(&client, &user, &hub, store.as_ref()).await;
+
+    let snapshot = access.snapshot().expect("enabled policy");
+    let mut users = snapshot.users;
+    users.get_mut("owner-subject@example.test").expect("owner row").enabled = false;
+    access.replace(snapshot.revision, "disable owner", users).expect("disable owner");
+
+    assert!(matches!(read(&client).await, Err(RemoteError::AuthenticationRequired { .. })));
+    assert!(stored(store.as_ref(), &hub.resource, &hub.base).await.is_none());
+
+    let snapshot = access.snapshot().expect("disabled policy");
+    let mut users = snapshot.users;
+    users.get_mut("owner-subject@example.test").expect("owner row").enabled = true;
+    access.replace(snapshot.revision, "re-enable owner", users).expect("re-enable owner");
+
+    assert!(matches!(read(&client).await, Err(RemoteError::AuthenticationRequired { .. })));
+    assert_eq!(hub.raw_info(&grant.access_token).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        hub.raw_refresh(grant.refresh_token.as_deref().expect("refresh token")).await,
+        (StatusCode::BAD_REQUEST, "invalid_grant".to_owned())
+    );
 }
 
 #[tokio::test]

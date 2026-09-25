@@ -70,6 +70,16 @@ it all locally for dev testing.
   same key can be retried: operation-aware remote writes bypass the client-side
   semantic duplicate preflight so the receiving receipt store authoritatively
   replays the mutation.
+- **Remote delete failures are not misses.** When a drawer ID is absent locally,
+  `agentpalace_delete_drawer` preserves its deterministic all-remote fallback.
+  Authoritative HTTP 404 responses advance silently; other failures are recorded
+  while later remotes are tried. A later success includes the earlier records in
+  `skipped_failures`. If no remote succeeds, the first structured
+  `outcome: "failed"` result is returned with any later records in
+  `additional_failures`. Each record includes `remote`, `kind`, `error`, and
+  `classification` (plus `http_status`/`body` for an HTTP rejection and an
+  `auth` hint when OAuth sign-in is required). Failures are never rewritten as
+  "Drawer not found".
 - **Diary is always local.** `wing_agents`, the `diary` room, and `diary:`-prefixed
   sources are hard-pinned to local storage. Any config that tries to route them
   remote is warned about and ignored, and the server rejects diary-shaped writes
@@ -97,6 +107,21 @@ failures are classified as unavailable, corrupt, or backend; they surface as
 a save fails, login reports the persistence error but keeps the fresh grant only in the initiating
 process; a later process can use it only after storage succeeds.
 No token is placed in ordinary config, MCP output, logs, command arguments, or URLs.
+
+`agentpalace auth logout --remote NAME` performs protected-resource discovery
+to identify the issuer; `--issuer ISSUER` is an optional recovery override, not
+normally required. The MCP `agentpalace_remote_auth_start` and
+`agentpalace_remote_auth_status` tools return setup, transport, refused-grant,
+and credential-store failures as structured `status: "failed"` results with a
+`classification`. A rejected stored grant includes guidance to run the
+issuer-discovering logout command before signing in again.
+
+The demo OAuth provider distinguishes an explicit user denial from a policy
+admission failure without exposing an identity: both use the standard OAuth
+`access_denied` code, while the latter adds the safe description
+`account_not_admitted`. Device polling also distinguishes a server-issued
+`expired_token` from the client's own polling deadline; the latter is reported
+as a local timeout.
 
 When a request — read or mutation — is answered with `401`, the client attempts one bounded
 recovery and then re-sends the identical request once; a second `401` is reported without further
@@ -197,6 +222,13 @@ On start it prints the palace path, bind address, and token file, then logs
 All routes are under `/v1`. `GET /v1/health` is unauthenticated; everything else
 requires `Authorization: Bearer <token>`. See [Demo-Hub-REST-Inventory.md](Demo-Hub-REST-Inventory.md)
 for the canonical operation inventory, demo role mappings, durable stores, and owner-provenance contract.
+
+The demo gateway returns OAuth-style JSON for authorization failures: a missing,
+invalid, or disabled grant is HTTP 401 with `{"error":"invalid_token"}` and the
+RFC 9728 `WWW-Authenticate` challenge; an authenticated principal that lacks a
+required role or hard-delete permission is HTTP 403 with
+`{"error":"insufficient_scope"}`. These bodies apply consistently to forwarded
+read-only/write failures and hard-delete refusal.
 
 | Method & path | Purpose |
 |---|---|
@@ -566,6 +598,10 @@ This applies to all federated write paths that go through the MCP tools:
 > attempting deletion on ALL configured remotes (in deterministic name order), as
 > before, and the response reports `applied_to: "remote:<name>"` with no
 > `replication` field.
+> An authoritative 404 advances silently. Other failures are retained while the
+> fallback tries later remotes: a later success carries `skipped_failures`; if
+> none succeeds, the first structured failure is returned with subsequent ones
+> in `additional_failures`. No failure is collapsed into "Drawer not found".
 >
 > **Keyed delete retries replay the original intent.** Retrying a `write: both`
 > delete with the same caller `operation_id` after the local drawer is gone (or

@@ -56,7 +56,7 @@
     }
   },
   "mempalace_delete_drawer": {
-    "description": "Delete a drawer by ID. Irreversible. Known local drawers follow write routing; write:both commits locally and queues durable replication. Unknown IDs fall back across remotes.",
+    "description": "Delete a drawer by ID. Irreversible. Known local drawers follow write routing; write:both commits locally and queues durable replication. Unknown IDs fall back across remotes. Authentication, authorization, transport, and credential-store failures return a structured failed result with remote, classification, and actionable authentication guidance when applicable; only an authoritative 404 is treated as not found.",
     "input_schema": {
       "properties": {
         "drawer_id": {

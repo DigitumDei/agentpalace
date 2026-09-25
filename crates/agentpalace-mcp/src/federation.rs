@@ -871,13 +871,18 @@ impl FederationRouter {
         };
         let generated_op_id = generate_operation_id();
         let effective_operation_id =
-            operation_id_for_remote(api.as_ref(), remote_name, operation_id, &generated_op_id)
+            match operation_id_for_remote(api.as_ref(), remote_name, operation_id, &generated_op_id)
                 .await
-                .map_err(|error| {
-                    ToolError::Internal(McpError::Federation(format!(
-                        "remote `{remote_name}` idempotency capability check failed: {error}"
-                    )))
-                })?;
+            {
+                Ok(operation_id) => operation_id,
+                Err(error) => {
+                    return Ok(Some(structured_remote_failure(
+                        remote_name,
+                        "delete_drawer",
+                        &error,
+                    )));
+                }
+            };
         match api
             .delete_drawer_with_operation_id(drawer_id, effective_operation_id.as_deref())
             .await
@@ -892,14 +897,13 @@ impl FederationRouter {
                 &e,
                 effective_operation_id.as_deref(),
             ))),
-            Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
-                "remote `{remote_name}` delete_drawer failed: {e}"
-            )))),
+            Err(e) => Ok(Some(structured_remote_failure(remote_name, "delete_drawer", &e))),
         }
     }
 
     /// Try to delete a drawer from ALL configured remotes in config order (BTreeMap
-    /// name order — deterministic). Returns the first success with "origin".
+    /// name order — deterministic). Returns the first success with "origin" and reports
+    /// any earlier non-404 failures in `skipped_failures`.
     /// Deletion is by drawer id; the wing is not known here.
     pub async fn delete_drawer_remote(&self, drawer_id: &str) -> ToolResult<Option<Value>> {
         self.delete_drawer_remote_with_operation(drawer_id, None).await
@@ -911,6 +915,7 @@ impl FederationRouter {
         operation_id: Option<&str>,
     ) -> ToolResult<Option<Value>> {
         let generated_op_id = generate_operation_id();
+        let mut failures = Vec::new();
         for (name, api) in &self.remotes {
             let effective_operation_id =
                 match operation_id_for_remote(api.as_ref(), name, operation_id, &generated_op_id)
@@ -925,12 +930,12 @@ impl FederationRouter {
                             %error,
                             "skipping unreachable remote during all-remote drawer delete"
                         );
+                        failures.push(structured_remote_failure(name, "delete_drawer", &error));
                         continue;
                     }
                     Err(error) => {
-                        return Err(ToolError::Internal(McpError::Federation(format!(
-                            "remote `{name}` idempotency capability check failed: {error}"
-                        ))));
+                        failures.push(structured_remote_failure(name, "delete_drawer", &error));
+                        continue;
                     }
                 };
             match api
@@ -938,33 +943,50 @@ impl FederationRouter {
                 .await
             {
                 Ok(()) => {
-                    return Ok(Some(json!({
+                    let mut result = json!({
                         "success": true,
                         "drawer_id": drawer_id,
                         "origin": name,
                         "applied_to": format_remote_origin(name),
-                    })));
+                    });
+                    if !failures.is_empty() {
+                        result["skipped_failures"] = json!(failures);
+                    }
+                    return Ok(Some(result));
                 }
                 // The request may have committed but its outcome is unconfirmed: surface the
                 // ambiguity honestly instead of swallowing it into a false not-found.
                 Err(e) if e.is_unknown_outcome() => {
-                    return Ok(Some(remote_mutation_unknown_outcome_value(
+                    let mut result = remote_mutation_unknown_outcome_value(
                         &e,
                         effective_operation_id.as_deref(),
-                    )));
+                    );
+                    if !failures.is_empty() {
+                        result["skipped_failures"] = json!(failures);
+                    }
+                    return Ok(Some(result));
                 }
-                Err(e) if e.is_degradable() => continue,
+                Err(RemoteError::RemoteRejected { status: 404, .. }) => continue,
                 Err(e) => {
                     tracing::warn!(
                         remote = %name,
                         error = %e,
-                        "non-degradable error during remote drawer delete"
+                        "remote drawer delete failed"
                     );
+                    failures.push(structured_remote_failure(name, "delete_drawer", &e));
                     continue;
                 }
             }
         }
-        Ok(None)
+        let mut failures = failures.into_iter();
+        let Some(mut first) = failures.next() else {
+            return Ok(None);
+        };
+        let additional = failures.collect::<Vec<_>>();
+        if !additional.is_empty() {
+            first["additional_failures"] = json!(additional);
+        }
+        Ok(Some(first))
     }
 
     // ─── Taxonomy / Status ───────────────────────────────────────────────────────
@@ -2601,7 +2623,7 @@ fn remote_mutation_unknown_outcome_value(error: &RemoteError, operation_id: Opti
 
 /// Machine-actionable classification of a [`RemoteError`] for structured read-degradation
 /// warnings.
-fn remote_error_classification(error: &RemoteError) -> &'static str {
+pub(crate) fn remote_error_classification(error: &RemoteError) -> &'static str {
     match error {
         RemoteError::Unreachable { .. } => "unreachable",
         RemoteError::Unauthorized { .. } => "unauthorized",
@@ -2614,6 +2636,39 @@ fn remote_error_classification(error: &RemoteError) -> &'static str {
         RemoteError::CapabilityMissing { .. } => "capability_missing",
         RemoteError::UnknownOutcome { .. } => "unknown_outcome",
     }
+}
+
+/// Machine-actionable failure for a remote operation that could not be completed.
+/// Unlike a read degradation, this is the operation's result rather than an attached warning.
+pub(crate) fn structured_remote_failure(
+    remote: &str,
+    kind: &str,
+    error: &RemoteError,
+) -> Value {
+    let mut record = json!({
+        "success": false,
+        "outcome": "failed",
+        "remote": remote,
+        "kind": kind,
+        "error": error.to_string(),
+        "classification": remote_error_classification(error),
+    });
+    if let RemoteError::RemoteRejected { status, body, .. } = error {
+        record["http_status"] = json!(status);
+        if !body.is_empty() {
+            record["body"] = json!(body);
+        }
+    }
+    if matches!(error, RemoteError::AuthenticationRequired { .. }) {
+        record["auth"] =
+            json!({ "tool": "agentpalace_remote_auth_start", "arguments": { "remote": remote } });
+    } else if matches!(error, RemoteError::Unauthorized { .. }) {
+        record["auth"] = json!({
+            "action": "replace_static_bearer_token",
+            "message": "Replace or correct the configured static bearer token for this remote."
+        });
+    }
+    record
 }
 
 /// Structured partial-read degradation record (issue #127 requires machine-actionable
@@ -3546,6 +3601,8 @@ mod tests {
         kg_add_response: Value,
         kg_invalidate_response: Value,
         delete_succeeds: bool,
+        delete_rejection_status: Option<u16>,
+        delete_authentication_required: bool,
         fail_on: Option<String>,
         /// Endpoint that returns [`RemoteError::UnknownOutcome`] instead of its normal result
         /// (e.g. `"add_drawer"`, `"delete"`, `"kg_add"`, `"kg_invalidate"`).
@@ -3613,6 +3670,8 @@ mod tests {
                 kg_add_response: json!({"success": true}),
                 kg_invalidate_response: json!({"success": true}),
                 delete_succeeds: true,
+                delete_rejection_status: None,
+                delete_authentication_required: false,
                 fail_on: None,
                 fail_unknown_on: None,
                 add_drawer_commit_then_unknown: false,
@@ -3809,6 +3868,13 @@ mod tests {
             Ok(serde_json::from_value(self.info_response.clone()).unwrap())
         }
 
+        async fn idempotent_mutations_capability(
+            &self,
+        ) -> agentpalace_remote::Result<Option<bool>> {
+            self.check_fail("idempotency_capability")?;
+            Ok(None)
+        }
+
         async fn search_drawers(
             &self,
             req: DrawerSearchRequest,
@@ -3893,6 +3959,22 @@ mod tests {
 
         async fn delete_drawer(&self, _drawer_id: &str) -> agentpalace_remote::Result<()> {
             self.check_fail("delete")?;
+            if self.delete_authentication_required {
+                return Err(RemoteError::AuthenticationRequired {
+                    remote: "mock".to_owned(),
+                    action: "start OAuth sign-in".to_owned(),
+                    resource_metadata: Some(
+                        "https://mock/.well-known/oauth-protected-resource".to_owned(),
+                    ),
+                });
+            }
+            if let Some(status) = self.delete_rejection_status {
+                return Err(RemoteError::RemoteRejected {
+                    remote: "mock".to_owned(),
+                    status,
+                    body: r#"{"error":"insufficient_scope"}"#.to_owned(),
+                });
+            }
             if self.delete_succeeds {
                 Ok(())
             } else {
@@ -5495,6 +5577,141 @@ mod tests {
         assert_eq!(result["operation_id"], "op-del-unknown-2");
         let seen = received_ids.lock().unwrap();
         assert_eq!(seen.as_slice(), &[Some("op-del-unknown-2".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn all_remote_delete_reports_a_structured_rejection_instead_of_not_found() {
+        let mock = MockRemote {
+            delete_rejection_status: Some(403),
+            ..Default::default()
+        };
+        let router = make_router(BTreeMap::from([(
+            "alpha".to_owned(),
+            Arc::new(mock) as Arc<dyn RemoteApi>,
+        )]));
+
+        let result = router
+            .delete_drawer_remote_with_operation("d-1", None)
+            .await
+            .unwrap()
+            .expect("a refusal must be returned as a structured result");
+
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "alpha");
+        assert_eq!(result["classification"], "rejected");
+        assert_eq!(result["http_status"], 403);
+        assert!(result["body"].as_str().unwrap().contains("insufficient_scope"));
+    }
+
+    #[tokio::test]
+    async fn all_remote_delete_reports_earlier_failures_when_a_later_remote_succeeds() {
+        let refused = MockRemote {
+            delete_rejection_status: Some(403),
+            ..Default::default()
+        };
+        let router = make_router(BTreeMap::from([
+            ("alpha".to_owned(), Arc::new(refused) as Arc<dyn RemoteApi>),
+            ("beta".to_owned(), Arc::new(MockRemote::default()) as Arc<dyn RemoteApi>),
+        ]));
+
+        let result = router
+            .delete_drawer_remote_with_operation("d-1", None)
+            .await
+            .unwrap()
+            .expect("the later remote must succeed");
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["origin"], "beta");
+        assert_eq!(result["skipped_failures"][0]["remote"], "alpha");
+        assert_eq!(result["skipped_failures"][0]["http_status"], 403);
+    }
+
+    #[tokio::test]
+    async fn all_remote_delete_preserves_additional_failures_when_none_succeeds() {
+        let refused = MockRemote {
+            delete_rejection_status: Some(403),
+            ..Default::default()
+        };
+        let auth_required = MockRemote {
+            delete_authentication_required: true,
+            ..Default::default()
+        };
+        let router = make_router(BTreeMap::from([
+            ("alpha".to_owned(), Arc::new(refused) as Arc<dyn RemoteApi>),
+            ("beta".to_owned(), Arc::new(auth_required) as Arc<dyn RemoteApi>),
+        ]));
+
+        let result = router
+            .delete_drawer_remote_with_operation("d-1", None)
+            .await
+            .unwrap()
+            .expect("the first failure must be returned");
+
+        assert_eq!(result["remote"], "alpha");
+        assert_eq!(result["additional_failures"][0]["remote"], "beta");
+        assert_eq!(
+            result["additional_failures"][0]["classification"],
+            "authentication_required"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_delete_capability_probe_failure_is_structured_data() {
+        let mock = MockRemote {
+            fail_on: Some("idempotency_capability".to_owned()),
+            ..Default::default()
+        };
+        let router = make_router(BTreeMap::from([(
+            "alpha".to_owned(),
+            Arc::new(mock) as Arc<dyn RemoteApi>,
+        )]));
+        let route = make_combined_route("alpha");
+
+        let result = router
+            .delete_drawer_routed_remote("d-1", &route, None)
+            .await
+            .expect("capability failure must not become a tool error")
+            .expect("capability failure must be returned as data");
+
+        assert_eq!(result["success"], false);
+        assert_eq!(result["classification"], "unreachable");
+        assert_eq!(result["kind"], "delete_drawer");
+    }
+
+    #[test]
+    fn static_token_unauthorized_failure_does_not_offer_oauth_sign_in() {
+        let error = RemoteError::Unauthorized {
+            remote: "alpha".to_owned(),
+            resource_metadata: None,
+        };
+        let result = structured_remote_failure("alpha", "delete_drawer", &error);
+
+        assert_eq!(result["classification"], "unauthorized");
+        assert!(result["auth"].get("tool").is_none());
+        assert_eq!(result["auth"]["action"], "replace_static_bearer_token");
+    }
+
+    #[tokio::test]
+    async fn all_remote_delete_reports_authentication_required_with_a_sign_in_hint() {
+        let mock = MockRemote {
+            delete_authentication_required: true,
+            ..Default::default()
+        };
+        let router = make_router(BTreeMap::from([(
+            "alpha".to_owned(),
+            Arc::new(mock) as Arc<dyn RemoteApi>,
+        )]));
+
+        let result = router
+            .delete_drawer_remote_with_operation("d-1", None)
+            .await
+            .unwrap()
+            .expect("an auth refusal must be returned as a structured result");
+
+        assert_eq!(result["success"], false);
+        assert_eq!(result["classification"], "authentication_required");
+        assert_eq!(result["auth"]["tool"], "agentpalace_remote_auth_start");
+        assert_eq!(result["auth"]["arguments"]["remote"], "alpha");
     }
 
     #[tokio::test]

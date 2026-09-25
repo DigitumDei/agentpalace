@@ -276,6 +276,12 @@ removing access applies to subsequent requests; promotion does not silently
 expand an existing grant. Admin-owned agent grants are capped at write. Access
 list administration requires a recently authenticated admin browser session.
 
+Disabling or removing an account is deliberately fail-closed revocation, not a
+temporary suspension. The next protected request returns a 401 challenge; the
+client makes its single bounded refresh attempt, the hub refuses that refresh
+and revokes the grant family, and the client clears its stored grant. Re-enabling
+the account does not resurrect those credentials: the user must sign in again.
+
 The authentication layer rejects unauthenticated requests before any upstream
 mutation. Following login/refresh, retry only a read or an operation definitively
 rejected before execution, with a bounded retry count. Preserve the exact
@@ -308,8 +314,9 @@ Proposed administrative browser sessions last eight hours, with HttpOnly
 SameSite cookies and CSRF protection for mutations. The explicit HTTP loopback
 demo uses HttpOnly/SameSite cookies without Secure; secure deployments require
 Secure cookies. This exception must not apply to arbitrary hosts. Recheck membership on every
-request. Removing access also disables existing sessions and OAuth grants for
-subsequent requests; it does not undo committed writes. Users may list/revoke
+request. Removing access also revokes existing sessions and OAuth grant families
+on their next use; re-enabling requires a new sign-in and does not undo committed
+writes. Users may list/revoke
 their own authorized agent connections without gaining shared-memory write
 permissions.
 
