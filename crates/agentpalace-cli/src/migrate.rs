@@ -108,10 +108,11 @@ fn run_with_cache(
     // Read and validate every client document before changing the palace.
     let edits = client_edits(home, &from, &to, &binary)?;
     validate_data(&from, &to)?;
+    let no_legacy_home = !from.exists();
     // A cache without a legacy home is not a palace to migrate. It may be an
     // external model-cache symlink, which a fresh installer must leave alone.
     // An explicit cache skip also permits a real home migration to continue.
-    let cache = cache.filter(|_| from.exists() && !skip_cache);
+    let cache = cache.filter(|_| !no_legacy_home && !skip_cache);
     if dirs::home_dir().as_deref() == Some(home) {
         if let Some(hf_home) = std::env::var_os("HF_HOME") {
             let hf_home = PathBuf::from(hf_home);
@@ -139,6 +140,13 @@ fn run_with_cache(
             to.display(),
             edits.len()
         ));
+    }
+    if no_legacy_home && edits.is_empty() {
+        return Ok(concat!(
+            "Nothing to migrate: no legacy home or client registrations found. ",
+            "Legacy model cache left untouched.\n"
+        )
+        .to_owned());
     }
     if let Some((old, new)) = cache {
         migrate_data(old, new)?;
@@ -661,7 +669,8 @@ mod tests {
         fs::create_dir(&cache.0).unwrap();
         fs::create_dir(&external).unwrap();
         std::os::unix::fs::symlink(&external, cache.0.join("embeddings")).unwrap();
-        run_with_cache(&from, &to, home.path(), Path::new("/bin/agentpalace"), false, false, Some(&cache)).unwrap();
+        let result = run_with_cache(&from, &to, home.path(), Path::new("/bin/agentpalace"), false, false, Some(&cache)).unwrap();
+        assert!(result.starts_with("Nothing to migrate:"));
         assert!(!to.exists());
         assert!(!cache.1.exists());
         assert!(fs::symlink_metadata(cache.0.join("embeddings")).unwrap().file_type().is_symlink());

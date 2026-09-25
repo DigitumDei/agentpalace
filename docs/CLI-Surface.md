@@ -355,8 +355,13 @@ Flags:
   Skip the embedding-model warm-up and offline startup check entirely. For air-gapped operators who stage the model cache themselves.
 
 Behavior:
+- Under WSL, PATH-based detection for `claude`, `codex`, `gemini`, `opencode`,
+  `copilot`, `antigravity`, and `jules` ignores candidates under Windows drive
+  mounts (`/mnt/<drive>` or the configured automount root), including symlinked
+  PATH entries. Tools with other detection methods may still be detected by those
+  methods.
 - Per-tool mechanism (verified against each tool's official docs):
-  - **claude / codex / gemini** — registered via the tool's own CLI (`claude mcp add --scope user`, `codex mcp add`, `gemini mcp add -s user`), at user/global scope. Requires the tool's binary on `PATH`. Idempotent: an existing `agentpalace` server is detected and left as-is. The binary is invoked by its resolved path (including the npm `.cmd` shim on Windows), so arguments — including the MCP path — are passed as real argv entries rather than re-parsed by `cmd.exe`. Under WSL, setup ignores CLI candidates under Windows drive mounts (`/mnt/<drive>` or the configured automount root), including symlinked PATH entries, and uses Linux-installed tools only.
+  - **claude / codex / gemini** — registered via the tool's own CLI (`claude mcp add --scope user`, `codex mcp add`, `gemini mcp add -s user`), at user/global scope. Requires the tool's binary on `PATH`. Idempotent: an existing `agentpalace` server is detected and left as-is. The binary is invoked by its resolved path (including the npm `.cmd` shim on Windows), so arguments — including the MCP path — are passed as real argv entries rather than re-parsed by `cmd.exe`.
   - **opencode** — merges a `mcp.agentpalace` entry (`type: "local"`, command as a single-element array) into `~/.config/opencode/opencode.json` (XDG path, the same on Windows).
   - **copilot** — merges a `mcpServers.agentpalace` entry into `~/.copilot/mcp-config.json`.
   - **antigravity** — merges a `mcpServers.agentpalace` entry into both `~/.gemini/config/mcp_config.json` and `~/.gemini/antigravity-cli/mcp_config.json` (the config location differs across Antigravity versions; writing both is harmless). Detection keys off the antigravity-owned `~/.gemini/antigravity-cli/` directory (not the bare `~/.gemini/config/`, which is shared with the Gemini CLI).

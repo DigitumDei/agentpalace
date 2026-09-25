@@ -23,6 +23,9 @@ Migration:
 1. Checks for running MemPalace or AgentPalace processes when the old home exists,
    because its database may be in use. A fresh install or repeat update with no old
    home skips that process-name guard; unrelated servers need not be stopped.
+   When the old home exists, migration conservatively blocks on any matching
+   process name, including a server owned by another user or running in a
+   container. Stop it for the migration, then restart it after installation.
 2. Validates existing supported client configuration before copying data.
 3. Copies `~/.mempalace` into a staging directory beside `~/.agentpalace`, then
    publishes the complete copy by renaming the directory. The old `bin` directory
