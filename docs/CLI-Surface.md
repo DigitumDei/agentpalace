@@ -46,10 +46,11 @@ Credentials and tokens are never command-line arguments or config values.
 Offline MemPalace upgrade, also invoked by both installers. Requires
 `--mcp-path <final-executable-path>`. Optional `--from <old-home>` and
 `--to <new-home>` default to `~/.mempalace` and `~/.agentpalace`; `--dry-run`
-previews without writing. The applying command refuses running servers, stages
-and backs up data, and migrates supported MCP registrations. Internal file
-symlinks are materialized; directory, external, broken, and cyclic links are
-rejected. Failures exit 1.
+previews without writing. `--skip-cache` leaves the legacy model cache untouched
+while migrating the home and supported MCP registrations. The applying command
+checks for running servers only when the old home exists. A missing old home also
+leaves any legacy cache untouched. Internal file symlinks are materialized;
+directory, external, broken, and cyclic links are rejected when copied. Failures exit 1.
 See [Migration](Migration.md) for conflicts, custom paths, and rollback.
 
 ### `init <dir>`
@@ -355,7 +356,7 @@ Flags:
 
 Behavior:
 - Per-tool mechanism (verified against each tool's official docs):
-  - **claude / codex / gemini** — registered via the tool's own CLI (`claude mcp add --scope user`, `codex mcp add`, `gemini mcp add -s user`), at user/global scope. Requires the tool's binary on `PATH`. Idempotent: an existing `agentpalace` server is detected and left as-is. The binary is invoked by its resolved path (including the npm `.cmd` shim on Windows), so arguments — including the MCP path — are passed as real argv entries rather than re-parsed by `cmd.exe`.
+  - **claude / codex / gemini** — registered via the tool's own CLI (`claude mcp add --scope user`, `codex mcp add`, `gemini mcp add -s user`), at user/global scope. Requires the tool's binary on `PATH`. Idempotent: an existing `agentpalace` server is detected and left as-is. The binary is invoked by its resolved path (including the npm `.cmd` shim on Windows), so arguments — including the MCP path — are passed as real argv entries rather than re-parsed by `cmd.exe`. Under WSL, setup ignores CLI candidates under Windows drive mounts (`/mnt/<drive>` or the configured automount root), including symlinked PATH entries, and uses Linux-installed tools only.
   - **opencode** — merges a `mcp.agentpalace` entry (`type: "local"`, command as a single-element array) into `~/.config/opencode/opencode.json` (XDG path, the same on Windows).
   - **copilot** — merges a `mcpServers.agentpalace` entry into `~/.copilot/mcp-config.json`.
   - **antigravity** — merges a `mcpServers.agentpalace` entry into both `~/.gemini/config/mcp_config.json` and `~/.gemini/antigravity-cli/mcp_config.json` (the config location differs across Antigravity versions; writing both is harmless). Detection keys off the antigravity-owned `~/.gemini/antigravity-cli/` directory (not the bare `~/.gemini/config/`, which is shared with the Gemini CLI).

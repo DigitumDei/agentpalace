@@ -20,15 +20,17 @@ new registrations and model warm-up, not migration of existing registrations.
 
 Migration:
 
-1. Refuses to proceed while a MemPalace or AgentPalace process is running. Service
-   managers and MCP hosts must remain stopped throughout the upgrade.
+1. Checks for running MemPalace or AgentPalace processes when the old home exists,
+   because its database may be in use. A fresh install or repeat update with no old
+   home skips that process-name guard; unrelated servers need not be stopped.
 2. Validates existing supported client configuration before copying data.
 3. Copies `~/.mempalace` into a staging directory beside `~/.agentpalace`, then
    publishes the complete copy by renaming the directory. The old `bin` directory
    is retained only in the backup; the installer supplies the new executable.
 4. Retains the original home as `~/.mempalace.pre-agentpalace`. The default model
    cache under the OS cache directory migrates from `mempalace` to `agentpalace`
-   the same way, avoiding an unnecessary model download. External `HF_HOME`
+   the same way when the old home exists, avoiding an unnecessary model download.
+   With no old home, an existing legacy cache is left untouched. External `HF_HOME`
    caches are unchanged. If the process's `HF_HOME` points inside a home being
    moved, migration stops and reports its replacement path; update that setting
    before retrying so subsequent processes cannot recreate the retired home.
@@ -61,7 +63,11 @@ migrated directory are preserved.
 
 Unix installers accept `--migrate-from <old-home>` and `--migrate-to <new-home>`.
 PowerShell accepts `-MigrationFrom <old-home>` and `-MigrationTo <new-home>`.
-Both accept their existing install-directory override for the executable.
+Use `--skip-cache-migration` (Unix) or `-SkipCacheMigration` (PowerShell, also
+`AGENTPALACE_SKIP_CACHE_MIGRATION=1`) to migrate the old home and registrations
+without copying the legacy model cache. This is useful when the cache contains
+an external link; the old cache stays in place and setup may download models into
+its new cache. Both installers accept their existing install-directory override.
 The default executable directory is `<new-home>/bin`. It must be outside the old
 home and its backup. A custom data/config home is never guessed or recursively
 searched: pass these options to move it, or retain it and set
@@ -75,7 +81,9 @@ agentpalace migrate --mcp-path /absolute/install/path/agentpalace
 ```
 
 The preview does not write files or inspect running processes. The applying
-command requires all servers to be stopped. It works without downloading models.
+command requires matching server processes to be stopped when the old home exists. Pass
+`--skip-cache` to leave the legacy model cache untouched. It works without
+downloading models.
 The executable path describes the **final installed path**, not a temporary
 download. Install that executable before restarting any clients.
 
@@ -102,9 +110,9 @@ and choose a destination explicitly. File symlinks whose resolved targets are
 regular files inside the same source tree (including Hugging Face snapshot links
 to cached blobs) are copied as ordinary files, so they remain usable after the
 original directory is retired. Directory links, links outside the source tree,
-broken links, and link cycles are rejected. Migration also refuses to overwrite
-a previous source backup. Custom external storage can
-remain outside the home, referenced by its configured path.
+broken links, and link cycles are rejected when that cache or home is copied.
+The cache-skip option above leaves an external cache link intact. Migration also refuses to overwrite a previous source backup. Custom external
+storage can remain outside the home, referenced by its configured path.
 
 A marker in the new home permits a repeated run to finish retiring the original
 after interruption between publication and backup. Interrupted staging copies

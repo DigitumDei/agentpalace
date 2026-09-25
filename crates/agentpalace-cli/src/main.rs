@@ -325,6 +325,8 @@ enum Commands {
         mcp_path: PathBuf,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long, help = "Leave the legacy model cache untouched while migrating the home")]
+        skip_cache: bool,
     },
     /// Wire the agentpalace MCP server into your installed AI coding tools.
     Setup {
@@ -666,12 +668,13 @@ where
         Commands::WakeUp { wing } => {
             execute_wake_up(wing, cli.palace.as_deref(), context, provider_factory)
         }
-        Commands::Migrate { from, to, mcp_path, dry_run } => {
+        Commands::Migrate { from, to, mcp_path, dry_run, skip_cache } => {
             let result = (|| {
                 let home = dirs::home_dir().ok_or_else(|| std::io::Error::other("No home directory"))?;
-                if !dry_run { migrate::check_stopped()?; }
-                migrate::run(&from.unwrap_or_else(|| home.join(".mempalace")),
-                    &to.unwrap_or_else(|| home.join(".agentpalace")), &home, &mcp_path, dry_run)
+                let from = from.unwrap_or_else(|| home.join(".mempalace"));
+                let to = to.unwrap_or_else(|| home.join(".agentpalace"));
+                if !dry_run { migrate::check_stopped(&from)?; }
+                migrate::run(&from, &to, &home, &mcp_path, dry_run, skip_cache)
             })();
             Ok(match result {
                 Ok(text) => CliOutput::success(text),

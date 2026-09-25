@@ -678,7 +678,64 @@ fn resolve_mcp_binary(override_path: Option<&Path>) -> Option<PathBuf> {
 /// Locate an executable named `name` on `PATH`.
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    lookup_in_paths(name, &path, cfg!(windows))
+    let wsl_root = wsl_automount_root();
+    lookup_in_paths(name, &path, cfg!(windows), wsl_root.as_deref())
+}
+
+#[cfg(target_os = "linux")]
+fn wsl_automount_root() -> Option<PathBuf> {
+    let release = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    if std::env::var_os("WSL_DISTRO_NAME").is_none()
+        && !release.to_ascii_lowercase().contains("microsoft")
+    {
+        return None;
+    }
+    Some(
+        fs::read_to_string("/etc/wsl.conf")
+            .ok()
+            .and_then(|text| parse_wsl_automount_root(&text))
+            .unwrap_or_else(|| PathBuf::from("/mnt")),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wsl_automount_root() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_wsl_automount_root(config: &str) -> Option<PathBuf> {
+    let mut automount = false;
+    for raw in config.lines() {
+        let line = raw.split(['#', ';']).next().unwrap_or("").trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            automount = line[1..line.len() - 1].trim().eq_ignore_ascii_case("automount");
+        } else if automount {
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim().eq_ignore_ascii_case("root") {
+                    let root = PathBuf::from(value.trim().trim_matches('"'));
+                    if root.is_absolute() {
+                        return Some(root);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Skip Windows drive mounts that WSL appends to Linux PATH, including a
+/// symlinked PATH directory that resolves into a drive mount.
+fn is_wsl_windows_drive_dir(dir: &Path, root: &Path) -> bool {
+    let resolved_dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let resolved_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    resolved_dir.strip_prefix(resolved_root).ok().and_then(|relative| relative.components().next())
+        .is_some_and(|component| match component {
+            std::path::Component::Normal(name) => name.to_str().is_some_and(|part| {
+                part.len() == 1 && part.as_bytes()[0].is_ascii_alphabetic()
+            }),
+            _ => false,
+        })
 }
 
 /// PATH lookup split out for testing (no env access). On Windows, only the
@@ -687,9 +744,17 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 /// alongside the `.cmd` one, and a `.ps1` next to it; neither is a PE image, so
 /// `CreateProcess` rejects them with "%1 is not a valid Win32 application"
 /// (os error 193). Trying `""` first would therefore shadow the usable `.cmd`.
-fn lookup_in_paths(name: &str, path_var: &OsStr, windows: bool) -> Option<PathBuf> {
+fn lookup_in_paths(
+    name: &str,
+    path_var: &OsStr,
+    windows: bool,
+    wsl_root: Option<&Path>,
+) -> Option<PathBuf> {
     let exts: &[&str] = if windows { &[".exe", ".cmd", ".bat"] } else { &[""] };
     for dir in std::env::split_paths(path_var) {
+        if wsl_root.is_some_and(|root| is_wsl_windows_drive_dir(&dir, root)) {
+            continue;
+        }
         for ext in exts {
             let candidate = dir.join(format!("{name}{ext}"));
             if candidate.is_file() {
@@ -850,14 +915,71 @@ mod tests {
     }
 
     #[test]
+    fn wsl_lookup_skips_windows_drive_and_uses_linux_cli() {
+        let temp = tempfile::tempdir().unwrap();
+        let mount_root = temp.path().join("mnt");
+        let windows_bin = mount_root.join("c/Users/test/AppData/Roaming/npm");
+        let linux_bin = temp.path().join("usr/local/bin");
+        fs::create_dir_all(&windows_bin).unwrap();
+        fs::create_dir_all(&linux_bin).unwrap();
+        let windows_tool = windows_bin.join("gemini");
+        let linux_tool = linux_bin.join("gemini");
+        fs::write(&windows_tool, b"#!/bin/sh\n").unwrap();
+        fs::write(&linux_tool, b"#!/bin/sh\n").unwrap();
+        let path_var = std::env::join_paths([windows_bin.as_path(), linux_bin.as_path()]).unwrap();
+        assert_eq!(
+            lookup_in_paths("gemini", &path_var, false, None).as_deref(),
+            Some(windows_tool.as_path())
+        );
+        assert_eq!(
+            lookup_in_paths("gemini", &path_var, false, Some(&mount_root)).as_deref(),
+            Some(linux_tool.as_path())
+        );
+        let windows_only = std::env::join_paths([windows_bin.as_path()]).unwrap();
+        assert!(lookup_in_paths("gemini", &windows_only, false, Some(&mount_root)).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wsl_lookup_skips_symlink_into_windows_drive() {
+        let temp = tempfile::tempdir().unwrap();
+        let mount_root = temp.path().join("windir");
+        let windows_bin = mount_root.join("d/npm");
+        let linux_bin = temp.path().join("native/bin");
+        fs::create_dir_all(&windows_bin).unwrap();
+        fs::create_dir_all(&linux_bin).unwrap();
+        fs::write(windows_bin.join("codex"), b"#!/bin/sh\n").unwrap();
+        let linux_tool = linux_bin.join("codex");
+        fs::write(&linux_tool, b"#!/bin/sh\n").unwrap();
+        let alias = temp.path().join("interop-bin");
+        std::os::unix::fs::symlink(&windows_bin, &alias).unwrap();
+        let path_var = std::env::join_paths([alias.as_path(), linux_bin.as_path()]).unwrap();
+        assert_eq!(
+            lookup_in_paths("codex", &path_var, false, Some(&mount_root)).as_deref(),
+            Some(linux_tool.as_path())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wsl_automount_root_respects_wsl_conf_section() {
+        assert_eq!(
+            parse_wsl_automount_root("[interop]\nappendWindowsPath = true\n[automount]\nroot = /windir/ # fixed drives\n"),
+            Some(PathBuf::from("/windir"))
+        );
+        assert_eq!(parse_wsl_automount_root("[automount]\nroot = /\n"), Some(PathBuf::from("/")));
+        assert_eq!(parse_wsl_automount_root("[user]\nroot = /wrong\n"), None);
+    }
+
+    #[test]
     fn lookup_finds_executable_unix_semantics() {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("mytool");
         std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
         let path_var = OsString::from(dir.path());
-        let found = lookup_in_paths("mytool", &path_var, false);
+        let found = lookup_in_paths("mytool", &path_var, false, None);
         assert_eq!(found.as_deref(), Some(exe.as_path()));
-        assert!(lookup_in_paths("absent", &path_var, false).is_none());
+        assert!(lookup_in_paths("absent", &path_var, false, None).is_none());
     }
 
     #[test]
@@ -867,8 +989,8 @@ mod tests {
         std::fs::write(&shim, b"@echo off\n").unwrap();
         let path_var = OsString::from(dir.path());
         // Bare name has no match on unix-semantics, but windows-semantics finds the .cmd shim.
-        assert!(lookup_in_paths("gemini", &path_var, false).is_none());
-        assert_eq!(lookup_in_paths("gemini", &path_var, true).as_deref(), Some(shim.as_path()));
+        assert!(lookup_in_paths("gemini", &path_var, false, None).is_none());
+        assert_eq!(lookup_in_paths("gemini", &path_var, true, None).as_deref(), Some(shim.as_path()));
     }
 
     /// npm lays down `codex`, `codex.cmd` and `codex.ps1` side by side. Only the
@@ -884,7 +1006,7 @@ mod tests {
         std::fs::write(&cmd_shim, b"@echo off\n").unwrap();
         std::fs::write(&ps_shim, b"#!/usr/bin/env pwsh\n").unwrap();
         let path_var = OsString::from(dir.path());
-        assert_eq!(lookup_in_paths("codex", &path_var, true).as_deref(), Some(cmd_shim.as_path()));
+        assert_eq!(lookup_in_paths("codex", &path_var, true, None).as_deref(), Some(cmd_shim.as_path()));
     }
 
     /// A lone `.ps1` is not launchable either: reporting "not installed" beats
@@ -894,7 +1016,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("gemini.ps1"), b"#!/usr/bin/env pwsh\n").unwrap();
         let path_var = OsString::from(dir.path());
-        assert!(lookup_in_paths("gemini", &path_var, true).is_none());
+        assert!(lookup_in_paths("gemini", &path_var, true, None).is_none());
     }
 
     #[test]

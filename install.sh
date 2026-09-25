@@ -8,6 +8,7 @@
 # Options (pass via `sh -s -- <flags>` when piping):
 #   --no-setup           skip `agentpalace setup` (MCP registration + embedding-model warm-up)
 #   --no-path            skip adding the install dir to your shell PATH
+#   --skip-cache-migration  leave the legacy model cache untouched
 #   --install-dir <dir>  install somewhere other than ~/.agentpalace/bin
 #   --channel <channel>  stable (default) or explicit nightly candidate
 #   --version <tag>      required immutable v<version>-nightly.<full-sha> tag
@@ -20,6 +21,7 @@ MIGRATION_FROM="${HOME}/.mempalace"
 MIGRATION_TO="${HOME}/.agentpalace"
 RUN_SETUP=1
 UPDATE_PATH=1
+SKIP_CACHE_MIGRATION=0
 CHANNEL="stable"
 VERSION=""
 
@@ -27,6 +29,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --no-setup) RUN_SETUP=0 ;;
         --no-path) UPDATE_PATH=0 ;;
+        --skip-cache-migration) SKIP_CACHE_MIGRATION=1 ;;
         --install-dir)
             shift
             [ $# -gt 0 ] || { echo "error: --install-dir requires a value" >&2; exit 1; }
@@ -57,6 +60,7 @@ server with detected AI tools, and warms the embedding model.
 Options (pass via `sh -s -- <flags>` when piping):
   --no-setup           skip `agentpalace setup` (MCP registration + embedding-model warm-up)
   --no-path            skip adding the install dir to your shell PATH
+  --skip-cache-migration  leave the legacy model cache untouched
   --install-dir <dir>  install somewhere other than ~/.agentpalace/bin
   --migrate-from <dir> old data/config home (default: ~/.mempalace)
   --migrate-to <dir>   new data/config home (default: ~/.agentpalace)
@@ -245,8 +249,9 @@ fi
 
 # --- Install ----------------------------------------------------------------
 chmod +x "${TMP_DIR}/${CLI_ASSET}"
+if [ "${SKIP_CACHE_MIGRATION}" -eq 1 ]; then set -- --skip-cache; fi
 "${TMP_DIR}/${CLI_ASSET}" migrate --from "$MIGRATION_FROM" --to "$MIGRATION_TO" \
-    --mcp-path "${INSTALL_DIR}/agentpalace" \
+    --mcp-path "${INSTALL_DIR}/agentpalace" "$@" \
     || err "migration failed; resolve the reported issue and rerun this installer (backups are retained)"
 UPDATED=0
 if [ -f "${INSTALL_DIR}/agentpalace" ] || [ -f "${INSTALL_DIR}/agentpalace-cli" ] || [ -f "${INSTALL_DIR}/agentpalace-mcp" ]; then

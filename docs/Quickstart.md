@@ -28,6 +28,7 @@ Options:
 |---|---|---|
 | `--no-setup` | `-NoSetup` (or `$env:AGENTPALACE_NO_SETUP='1'`) | skip MCP registration and model warm-up |
 | `--no-path` | `-NoPath` (or `$env:AGENTPALACE_NO_PATH='1'`) | don't touch your PATH |
+| `--skip-cache-migration` | `-SkipCacheMigration` (or `$env:AGENTPALACE_SKIP_CACHE_MIGRATION='1'`) | migrate the old home and registrations, but leave the legacy model cache untouched |
 | `--install-dir <dir>` | `-InstallDir <dir>` (or `$env:AGENTPALACE_INSTALL_DIR`) | install elsewhere |
 | `--channel nightly --version v<version>-nightly.<full-commit-sha>` | `-Channel nightly -Version v<version>-nightly.<full-commit-sha>` | explicitly install an immutable test candidate |
 
