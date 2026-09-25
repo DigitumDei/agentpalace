@@ -869,19 +869,35 @@ Through the MCP server, federated wings fan out across reads:
 
 You can exercise the whole feature on one machine with two palaces — a hub and a
 client — each with its own `config.json`. Use `AGENTPALACE_CONFIG_DIR` to give the
-client its own `~/.agentpalace`-shaped directory instead of editing your real one;
-the hub is pointed at directly with `--palace`/`--token-file` and needs no config
-directory of its own. The hub does the embedding, so set
+client its own `~/.agentpalace`-shaped directory instead of editing your real one.
+The hub is pointed at its palace and token file with `--palace`/`--token-file`, but
+it also needs a small config directory of its own: mined drawers are
+locator-backed, so the hub must map `wing_demo` to a checkout of the project with
+[`server.checkouts`](#12-configure-the-server-section-optional-but-recommended),
+or it rejects the mine with HTTP 409 `checkout_unavailable`. The hub does the
+embedding, so set
 `AGENTPALACE_STUB_EMBEDDINGS` (deterministic vectors, no model download) on the
 **hub** process — the client never embeds during a remote mine.
 
 ```bash
-# 1. Hub palace + token file
+# 1. Hub palace, token file, and hub config. The project must be a Git checkout
+#    whose agentpalace.yaml declares `wing: wing_demo`. On one machine the hub's
+#    checkout can be the same directory the client mines; it must hold the same
+#    committed bytes the client sends. Use an absolute path.
+DEMO_PROJECT=/path/to/demo-project
 mkdir -p /tmp/hub
 echo '[{"token":"dev-token","name":"dev","enabled":true}]' > /tmp/hub/tokens.json
+cat > /tmp/hub/config.json <<JSON
+{
+  "version": 1,
+  "server": { "checkouts": { "wing_demo": "$DEMO_PROJECT" } }
+}
+JSON
 
-# 2. Start the hub against the hub palace (stub embeddings for a fast offline run)
-AGENTPALACE_STUB_EMBEDDINGS=1 agentpalace --palace /tmp/hub/palace serve \
+# 2. Start the hub against the hub palace (stub embeddings for a fast offline run).
+#    AGENTPALACE_CONFIG_DIR=/tmp/hub makes `serve` read /tmp/hub/config.json.
+AGENTPALACE_CONFIG_DIR=/tmp/hub AGENTPALACE_STUB_EMBEDDINGS=1 \
+  agentpalace --palace /tmp/hub/palace serve \
   --bind 127.0.0.1:8765 --token-file /tmp/hub/tokens.json &
 
 # 3. Give the client its own config directory instead of touching
@@ -899,10 +915,10 @@ cat > /tmp/client/config.json <<'JSON'
 JSON
 export AGENTPALACE_CONFIG_DIR=/tmp/client
 
-# 4. Mine a project whose agentpalace.yaml declares wing: wing_demo → pushes to the hub.
-#    The client does NOT embed here; the hub does. AGENTPALACE_CONFIG_DIR must be
-#    set in this shell (or exported) so the CLI picks up /tmp/client/config.json.
-agentpalace mine /path/to/demo-project
+# 4. Mine the project → pushes to the hub. The client does NOT embed here; the
+#    hub does. AGENTPALACE_CONFIG_DIR must be set in this shell (or exported) so
+#    the CLI picks up /tmp/client/config.json.
+agentpalace mine "$DEMO_PROJECT"
 
 # 5. Verify the hub received it. The CLI's own `search` only reads the LOCAL
 #    palace, so query the hub directly over REST instead:
@@ -917,8 +933,12 @@ environment (an MCP client typically sets this in its server-launch config, sinc
 `agentpalace serve --stdio` itself takes no CLI arguments) — the fan-out lives in the MCP
 server, not the CLI.
 
-For non-stale snippet resolution on the hub, add the project path to
-`server.checkouts.wing_demo` in the hub's config and restart `serve`.
+The hub checks each batch against its `server.checkouts.wing_demo` directory
+before storing anything. Without a mapping the mine fails with HTTP 409
+`checkout_unavailable`; it also fails if the checkout's Git `HEAD` differs from the
+client's commit or a mined file's bytes differ, so commit changes before
+re-mining. The hub reads its config at startup: restart `serve` after editing
+`/tmp/hub/config.json`.
 
 Notes:
 - `AGENTPALACE_STUB_EMBEDDINGS` is honored by the `agentpalace serve --stdio` binary and the CLI
@@ -928,6 +948,9 @@ Notes:
   MCP server with the env var set.
 - The stub maps keyword-less text to a single vector, so give demo files distinct
   keyword clusters if you want them to rank apart.
+- Project mining skips files and chunks whose trimmed text is under 50 bytes, so a
+  demo project made of one-line files mines nothing (`Files ingested: 0`) rather
+  than failing.
 
 ## Part 7 — Federated coordination
 
