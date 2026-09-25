@@ -39,6 +39,8 @@ On the clean issue-167 worktree, the targeted gateway suite passed 44 unit tests
 
 > **2026-09-24 annotation.** Live Google results for admin A, readonly B and writer D on desktop and WSL are recorded in [Live results — 2026-09-24](#live-results--2026-09-24). Most of the live procedure has now been run: A, B, C and D on desktop and WSL, drawer-level role boundaries, disable and re-enable, and a Compose restart with persistence. Some required checks are still missing (see [Still pending](#still-pending)), so the last row **remains a launch blocker**. Mining into `wing_demo` failed on 2026-09-24 and has since been dropped from the package's scope (#183).
 
+> **2026-09-25 annotation.** The maintainer waived the two checks listed under [Still pending](#still-pending). They were not run, and this record does not claim they passed. The demo's purpose is to show AgentPalace wrapped with per-user authentication, roles and owner provenance, not to be a production hub. The live run and the automated gateway suite cover that purpose. With the waiver, the last row is no longer a launch blocker for the demo. The findings below remain open work in their own issues.
+
 The limitations above are explicit work remaining before anyone describes the full #159 design as accepted. Do not close #157, merge, release, deploy, or mark the demo complete on the strength of this record.
 
 ## Live tester handoff (Dion)
@@ -130,4 +132,4 @@ These required checks have not been run or recorded:
 - **Step 5, B's other writes:** readonly B was only tested with `add_drawer`. B must also be refused for a KG fact, a coordination task and an ingest batch, and for an access-list edit.
 - **Step 5, D's membership edit:** repeat `/hub/v1/access` as D immediately after a fresh hub sign-in as D (for example `agentpalace auth login --mode browser` completed in D's profile), so that a `403` reflects D's role rather than a missing session.
 
-Real-Google acceptance stays **pending** until these are recorded. Separately, the findings above are open work: the client-side error reporting, installer and WSL issues need their own fixes. Whether they block launch is the maintainer's decision.
+**Waived by the maintainer on 2026-09-25; not run.** Readonly B's refusal of KG, coordination, ingest and access-list writes, and D's membership-edit refusal, remain covered only by the automated `admin_gateway` and `compiled_gateway_acceptance` tests, not by live evidence. Separately, the findings above are open work: the client-side error reporting, installer and WSL issues need their own fixes. Whether they block launch is the maintainer's decision.
