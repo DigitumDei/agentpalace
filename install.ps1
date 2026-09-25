@@ -8,12 +8,14 @@
 # it with parameters, or set the env-var equivalents before the one-liner:
 #   -NoSetup      / $env:AGENTPALACE_NO_SETUP = '1'   skip MCP registration + model warm-up
 #   -NoPath       / $env:AGENTPALACE_NO_PATH  = '1'   skip PATH update
+#   -SkipCacheMigration / $env:AGENTPALACE_SKIP_CACHE_MIGRATION = '1' leave legacy model cache untouched
 #   -InstallDir   / $env:AGENTPALACE_INSTALL_DIR      install somewhere else
 
 [CmdletBinding()]
 param(
     [switch]$NoSetup,
     [switch]$NoPath,
+    [switch]$SkipCacheMigration,
     [string]$InstallDir,
     [ValidateSet('stable', 'nightly')]
     [string]$Channel = 'stable',
@@ -30,6 +32,7 @@ if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion -lt [vers
 
 if (-not $NoSetup -and $env:AGENTPALACE_NO_SETUP -eq '1') { $NoSetup = $true }
 if (-not $NoPath -and $env:AGENTPALACE_NO_PATH -eq '1') { $NoPath = $true }
+if (-not $SkipCacheMigration -and $env:AGENTPALACE_SKIP_CACHE_MIGRATION -eq '1') { $SkipCacheMigration = $true }
 if ($Channel -eq 'stable' -and $env:AGENTPALACE_CHANNEL) { $Channel = $env:AGENTPALACE_CHANNEL }
 if (-not $Version -and $env:AGENTPALACE_VERSION) { $Version = $env:AGENTPALACE_VERSION }
 if (-not $InstallDir) {
@@ -181,8 +184,10 @@ try {
 
     # Only the signed, checksum-verified executable may migrate local data.
     # This runs even with -NoSetup: existing registrations must follow the rename.
-    & (Join-Path $tmpDir 'agentpalace-windows-x86_64.exe') migrate `
-        --from $MigrationFrom --to $MigrationTo --mcp-path (Join-Path $InstallDir 'agentpalace.exe')
+    $migrateArgs = @('migrate', '--from', $MigrationFrom, '--to', $MigrationTo,
+        '--mcp-path', (Join-Path $InstallDir 'agentpalace.exe'))
+    if ($SkipCacheMigration) { $migrateArgs += '--skip-cache' }
+    & (Join-Path $tmpDir 'agentpalace-windows-x86_64.exe') @migrateArgs
     if ($LASTEXITCODE -ne 0) { throw 'Migration failed. Existing backups are retained; resolve the reported issue and rerun this installer.' }
 
     $updated = (Test-Path (Join-Path $InstallDir 'agentpalace.exe')) -or

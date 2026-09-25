@@ -14,7 +14,12 @@ fn invalid(message: impl ToString) -> io::Error {
 }
 
 /// Refuse to copy a database while either generation of the server may be writing.
-pub fn check_stopped() -> io::Result<()> {
+/// A missing legacy home cannot contain a live database, so unrelated servers
+/// must not block a fresh install or an update of an already migrated client.
+pub fn check_stopped(from: &Path) -> io::Result<()> {
+    if !from.exists() {
+        return Ok(());
+    }
     #[cfg(windows)]
     let output = Command::new("tasklist").args(["/FO", "CSV", "/NH"]).output()?;
     #[cfg(not(windows))]
@@ -64,6 +69,24 @@ pub fn run(
     home: &Path,
     binary: &Path,
     dry_run: bool,
+    skip_cache: bool,
+) -> io::Result<String> {
+    let cache = if dirs::home_dir().as_deref() == Some(home) {
+        dirs::cache_dir().map(|root| (root.join("mempalace"), root.join("agentpalace")))
+    } else {
+        None
+    };
+    run_with_cache(from, to, home, binary, dry_run, skip_cache, cache.as_ref())
+}
+
+fn run_with_cache(
+    from: &Path,
+    to: &Path,
+    home: &Path,
+    binary: &Path,
+    dry_run: bool,
+    skip_cache: bool,
+    cache: Option<&(PathBuf, PathBuf)>,
 ) -> io::Result<String> {
     let from = absolute(from)?;
     let to = absolute(to)?;
@@ -85,16 +108,16 @@ pub fn run(
     // Read and validate every client document before changing the palace.
     let edits = client_edits(home, &from, &to, &binary)?;
     validate_data(&from, &to)?;
-    let cache = if dirs::home_dir().as_deref() == Some(home) {
-        dirs::cache_dir().map(|root| (root.join("mempalace"), root.join("agentpalace")))
-    } else {
-        None
-    };
+    let no_legacy_home = !from.exists();
+    // A cache without a legacy home is not a palace to migrate. It may be an
+    // external model-cache symlink, which a fresh installer must leave alone.
+    // An explicit cache skip also permits a real home migration to continue.
+    let cache = cache.filter(|_| !no_legacy_home && !skip_cache);
     if dirs::home_dir().as_deref() == Some(home) {
         if let Some(hf_home) = std::env::var_os("HF_HOME") {
             let hf_home = PathBuf::from(hf_home);
             for (old, new) in
-                std::iter::once((&from, &to)).chain(cache.iter().map(|(old, new)| (old, new)))
+                std::iter::once((&from, &to)).chain(cache.into_iter().map(|(old, new)| (old, new)))
             {
                 if old.exists() {
                     if let Ok(relative) = hf_home.strip_prefix(old) {
@@ -107,7 +130,7 @@ pub fn run(
             }
         }
     }
-    if let Some((old, new)) = &cache {
+    if let Some((old, new)) = cache {
         validate_data(old, new)?;
     }
     if dry_run {
@@ -118,7 +141,14 @@ pub fn run(
             edits.len()
         ));
     }
-    if let Some((old, new)) = &cache {
+    if no_legacy_home && edits.is_empty() {
+        return Ok(concat!(
+            "Nothing to migrate: no legacy home or client registrations found. ",
+            "Legacy model cache left untouched.\n"
+        )
+        .to_owned());
+    }
+    if let Some((old, new)) = cache {
         migrate_data(old, new)?;
     }
     migrate_data(&from, &to)?;
@@ -630,6 +660,66 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn missing_legacy_home_leaves_external_cache_link_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let from = home.path().join(".mempalace");
+        let to = home.path().join(".agentpalace");
+        let cache = (home.path().join("old-cache"), home.path().join("new-cache"));
+        let external = home.path().join("external-models");
+        fs::create_dir(&cache.0).unwrap();
+        fs::create_dir(&external).unwrap();
+        std::os::unix::fs::symlink(&external, cache.0.join("embeddings")).unwrap();
+        let result = run_with_cache(&from, &to, home.path(), Path::new("/bin/agentpalace"), false, false, Some(&cache)).unwrap();
+        assert!(result.starts_with("Nothing to migrate:"));
+        assert!(!to.exists());
+        assert!(!cache.1.exists());
+        assert!(fs::symlink_metadata(cache.0.join("embeddings")).unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_skip_migrates_home_without_following_external_link() {
+        let home = tempfile::tempdir().unwrap();
+        let from = home.path().join(".mempalace");
+        let to = home.path().join(".agentpalace");
+        let cache = (home.path().join("old-cache"), home.path().join("new-cache"));
+        let external = home.path().join("external-models");
+        fs::create_dir(&from).unwrap();
+        fs::write(from.join("note.txt"), b"legacy palace").unwrap();
+        fs::create_dir(&cache.0).unwrap();
+        fs::create_dir(&external).unwrap();
+        std::os::unix::fs::symlink(&external, cache.0.join("embeddings")).unwrap();
+        assert!(run_with_cache(&from, &to, home.path(), Path::new("/bin/agentpalace"), false, false, Some(&cache)).is_err());
+        assert!(from.exists());
+        assert!(!to.exists());
+        run_with_cache(&from, &to, home.path(), Path::new("/bin/agentpalace"), false, true, Some(&cache)).unwrap();
+        assert_eq!(fs::read(to.join("note.txt")).unwrap(), b"legacy palace");
+        assert!(backup_path(&from).exists());
+        assert!(!cache.1.exists());
+        assert!(fs::symlink_metadata(cache.0.join("embeddings")).unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrelated_agentpalace_process_does_not_block_missing_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let fake_server = home.path().join("agentpalace");
+        fs::copy("/bin/sleep", &fake_server).unwrap();
+        fs::set_permissions(&fake_server, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut server = Command::new(&fake_server).arg("10").spawn().unwrap();
+        let from = home.path().join(".mempalace");
+        let missing_result = check_stopped(&from);
+        fs::create_dir(&from).unwrap();
+        let existing_result = check_stopped(&from);
+        server.kill().unwrap();
+        server.wait().unwrap();
+        assert!(missing_result.is_ok(), "an unrelated server cannot block a fresh install");
+        assert!(existing_result.unwrap_err().to_string().contains("Stop agentpalace"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn aliased_destination_cannot_stage_inside_source() {
         let home = tempfile::tempdir().unwrap();
         let from = home.path().join("old");
@@ -637,7 +727,7 @@ mod tests {
         let alias = home.path().join("alias");
         std::os::unix::fs::symlink(&from, &alias).unwrap();
         assert!(
-            run(&from, &alias.join("new"), home.path(), Path::new("/bin/agentpalace"), false)
+            run(&from, &alias.join("new"), home.path(), Path::new("/bin/agentpalace"), false, false)
                 .is_err()
         );
         assert!(from.exists());
@@ -716,7 +806,7 @@ mod tests {
             )
             .unwrap();
         drop(engine);
-        run(&from, &to, home.path(), &to.join("bin/agentpalace"), false).unwrap();
+        run(&from, &to, home.path(), &to.join("bin/agentpalace"), false, false).unwrap();
         let reopened =
             StorageEngine::open(to.join("palace"), EmbeddingProfile::Balanced).await.unwrap();
         assert_eq!(reopened.drawer_store().get_drawer(&record.id).await.unwrap(), Some(record));
@@ -745,9 +835,9 @@ mod tests {
         let old = json!({"mcpServers":{"mempalace":{"command":"/old/mempalace","args":["serve","--stdio","--palace","/custom/palace"],"env":{"MEMPALACE_CONFIG_DIR":from,"MY_TOKEN":"untouched"},"enabled_tools":["mempalace_search"]}},"other":true});
         let client = home.path().join(".claude.json");
         fs::write(&client, serde_json::to_vec(&old).unwrap()).unwrap();
-        run(&from, &to, home.path(), &to.join("bin/agentpalace"), true).unwrap();
+        run(&from, &to, home.path(), &to.join("bin/agentpalace"), true, false).unwrap();
         assert!(!to.exists());
-        run(&from, &to, home.path(), &to.join("bin/agentpalace"), false).unwrap();
+        run(&from, &to, home.path(), &to.join("bin/agentpalace"), false, false).unwrap();
         assert!(!from.exists());
         assert_eq!(
             fs::read(to.join("palace/memory")).unwrap(),
@@ -771,7 +861,7 @@ mod tests {
         assert_eq!(migrated["mcpServers"]["agentpalace"]["env"]["MY_TOKEN"], "untouched");
         assert_eq!(migrated["mcpServers"]["agentpalace"]["args"][3], "/custom/palace");
         assert_eq!(migrated["mcpServers"]["agentpalace"]["enabled_tools"][0], "agentpalace_search");
-        run(&from, &to, home.path(), &to.join("bin/agentpalace"), false).unwrap();
+        run(&from, &to, home.path(), &to.join("bin/agentpalace"), false, false).unwrap();
         assert_eq!(updated, fs::read(&client).unwrap());
     }
 
@@ -782,11 +872,11 @@ mod tests {
         let to = home.path().join(".agentpalace");
         fs::create_dir(&from).unwrap();
         fs::create_dir(&to).unwrap();
-        assert!(run(&from, &to, home.path(), Path::new("/bin/agentpalace"), false).is_err());
+        assert!(run(&from, &to, home.path(), Path::new("/bin/agentpalace"), false, false).is_err());
         assert!(from.exists());
         fs::remove_dir(&to).unwrap();
         fs::write(home.path().join(".claude.json"), "{broken").unwrap();
-        assert!(run(&from, &to, home.path(), Path::new("/bin/agentpalace"), false).is_err());
+        assert!(run(&from, &to, home.path(), Path::new("/bin/agentpalace"), false, false).is_err());
         assert!(from.exists());
         assert!(!to.exists());
     }
@@ -816,7 +906,7 @@ mod tests {
         fs::write(&path,"model = 'chosen'\n[mcp_servers.mempalace]\ncommand = '/old/mempalace-mcp'\nargs = ['--palace', '/custom']\nstartup_timeout_sec = 120\n[mcp_servers.mempalace.env]\nMEMPALACE_EMBEDDING_PROFILE = 'low_cpu'\nTOKEN = 'secret'\n[mcp_servers.other]\nurl = 'https://example.test'\n").unwrap();
         let from = home.path().join(".mempalace");
         let to = home.path().join(".agentpalace");
-        run(&from, &to, home.path(), Path::new("/new/agentpalace"), false).unwrap();
+        run(&from, &to, home.path(), Path::new("/new/agentpalace"), false, false).unwrap();
         let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(parsed["model"].as_str(), Some("chosen"));
         assert_eq!(parsed["mcp_servers"]["agentpalace"]["env"]["TOKEN"].as_str(), Some("secret"));
