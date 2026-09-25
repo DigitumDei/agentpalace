@@ -2722,6 +2722,11 @@ fn drawer_result_to_value(result: RemoteDrawerResult, origin: &str) -> Value {
     if let Some(c) = &result.content_hash {
         v["content_hash"] = json!(c);
     }
+    // The server already redacts provider issuer/subject; pass its shape through
+    // unchanged so the caller sees the hub's authenticated attribution.
+    if let Some(provenance) = result.provenance {
+        v["provenance"] = provenance;
+    }
     if result.stale {
         v["stale"] = json!(true);
     }
@@ -3823,9 +3828,9 @@ mod tests {
                     content: v["text"].as_str().unwrap_or("").to_owned(),
                     source_file: v["source_file"].as_str().map(|s| s.to_owned()),
                     content_hash: v["content_hash"].as_str().map(|s| s.to_owned()),
-                    filed_at: None,
-                    added_by: None,
-                    provenance: None,
+                    filed_at: v["filed_at"].as_str().map(|s| s.to_owned()),
+                    added_by: v["added_by"].as_str().map(|s| s.to_owned()),
+                    provenance: v.get("provenance").cloned(),
                     stale: false,
                 })
                 .collect();
@@ -5064,6 +5069,39 @@ mod tests {
         assert!(!results[0]["origin"].is_null());
         assert_eq!(results[1]["text"], "remote hit");
         assert_eq!(results[1]["origin"], "alpha");
+    }
+
+    #[tokio::test]
+    async fn search_passes_remote_attribution_through_unchanged() {
+        // Shape of the server's redacted `ProvenanceResponse`.
+        let owner =
+            json!({"id": "owner-a", "email_at_write": "a@example.test", "status": "authenticated"});
+        let provenance = json!({
+            "creator": owner.clone(),
+            "authenticated_submitter": owner,
+            "storage_origin": {"kind": "local", "origin_id": "local"}
+        });
+        let mock = MockRemote {
+            search_results: vec![
+                json!({
+                    "wing":"w", "room":"r", "similarity":0.8, "text":"attributed",
+                    "provenance": provenance.clone()
+                }),
+                json!({"wing":"w", "room":"r", "similarity":0.7, "text":"legacy"}),
+            ],
+            ..MockRemote::default()
+        };
+        let mut remotes = BTreeMap::new();
+        remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+        let router = make_router(remotes);
+
+        let result =
+            router.search(vec![], "test", Some("w"), None, None, 10, &["alpha".to_owned()]).await;
+        let result = result.expect("remote search succeeds");
+        let results = result["results"].as_array().expect("results array");
+
+        assert_eq!(results[0]["provenance"], provenance);
+        assert!(results[1].get("provenance").is_none(), "legacy row must omit provenance");
     }
 
     #[tokio::test]
