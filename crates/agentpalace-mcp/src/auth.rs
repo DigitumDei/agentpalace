@@ -102,22 +102,28 @@ impl RemoteAuth {
     }
 
     pub async fn start(&self, name: &str) -> Result<Value, String> {
-        let client = self
-            .clients
-            .get(name)
-            .ok_or_else(|| format!("remote `{name}` is not configured for OAuth"))?
-            .clone();
-        let gate = self.start_gates.get(name).ok_or_else(|| format!("remote `{name}` has no sign-in gate"))?;
+        let Some(client) = self.clients.get(name).cloned() else {
+            return Ok(local_auth_failure(
+                name,
+                "remote_auth_start",
+                "invalid_config",
+                &format!("remote `{name}` is not configured for OAuth"),
+            ));
+        };
+        let Some(gate) = self.start_gates.get(name) else {
+            return Ok(local_auth_failure(
+                name,
+                "remote_auth_start",
+                "invalid_config",
+                &format!("remote `{name}` has no sign-in gate"),
+            ));
+        };
         let _guard = gate.lock().await;
         if let Some(prompt) = self.flows.lock().await.get(name).map(|flow| flow.prompt.clone()) {
             return Ok(prompt_value(name, &prompt));
         }
         let challenge = match client.login_challenge().await {
-            Err(error) => return Ok(crate::federation::structured_remote_failure(
-                name,
-                "remote_auth_start",
-                &error,
-            )),
+            Err(error) => return Ok(remote_auth_failure(name, "remote_auth_start", &error)),
             Ok(None) => return Ok(json!({ "remote": name, "status": "authenticated" })),
             Ok(Some(url)) => url,
         };
@@ -154,6 +160,7 @@ impl RemoteAuth {
                             return Ok(local_auth_failure(
                                 name,
                                 "remote_auth_start",
+                                "local_failure",
                                 "remote login task stopped",
                             ));
                         }
@@ -162,19 +169,17 @@ impl RemoteAuth {
                         Ok(()) => local_auth_failure(
                             name,
                             "remote_auth_start",
+                            "invalid_response",
                             "remote login ended without a device prompt",
                         ),
-                        Err(error) => crate::federation::structured_remote_failure(
-                            name,
-                            "remote_auth_start",
-                            &error,
-                        ),
+                        Err(error) => remote_auth_failure(name, "remote_auth_start", &error),
                     });
                 }
                 task.abort();
                 return Ok(local_auth_failure(
                     name,
                     "remote_auth_start",
+                    "local_timeout",
                     "remote did not provide a device prompt within 30 seconds",
                 ));
             }
@@ -187,7 +192,12 @@ impl RemoteAuth {
 
     pub async fn status(&self, name: &str) -> Result<Value, String> {
         if !self.clients.contains_key(name) {
-            return Err(format!("remote `{name}` is not configured for OAuth"));
+            return Ok(local_auth_failure(
+                name,
+                "remote_auth_status",
+                "invalid_config",
+                &format!("remote `{name}` is not configured for OAuth"),
+            ));
         }
         let mut flows = self.flows.lock().await;
         let Some(flow) = flows.get(name) else {
@@ -205,6 +215,7 @@ impl RemoteAuth {
             Err(_) => Ok(local_auth_failure(
                 name,
                 "remote_auth_status",
+                "local_failure",
                 "remote login task stopped",
             )),
         }
@@ -220,35 +231,39 @@ impl RemoteAuth {
     }
 }
 
-fn local_auth_failure(name: &str, kind: &str, message: &str) -> Value {
+fn local_auth_failure(name: &str, kind: &str, classification: &str, message: &str) -> Value {
     json!({
         "success": false,
         "outcome": "failed",
         "remote": name,
         "kind": kind,
         "status": "failed",
-        "classification": "invalid_response",
+        "classification": classification,
         "error": message,
     })
 }
 
 fn auth_status_failure(name: &str, error: &agentpalace_remote::RemoteError) -> Value {
-    let mut value = crate::federation::structured_remote_failure(
-        name,
-        "remote_auth_status",
-        error,
-    );
-    value["status"] = json!("failed");
+    let mut value = remote_auth_failure(name, "remote_auth_status", error);
     if matches!(
         error,
         agentpalace_remote::RemoteError::AuthenticationRequired { .. }
-            | agentpalace_remote::RemoteError::Unauthorized { .. }
-            | agentpalace_remote::RemoteError::RemoteRejected { .. }
+            | agentpalace_remote::RemoteError::RemoteRejected { status: 401 | 403, .. }
     ) {
         value["next"] = json!(format!(
             "Run `agentpalace auth logout --remote {name}` to clear the refused grant, then start sign-in again."
         ));
     }
+    value
+}
+
+fn remote_auth_failure(
+    name: &str,
+    kind: &str,
+    error: &agentpalace_remote::RemoteError,
+) -> Value {
+    let mut value = crate::federation::structured_remote_failure(name, kind, error);
+    value["status"] = json!("failed");
     value
 }
 
@@ -654,8 +669,39 @@ mod tests {
         let result = auth.start("demo").await.expect("failure should be returned as data");
         assert_eq!(result["success"], false);
         assert_eq!(result["outcome"], "failed");
+        assert_eq!(result["status"], "failed");
         assert_eq!(result["classification"], "unreachable");
         assert_eq!(result["kind"], "remote_auth_start");
+    }
+
+    #[tokio::test]
+    async fn mcp_auth_tools_return_structured_invalid_config_for_an_unknown_remote() {
+        let auth = RemoteAuth::new(Default::default());
+
+        for result in [auth.start("missing").await.unwrap(), auth.status("missing").await.unwrap()] {
+            assert_eq!(result["success"], false);
+            assert_eq!(result["outcome"], "failed");
+            assert_eq!(result["status"], "failed");
+            assert_eq!(result["remote"], "missing");
+            assert_eq!(result["classification"], "invalid_config");
+        }
+    }
+
+    #[test]
+    fn auth_status_only_recommends_logout_for_a_refused_grant() {
+        let rate_limited = agentpalace_remote::RemoteError::RemoteRejected {
+            remote: "demo".to_owned(),
+            status: 429,
+            body: "try later".to_owned(),
+        };
+        let server_error = agentpalace_remote::RemoteError::RemoteRejected {
+            remote: "demo".to_owned(),
+            status: 503,
+            body: "unavailable".to_owned(),
+        };
+
+        assert!(super::auth_status_failure("demo", &rate_limited).get("next").is_none());
+        assert!(super::auth_status_failure("demo", &server_error).get("next").is_none());
     }
 
     #[tokio::test]

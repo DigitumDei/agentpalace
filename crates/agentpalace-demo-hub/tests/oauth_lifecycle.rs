@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentpalace_core::{AuthenticatedOwner, Issuer, OwnerId};
 use agentpalace_demo_hub::{
+    access_policy::{AccessEntry, AccessPolicyStore, AccessRole, BootstrapAdmin},
     AdmissionIdentity, AdmissionPolicy, DeviceTiming, Gateway, GatewayConfig, GatewayMode,
     GoogleClaimError, GoogleOidcConfig, GoogleOidcVerifier, GoogleOidcVerifierAdapter,
     NativeClient, VerifiedIdentity,
@@ -340,6 +341,24 @@ struct Hub {
 
 impl Hub {
     async fn start(idp: &Idp, resource_path: &str, timing: DeviceTiming) -> Self {
+        Self::start_configured(idp, resource_path, timing, None).await
+    }
+
+    async fn start_with_access_policy(
+        idp: &Idp,
+        resource_path: &str,
+        timing: DeviceTiming,
+        access: Arc<AccessPolicyStore>,
+    ) -> Self {
+        Self::start_configured(idp, resource_path, timing, Some(access)).await
+    }
+
+    async fn start_configured(
+        idp: &Idp,
+        resource_path: &str,
+        timing: DeviceTiming,
+        access: Option<Arc<AccessPolicyStore>>,
+    ) -> Self {
         let (listener, base) = bind().await;
         let resource = format!("{base}{resource_path}");
         let config = GatewayConfig {
@@ -352,10 +371,13 @@ impl Hub {
                 redirect_uri: "http://127.0.0.1:49152/callback".to_owned(),
             },
         };
-        let gateway = Gateway::new(config, Arc::new(AllowSubjects))
+        let mut gateway = Gateway::new(config, Arc::new(AllowSubjects))
             .expect("gateway configuration")
             .with_google_verifier(Arc::new(idp.adapter()))
             .with_device_timing(timing);
+        if let Some(access) = access {
+            gateway = gateway.with_access_policy_store(access);
+        }
         let hub = Self {
             base,
             resource,
@@ -1662,6 +1684,59 @@ async fn refresh_rotates_and_reuse_revokes_the_family_including_issued_access() 
     assert!(matches!(read(&client).await, Err(RemoteError::AuthenticationRequired { .. })));
     assert_eq!(hub.token_hits.load(Ordering::SeqCst), token_hits + 1);
     assert!(stored(store.as_ref(), &hub.resource, &hub.base).await.is_none());
+}
+
+#[tokio::test]
+async fn disabling_an_account_revokes_its_grant_and_reenable_requires_new_sign_in() {
+    let idp = Idp::start().await;
+    let temp = tempfile::tempdir().expect("access-policy tempdir");
+    let access = Arc::new(
+        AccessPolicyStore::open(
+            temp.path().join("access.json"),
+            temp.path().join("bindings.json"),
+            temp.path().join("audit.jsonl"),
+            Some(BootstrapAdmin {
+                email: Account::owner().email,
+                mailbox_proven: true,
+            }),
+        )
+        .expect("access policy"),
+    );
+    let snapshot = access.snapshot().expect("initial policy");
+    let mut users = snapshot.users;
+    users.insert(
+        "backup-admin@example.test".to_owned(),
+        AccessEntry { role: AccessRole::Admin, enabled: true, mailbox_proven: true },
+    );
+    access.replace(snapshot.revision, "fixture", users).expect("backup administrator");
+
+    let hub =
+        Hub::start_with_access_policy(&idp, "/api", FAST_DEVICE, Arc::clone(&access)).await;
+    let store: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::default());
+    let (user, _) = ScriptedUser::new(&idp, &hub, Account::owner(), Decision::Approve);
+    let client =
+        client_for(&format!("{}/api", hub.base), Arc::clone(&store), Arc::clone(&user), 30);
+    let grant = browser_login(&client, &user, &hub, store.as_ref()).await;
+
+    let snapshot = access.snapshot().expect("enabled policy");
+    let mut users = snapshot.users;
+    users.get_mut("owner-subject@example.test").expect("owner row").enabled = false;
+    access.replace(snapshot.revision, "disable owner", users).expect("disable owner");
+
+    assert!(matches!(read(&client).await, Err(RemoteError::AuthenticationRequired { .. })));
+    assert!(stored(store.as_ref(), &hub.resource, &hub.base).await.is_none());
+
+    let snapshot = access.snapshot().expect("disabled policy");
+    let mut users = snapshot.users;
+    users.get_mut("owner-subject@example.test").expect("owner row").enabled = true;
+    access.replace(snapshot.revision, "re-enable owner", users).expect("re-enable owner");
+
+    assert!(matches!(read(&client).await, Err(RemoteError::AuthenticationRequired { .. })));
+    assert_eq!(hub.raw_info(&grant.access_token).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        hub.raw_refresh(grant.refresh_token.as_deref().expect("refresh token")).await,
+        (StatusCode::BAD_REQUEST, "invalid_grant".to_owned())
+    );
 }
 
 #[tokio::test]

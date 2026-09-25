@@ -871,13 +871,18 @@ impl FederationRouter {
         };
         let generated_op_id = generate_operation_id();
         let effective_operation_id =
-            operation_id_for_remote(api.as_ref(), remote_name, operation_id, &generated_op_id)
+            match operation_id_for_remote(api.as_ref(), remote_name, operation_id, &generated_op_id)
                 .await
-                .map_err(|error| {
-                    ToolError::Internal(McpError::Federation(format!(
-                        "remote `{remote_name}` idempotency capability check failed: {error}"
-                    )))
-                })?;
+            {
+                Ok(operation_id) => operation_id,
+                Err(error) => {
+                    return Ok(Some(structured_remote_failure(
+                        remote_name,
+                        "delete_drawer",
+                        &error,
+                    )));
+                }
+            };
         match api
             .delete_drawer_with_operation_id(drawer_id, effective_operation_id.as_deref())
             .await
@@ -897,7 +902,8 @@ impl FederationRouter {
     }
 
     /// Try to delete a drawer from ALL configured remotes in config order (BTreeMap
-    /// name order — deterministic). Returns the first success with "origin".
+    /// name order — deterministic). Returns the first success with "origin" and reports
+    /// any earlier non-404 failures in `skipped_failures`.
     /// Deletion is by drawer id; the wing is not known here.
     pub async fn delete_drawer_remote(&self, drawer_id: &str) -> ToolResult<Option<Value>> {
         self.delete_drawer_remote_with_operation(drawer_id, None).await
@@ -909,7 +915,7 @@ impl FederationRouter {
         operation_id: Option<&str>,
     ) -> ToolResult<Option<Value>> {
         let generated_op_id = generate_operation_id();
-        let mut failure = None;
+        let mut failures = Vec::new();
         for (name, api) in &self.remotes {
             let effective_operation_id =
                 match operation_id_for_remote(api.as_ref(), name, operation_id, &generated_op_id)
@@ -924,15 +930,11 @@ impl FederationRouter {
                             %error,
                             "skipping unreachable remote during all-remote drawer delete"
                         );
-                        failure.get_or_insert_with(|| {
-                            structured_remote_failure(name, "delete_drawer", &error)
-                        });
+                        failures.push(structured_remote_failure(name, "delete_drawer", &error));
                         continue;
                     }
                     Err(error) => {
-                        failure.get_or_insert_with(|| {
-                            structured_remote_failure(name, "delete_drawer", &error)
-                        });
+                        failures.push(structured_remote_failure(name, "delete_drawer", &error));
                         continue;
                     }
                 };
@@ -941,20 +943,28 @@ impl FederationRouter {
                 .await
             {
                 Ok(()) => {
-                    return Ok(Some(json!({
+                    let mut result = json!({
                         "success": true,
                         "drawer_id": drawer_id,
                         "origin": name,
                         "applied_to": format_remote_origin(name),
-                    })));
+                    });
+                    if !failures.is_empty() {
+                        result["skipped_failures"] = json!(failures);
+                    }
+                    return Ok(Some(result));
                 }
                 // The request may have committed but its outcome is unconfirmed: surface the
                 // ambiguity honestly instead of swallowing it into a false not-found.
                 Err(e) if e.is_unknown_outcome() => {
-                    return Ok(Some(remote_mutation_unknown_outcome_value(
+                    let mut result = remote_mutation_unknown_outcome_value(
                         &e,
                         effective_operation_id.as_deref(),
-                    )));
+                    );
+                    if !failures.is_empty() {
+                        result["skipped_failures"] = json!(failures);
+                    }
+                    return Ok(Some(result));
                 }
                 Err(RemoteError::RemoteRejected { status: 404, .. }) => continue,
                 Err(e) => {
@@ -963,14 +973,20 @@ impl FederationRouter {
                         error = %e,
                         "remote drawer delete failed"
                     );
-                    failure.get_or_insert_with(|| {
-                        structured_remote_failure(name, "delete_drawer", &e)
-                    });
+                    failures.push(structured_remote_failure(name, "delete_drawer", &e));
                     continue;
                 }
             }
         }
-        Ok(failure)
+        let mut failures = failures.into_iter();
+        let Some(mut first) = failures.next() else {
+            return Ok(None);
+        };
+        let additional = failures.collect::<Vec<_>>();
+        if !additional.is_empty() {
+            first["additional_failures"] = json!(additional);
+        }
+        Ok(Some(first))
     }
 
     // ─── Taxonomy / Status ───────────────────────────────────────────────────────
@@ -2643,12 +2659,14 @@ pub(crate) fn structured_remote_failure(
             record["body"] = json!(body);
         }
     }
-    if matches!(
-        error,
-        RemoteError::AuthenticationRequired { .. } | RemoteError::Unauthorized { .. }
-    ) {
+    if matches!(error, RemoteError::AuthenticationRequired { .. }) {
         record["auth"] =
             json!({ "tool": "agentpalace_remote_auth_start", "arguments": { "remote": remote } });
+    } else if matches!(error, RemoteError::Unauthorized { .. }) {
+        record["auth"] = json!({
+            "action": "replace_static_bearer_token",
+            "message": "Replace or correct the configured static bearer token for this remote."
+        });
     }
     record
 }
@@ -3848,6 +3866,13 @@ mod tests {
         async fn info(&self) -> agentpalace_remote::Result<InfoResponse> {
             self.check_fail("info")?;
             Ok(serde_json::from_value(self.info_response.clone()).unwrap())
+        }
+
+        async fn idempotent_mutations_capability(
+            &self,
+        ) -> agentpalace_remote::Result<Option<bool>> {
+            self.check_fail("idempotency_capability")?;
+            Ok(None)
         }
 
         async fn search_drawers(
@@ -5576,6 +5601,94 @@ mod tests {
         assert_eq!(result["classification"], "rejected");
         assert_eq!(result["http_status"], 403);
         assert!(result["body"].as_str().unwrap().contains("insufficient_scope"));
+    }
+
+    #[tokio::test]
+    async fn all_remote_delete_reports_earlier_failures_when_a_later_remote_succeeds() {
+        let refused = MockRemote {
+            delete_rejection_status: Some(403),
+            ..Default::default()
+        };
+        let router = make_router(BTreeMap::from([
+            ("alpha".to_owned(), Arc::new(refused) as Arc<dyn RemoteApi>),
+            ("beta".to_owned(), Arc::new(MockRemote::default()) as Arc<dyn RemoteApi>),
+        ]));
+
+        let result = router
+            .delete_drawer_remote_with_operation("d-1", None)
+            .await
+            .unwrap()
+            .expect("the later remote must succeed");
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["origin"], "beta");
+        assert_eq!(result["skipped_failures"][0]["remote"], "alpha");
+        assert_eq!(result["skipped_failures"][0]["http_status"], 403);
+    }
+
+    #[tokio::test]
+    async fn all_remote_delete_preserves_additional_failures_when_none_succeeds() {
+        let refused = MockRemote {
+            delete_rejection_status: Some(403),
+            ..Default::default()
+        };
+        let auth_required = MockRemote {
+            delete_authentication_required: true,
+            ..Default::default()
+        };
+        let router = make_router(BTreeMap::from([
+            ("alpha".to_owned(), Arc::new(refused) as Arc<dyn RemoteApi>),
+            ("beta".to_owned(), Arc::new(auth_required) as Arc<dyn RemoteApi>),
+        ]));
+
+        let result = router
+            .delete_drawer_remote_with_operation("d-1", None)
+            .await
+            .unwrap()
+            .expect("the first failure must be returned");
+
+        assert_eq!(result["remote"], "alpha");
+        assert_eq!(result["additional_failures"][0]["remote"], "beta");
+        assert_eq!(
+            result["additional_failures"][0]["classification"],
+            "authentication_required"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_delete_capability_probe_failure_is_structured_data() {
+        let mock = MockRemote {
+            fail_on: Some("idempotency_capability".to_owned()),
+            ..Default::default()
+        };
+        let router = make_router(BTreeMap::from([(
+            "alpha".to_owned(),
+            Arc::new(mock) as Arc<dyn RemoteApi>,
+        )]));
+        let route = make_combined_route("alpha");
+
+        let result = router
+            .delete_drawer_routed_remote("d-1", &route, None)
+            .await
+            .expect("capability failure must not become a tool error")
+            .expect("capability failure must be returned as data");
+
+        assert_eq!(result["success"], false);
+        assert_eq!(result["classification"], "unreachable");
+        assert_eq!(result["kind"], "delete_drawer");
+    }
+
+    #[test]
+    fn static_token_unauthorized_failure_does_not_offer_oauth_sign_in() {
+        let error = RemoteError::Unauthorized {
+            remote: "alpha".to_owned(),
+            resource_metadata: None,
+        };
+        let result = structured_remote_failure("alpha", "delete_drawer", &error);
+
+        assert_eq!(result["classification"], "unauthorized");
+        assert!(result["auth"].get("tool").is_none());
+        assert_eq!(result["auth"]["action"], "replace_static_bearer_token");
     }
 
     #[tokio::test]

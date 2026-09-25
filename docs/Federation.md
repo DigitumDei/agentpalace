@@ -71,13 +71,15 @@ it all locally for dev testing.
   semantic duplicate preflight so the receiving receipt store authoritatively
   replays the mutation.
 - **Remote delete failures are not misses.** When a drawer ID is absent locally,
-  `agentpalace_delete_drawer` continues its deterministic remote fallback only
-  past authoritative HTTP 404 responses. Authentication, authorization,
-  credential-store, transport, and other remote failures return a structured
-  `outcome: "failed"` result with `remote`, `kind`, `error`, and
+  `agentpalace_delete_drawer` preserves its deterministic all-remote fallback.
+  Authoritative HTTP 404 responses advance silently; other failures are recorded
+  while later remotes are tried. A later success includes the earlier records in
+  `skipped_failures`. If no remote succeeds, the first structured
+  `outcome: "failed"` result is returned with any later records in
+  `additional_failures`. Each record includes `remote`, `kind`, `error`, and
   `classification` (plus `http_status`/`body` for an HTTP rejection and an
-  `auth` hint when sign-in is required). They are never rewritten as "Drawer
-  not found".
+  `auth` hint when OAuth sign-in is required). Failures are never rewritten as
+  "Drawer not found".
 - **Diary is always local.** `wing_agents`, the `diary` room, and `diary:`-prefixed
   sources are hard-pinned to local storage. Any config that tries to route them
   remote is warned about and ignored, and the server rejects diary-shaped writes
@@ -596,9 +598,10 @@ This applies to all federated write paths that go through the MCP tools:
 > attempting deletion on ALL configured remotes (in deterministic name order), as
 > before, and the response reports `applied_to: "remote:<name>"` with no
 > `replication` field.
-> An authoritative 404 advances to the next remote. Any other remote failure is
-> returned as a structured failed result and is not collapsed into a final
-> "Drawer not found" response.
+> An authoritative 404 advances silently. Other failures are retained while the
+> fallback tries later remotes: a later success carries `skipped_failures`; if
+> none succeeds, the first structured failure is returned with subsequent ones
+> in `additional_failures`. No failure is collapsed into "Drawer not found".
 >
 > **Keyed delete retries replay the original intent.** Retrying a `write: both`
 > delete with the same caller `operation_id` after the local drawer is gone (or
