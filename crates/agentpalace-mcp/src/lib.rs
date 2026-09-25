@@ -514,12 +514,12 @@ impl ToolName {
             },
             Self::RemoteAuthStart => ToolDefinition {
                 name: self.as_str(),
-                description: "Start OAuth sign-in for a configured federation remote. Desktop auto/browser mode opens the system browser and returns its authorization URL as a fallback; headless/device mode returns a verification link and one-time code. The MCP server waits for approval and saves the grant.",
+                description: "Start OAuth sign-in for a configured federation remote. Desktop auto/browser mode opens the system browser and returns its authorization URL as a fallback; headless/device mode returns a verification link and one-time code. The MCP server waits for approval and saves the grant. Setup, transport, and credential-store failures are returned as structured failed results with a classification instead of tool-protocol errors.",
                 input_schema: json!({"type":"object","properties":{"remote":{"type":"string"}},"required":["remote"]}),
             },
             Self::RemoteAuthStatus => ToolDefinition {
                 name: self.as_str(),
-                description: "Check an MCP-started remote sign-in. When authenticated, retry the original remote request.",
+                description: "Check an MCP-started remote sign-in. When authenticated, retry the original remote request. Refused or unusable grants return a structured failed status with a classification and sign-out guidance.",
                 input_schema: json!({"type":"object","properties":{"remote":{"type":"string"}},"required":["remote"]}),
             },
             Self::Status => ToolDefinition {
@@ -686,7 +686,7 @@ impl ToolName {
             },
             Self::DeleteDrawer => ToolDefinition {
                 name: self.as_str(),
-                description: "Delete a drawer by ID. Irreversible. Known local drawers follow write routing; write:both commits locally and queues durable replication. Unknown IDs fall back across remotes.",
+                description: "Delete a drawer by ID. Irreversible. Known local drawers follow write routing; write:both commits locally and queues durable replication. Unknown IDs fall back across remotes. Authentication, authorization, transport, and credential-store failures return a structured failed result with remote, classification, and actionable authentication guidance when applicable; only an authoritative 404 is treated as not found.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -3769,6 +3769,9 @@ where
                     )
                     .await?
                 {
+                    if remote_resp.get("success") != Some(&Value::Bool(true)) {
+                        return Ok(remote_resp);
+                    }
                     // `existing` is almost always `None` here in practice —
                     // `deleted == 0` means this palace never had the row, so
                     // there was nothing to look up — but populate wing/room

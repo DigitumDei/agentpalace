@@ -120,6 +120,8 @@ struct DeviceAuthorizationResponse {
 #[derive(Debug, Deserialize)]
 struct OAuthErrorResponse {
     error: String,
+    #[serde(default)]
+    error_description: Option<String>,
 }
 
 /// Extract the resource-metadata URL from a Bearer challenge without treating arbitrary
@@ -920,14 +922,24 @@ pub async fn browser_login(
             return Err(error);
         }
         if let Some(error) = parameter("error") {
+            let description = parameter("error_description");
+            let not_admitted = description.as_deref() == Some("account_not_admitted");
             write_callback_page(
                 &mut socket,
                 "200 OK",
-                "Login was not completed; you may close this window.",
+                if not_admitted {
+                    "This account is not admitted to this AgentPalace remote; you may close this window."
+                } else {
+                    "Authorization was denied; you may close this window."
+                },
             )
             .await;
             return Err(if error == "access_denied" {
-                "OAuth authorization was denied".to_owned()
+                if not_admitted {
+                    "OAuth account is not admitted to this remote".to_owned()
+                } else {
+                    "OAuth authorization was denied by the user".to_owned()
+                }
             } else {
                 "OAuth authorization failed at the issuer".to_owned()
             });
@@ -1027,14 +1039,24 @@ pub async fn device_login(
     // These are the only values suitable for a user-facing device prompt. The device_code is
     // intentionally never formatted, logged, or returned by this function.
     interaction(config).show_device_code(&grant.verification_uri, &grant.user_code);
-    let deadline = tokio::time::Instant::now()
-        + login_timeout(config).min(Duration::from_secs(grant.expires_in.unwrap_or(900)));
+    let local_timeout = login_timeout(config);
+    let issuer_lifetime = Duration::from_secs(grant.expires_in.unwrap_or(900));
+    let local_deadline_first = local_timeout < issuer_lifetime;
+    let deadline_duration = local_timeout.min(issuer_lifetime);
+    let deadline = tokio::time::Instant::now() + deadline_duration;
     let mut interval = Duration::from_secs(grant.interval.unwrap_or(5).max(1));
     let mut network_backoff = interval;
     loop {
         tokio::time::sleep(interval).await;
         if tokio::time::Instant::now() >= deadline {
-            return Err("device authorization expired".to_owned());
+            return Err(if local_deadline_first {
+                format!(
+                    "device authorization timed out locally after {} seconds",
+                    deadline_duration.as_secs()
+                )
+            } else {
+                "device authorization expired".to_owned()
+            });
         }
         let response = http
             .post(&metadata.token_endpoint)
@@ -1064,10 +1086,8 @@ pub async fn device_login(
                 .map_err(|_| "device token response was malformed".to_owned())?;
             return Ok(session_from(body, resource, metadata, config));
         }
-        let error = serde_json::from_slice::<OAuthErrorResponse>(&bytes)
-            .map(|body| body.error)
-            .unwrap_or_default();
-        match error.as_str() {
+        let error = serde_json::from_slice::<OAuthErrorResponse>(&bytes).ok();
+        match error.as_ref().map(|body| body.error.as_str()).unwrap_or_default() {
             "authorization_pending" => {}
             "slow_down" => {
                 interval = interval.saturating_add(Duration::from_secs(5));
@@ -1075,7 +1095,15 @@ pub async fn device_login(
             }
             "expired_token" => return Err("device authorization expired".to_owned()),
             "access_denied" | "authorization_denied" => {
-                return Err("device authorization was denied".to_owned());
+                return Err(if error
+                    .as_ref()
+                    .and_then(|body| body.error_description.as_deref())
+                    == Some("account_not_admitted")
+                {
+                    "device authorization account is not admitted to this remote".to_owned()
+                } else {
+                    "device authorization was denied by the user".to_owned()
+                });
             }
             "invalid_grant" | "invalid_request" => {
                 return Err("device authorization code was rejected or already used".to_owned());
@@ -1632,9 +1660,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn device_login_reports_denial_and_reused_code() {
+    async fn device_login_distinguishes_denial_not_admitted_and_reused_code() {
         for (error, expected) in [
-            (r#"{"error":"access_denied"}"#, "denied"),
+            (r#"{"error":"access_denied"}"#, "denied by the user"),
+            (
+                r#"{"error":"access_denied","error_description":"account_not_admitted"}"#,
+                "not admitted",
+            ),
             (r#"{"error":"invalid_grant"}"#, "rejected"),
         ] {
             let (origin, _state, task) = device_server(vec![
@@ -1651,6 +1683,23 @@ mod tests {
             assert!(message.contains(expected), "{message}");
             task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn device_login_reports_a_local_deadline_as_timeout_not_issuer_expiry() {
+        let (origin, _state, task) = device_server(vec![(
+            StatusCode::OK,
+            r#"{"device_code":"private","user_code":"ABCD","verification_uri":"https://issuer.example/verify","expires_in":30,"interval":1}"#,
+        )])
+        .await;
+        let config = device_config(1, Arc::new(RecordingInteraction::default()));
+        let message =
+            device_login(&reqwest::Client::new(), &device_metadata(&origin), &config, &origin)
+                .await
+                .expect_err("the local login deadline should stop polling");
+        assert!(message.contains("timed out locally after 1 seconds"), "{message}");
+        assert!(!message.contains("expired"), "{message}");
+        task.abort();
     }
 
     #[tokio::test]
@@ -1706,8 +1755,8 @@ mod tests {
         let config = device_config(3, Arc::new(RecordingInteraction::default()));
         let error = device_login(&reqwest::Client::new(), &metadata, &config, &origin)
             .await
-            .expect_err("network retry should expire");
-        assert!(error.contains("expired"));
+            .expect_err("network retry should reach the local deadline");
+        assert!(error.contains("timed out locally"));
         task.abort();
     }
 

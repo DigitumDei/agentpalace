@@ -958,14 +958,22 @@ async fn browser_and_device_verification_exchange_upstream_codes_at_distinct_red
 async fn browser_refusals_reach_the_waiting_client_as_denied_and_store_nothing() {
     let idp = Idp::start().await;
     let hub = Hub::start(&idp, "/api", FAST_DEVICE).await;
-    for (account, decision) in [
-        (Account::owner(), Decision::Deny),
-        (Account::owner(), Decision::UpstreamDenied),
+    for (account, decision, expected_message) in [
+        (Account::owner(), Decision::Deny, "denied by the user"),
+        (Account::owner(), Decision::UpstreamDenied, "denied by the user"),
         // Signs in successfully upstream but is not admitted by the hub policy.
-        (Account::named("stranger"), Decision::Approve),
+        (Account::named("stranger"), Decision::Approve, "not admitted"),
         // An ID token Google would never issue: the hub refuses it before consent.
-        (Account::owner().claim("email_verified", serde_json::json!(false)), Decision::Approve),
-        (Account::owner().signed(Signing::UnpublishedKey), Decision::Approve),
+        (
+            Account::owner().claim("email_verified", serde_json::json!(false)),
+            Decision::Approve,
+            "denied by the user",
+        ),
+        (
+            Account::owner().signed(Signing::UnpublishedKey),
+            Decision::Approve,
+            "denied by the user",
+        ),
     ] {
         let store: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::default());
         let (user, _) = ScriptedUser::new(&idp, &hub, account.clone(), decision);
@@ -977,7 +985,11 @@ async fn browser_refusals_reach_the_waiting_client_as_denied_and_store_nothing()
             .await
             .expect_err("refused login");
         user.finish_browser().await;
-        assert!(error.to_string().contains("denied"), "{decision:?}/{}: {error}", account.sub);
+        assert!(
+            error.to_string().contains(expected_message),
+            "{decision:?}/{}: {error}",
+            account.sub
+        );
         assert!(stored(store.as_ref(), &hub.resource, &hub.base).await.is_none());
         assert!(matches!(client.info().await, Err(RemoteError::AuthenticationRequired { .. })));
     }
@@ -1187,14 +1199,26 @@ async fn device_login_polls_while_pending_then_completes_after_browser_approval(
 async fn device_refusals_end_polling_with_a_denial() {
     let idp = Idp::start().await;
     let hub = Hub::start(&idp, "/api", FAST_DEVICE).await;
-    for (account, decision) in [
-        (Account::owner(), Decision::Deny),
-        (Account::owner(), Decision::UpstreamDenied),
-        (Account::named("stranger"), Decision::Approve),
+    for (account, decision, expected_message) in [
+        (Account::owner(), Decision::Deny, "denied by the user"),
+        (Account::owner(), Decision::UpstreamDenied, "denied by the user"),
+        (Account::named("stranger"), Decision::Approve, "not admitted"),
         // ID tokens that fail verification at the device callback end the grant, too.
-        (Account::owner().signed(Signing::UnpublishedKey), Decision::Approve),
-        (Account::owner().claim("email_verified", serde_json::json!(false)), Decision::Approve),
-        (Account::owner().claim("nonce", serde_json::json!("replayed-nonce")), Decision::Approve),
+        (
+            Account::owner().signed(Signing::UnpublishedKey),
+            Decision::Approve,
+            "denied by the user",
+        ),
+        (
+            Account::owner().claim("email_verified", serde_json::json!(false)),
+            Decision::Approve,
+            "denied by the user",
+        ),
+        (
+            Account::owner().claim("nonce", serde_json::json!("replayed-nonce")),
+            Decision::Approve,
+            "denied by the user",
+        ),
     ] {
         let store: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::default());
         let (user, mut prompts) = ScriptedUser::new(&idp, &hub, account.clone(), decision);
@@ -1226,7 +1250,11 @@ async fn device_refusals_end_polling_with_a_denial() {
         };
         assert_eq!(final_status, expected, "{decision:?}/{}", account.sub);
         let error = login.await.expect("device login task").expect_err("refused device login");
-        assert!(error.to_string().contains("denied"), "{decision:?}/{}: {error}", account.sub);
+        assert!(
+            error.to_string().contains(expected_message),
+            "{decision:?}/{}: {error}",
+            account.sub
+        );
         assert!(stored(store.as_ref(), &hub.resource, &hub.base).await.is_none());
     }
 }
@@ -1570,7 +1598,11 @@ async fn device_expiry_and_client_cancellation_store_no_credential() {
             .login_from_challenge_with_mode(&metadata, Some(OAuthLoginMode::Device))
             .await
             .expect_err("unapproved device login");
-        assert!(error.to_string().contains("expired"), "{error}");
+        if hub.base == short_hub.base {
+            assert!(error.to_string().contains("expired"), "{error}");
+        } else {
+            assert!(error.to_string().contains("timed out locally"), "{error}");
+        }
         let (verification_uri, _) = next_prompt(&mut prompts).await;
         if hub.base == long_hub.base {
             // Approval after the client stopped polling cannot deliver a credential to it.

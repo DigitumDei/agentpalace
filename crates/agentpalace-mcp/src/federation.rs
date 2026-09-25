@@ -892,9 +892,7 @@ impl FederationRouter {
                 &e,
                 effective_operation_id.as_deref(),
             ))),
-            Err(e) => Err(ToolError::Internal(McpError::Federation(format!(
-                "remote `{remote_name}` delete_drawer failed: {e}"
-            )))),
+            Err(e) => Ok(Some(structured_remote_failure(remote_name, "delete_drawer", &e))),
         }
     }
 
@@ -911,6 +909,7 @@ impl FederationRouter {
         operation_id: Option<&str>,
     ) -> ToolResult<Option<Value>> {
         let generated_op_id = generate_operation_id();
+        let mut failure = None;
         for (name, api) in &self.remotes {
             let effective_operation_id =
                 match operation_id_for_remote(api.as_ref(), name, operation_id, &generated_op_id)
@@ -925,12 +924,16 @@ impl FederationRouter {
                             %error,
                             "skipping unreachable remote during all-remote drawer delete"
                         );
+                        failure.get_or_insert_with(|| {
+                            structured_remote_failure(name, "delete_drawer", &error)
+                        });
                         continue;
                     }
                     Err(error) => {
-                        return Err(ToolError::Internal(McpError::Federation(format!(
-                            "remote `{name}` idempotency capability check failed: {error}"
-                        ))));
+                        failure.get_or_insert_with(|| {
+                            structured_remote_failure(name, "delete_drawer", &error)
+                        });
+                        continue;
                     }
                 };
             match api
@@ -953,18 +956,21 @@ impl FederationRouter {
                         effective_operation_id.as_deref(),
                     )));
                 }
-                Err(e) if e.is_degradable() => continue,
+                Err(RemoteError::RemoteRejected { status: 404, .. }) => continue,
                 Err(e) => {
                     tracing::warn!(
                         remote = %name,
                         error = %e,
-                        "non-degradable error during remote drawer delete"
+                        "remote drawer delete failed"
                     );
+                    failure.get_or_insert_with(|| {
+                        structured_remote_failure(name, "delete_drawer", &e)
+                    });
                     continue;
                 }
             }
         }
-        Ok(None)
+        Ok(failure)
     }
 
     // ─── Taxonomy / Status ───────────────────────────────────────────────────────
@@ -2601,7 +2607,7 @@ fn remote_mutation_unknown_outcome_value(error: &RemoteError, operation_id: Opti
 
 /// Machine-actionable classification of a [`RemoteError`] for structured read-degradation
 /// warnings.
-fn remote_error_classification(error: &RemoteError) -> &'static str {
+pub(crate) fn remote_error_classification(error: &RemoteError) -> &'static str {
     match error {
         RemoteError::Unreachable { .. } => "unreachable",
         RemoteError::Unauthorized { .. } => "unauthorized",
@@ -2614,6 +2620,37 @@ fn remote_error_classification(error: &RemoteError) -> &'static str {
         RemoteError::CapabilityMissing { .. } => "capability_missing",
         RemoteError::UnknownOutcome { .. } => "unknown_outcome",
     }
+}
+
+/// Machine-actionable failure for a remote operation that could not be completed.
+/// Unlike a read degradation, this is the operation's result rather than an attached warning.
+pub(crate) fn structured_remote_failure(
+    remote: &str,
+    kind: &str,
+    error: &RemoteError,
+) -> Value {
+    let mut record = json!({
+        "success": false,
+        "outcome": "failed",
+        "remote": remote,
+        "kind": kind,
+        "error": error.to_string(),
+        "classification": remote_error_classification(error),
+    });
+    if let RemoteError::RemoteRejected { status, body, .. } = error {
+        record["http_status"] = json!(status);
+        if !body.is_empty() {
+            record["body"] = json!(body);
+        }
+    }
+    if matches!(
+        error,
+        RemoteError::AuthenticationRequired { .. } | RemoteError::Unauthorized { .. }
+    ) {
+        record["auth"] =
+            json!({ "tool": "agentpalace_remote_auth_start", "arguments": { "remote": remote } });
+    }
+    record
 }
 
 /// Structured partial-read degradation record (issue #127 requires machine-actionable
@@ -3546,6 +3583,8 @@ mod tests {
         kg_add_response: Value,
         kg_invalidate_response: Value,
         delete_succeeds: bool,
+        delete_rejection_status: Option<u16>,
+        delete_authentication_required: bool,
         fail_on: Option<String>,
         /// Endpoint that returns [`RemoteError::UnknownOutcome`] instead of its normal result
         /// (e.g. `"add_drawer"`, `"delete"`, `"kg_add"`, `"kg_invalidate"`).
@@ -3613,6 +3652,8 @@ mod tests {
                 kg_add_response: json!({"success": true}),
                 kg_invalidate_response: json!({"success": true}),
                 delete_succeeds: true,
+                delete_rejection_status: None,
+                delete_authentication_required: false,
                 fail_on: None,
                 fail_unknown_on: None,
                 add_drawer_commit_then_unknown: false,
@@ -3893,6 +3934,22 @@ mod tests {
 
         async fn delete_drawer(&self, _drawer_id: &str) -> agentpalace_remote::Result<()> {
             self.check_fail("delete")?;
+            if self.delete_authentication_required {
+                return Err(RemoteError::AuthenticationRequired {
+                    remote: "mock".to_owned(),
+                    action: "start OAuth sign-in".to_owned(),
+                    resource_metadata: Some(
+                        "https://mock/.well-known/oauth-protected-resource".to_owned(),
+                    ),
+                });
+            }
+            if let Some(status) = self.delete_rejection_status {
+                return Err(RemoteError::RemoteRejected {
+                    remote: "mock".to_owned(),
+                    status,
+                    body: r#"{"error":"insufficient_scope"}"#.to_owned(),
+                });
+            }
             if self.delete_succeeds {
                 Ok(())
             } else {
@@ -5495,6 +5552,53 @@ mod tests {
         assert_eq!(result["operation_id"], "op-del-unknown-2");
         let seen = received_ids.lock().unwrap();
         assert_eq!(seen.as_slice(), &[Some("op-del-unknown-2".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn all_remote_delete_reports_a_structured_rejection_instead_of_not_found() {
+        let mock = MockRemote {
+            delete_rejection_status: Some(403),
+            ..Default::default()
+        };
+        let router = make_router(BTreeMap::from([(
+            "alpha".to_owned(),
+            Arc::new(mock) as Arc<dyn RemoteApi>,
+        )]));
+
+        let result = router
+            .delete_drawer_remote_with_operation("d-1", None)
+            .await
+            .unwrap()
+            .expect("a refusal must be returned as a structured result");
+
+        assert_eq!(result["success"], false);
+        assert_eq!(result["remote"], "alpha");
+        assert_eq!(result["classification"], "rejected");
+        assert_eq!(result["http_status"], 403);
+        assert!(result["body"].as_str().unwrap().contains("insufficient_scope"));
+    }
+
+    #[tokio::test]
+    async fn all_remote_delete_reports_authentication_required_with_a_sign_in_hint() {
+        let mock = MockRemote {
+            delete_authentication_required: true,
+            ..Default::default()
+        };
+        let router = make_router(BTreeMap::from([(
+            "alpha".to_owned(),
+            Arc::new(mock) as Arc<dyn RemoteApi>,
+        )]));
+
+        let result = router
+            .delete_drawer_remote_with_operation("d-1", None)
+            .await
+            .unwrap()
+            .expect("an auth refusal must be returned as a structured result");
+
+        assert_eq!(result["success"], false);
+        assert_eq!(result["classification"], "authentication_required");
+        assert_eq!(result["auth"]["tool"], "agentpalace_remote_auth_start");
+        assert_eq!(result["auth"]["arguments"]["remote"], "alpha");
     }
 
     #[tokio::test]

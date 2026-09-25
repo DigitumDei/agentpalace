@@ -254,6 +254,42 @@ impl RemoteClient {
         }
     }
 
+    /// Fetch the protected resource's RFC 9728 challenge without loading, refreshing, or
+    /// sending a stored grant. Logout uses this side-effect-free path to discover the issuer
+    /// before it selects and clears the matching credential-store record.
+    pub async fn oauth_resource_metadata_challenge(&self) -> Result<Option<String>> {
+        self.oauth_config()?;
+        let url = self.url("v1/info")?;
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| self.classify_send_error(CallKind::Read, error))?;
+        let status = response.status();
+        let challenge = response
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::oauth::resource_metadata_from_challenge);
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return challenge.map(Some).ok_or_else(|| RemoteError::AuthenticationRequired {
+                remote: self.name.clone(),
+                action: "the remote did not advertise OAuth protected-resource metadata"
+                    .to_owned(),
+                resource_metadata: None,
+            });
+        }
+        if status.is_success() {
+            return Ok(challenge);
+        }
+        Err(RemoteError::RemoteRejected {
+            remote: self.name.clone(),
+            status: status.as_u16(),
+            body: "OAuth issuer discovery request was rejected".to_owned(),
+        })
+    }
+
     /// Ensure the version handshake has been performed, returning a reference
     /// to the cached [`InfoResponse`].
     ///

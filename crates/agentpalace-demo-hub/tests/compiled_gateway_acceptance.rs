@@ -444,6 +444,10 @@ async fn public_gateway_enforces_current_roles_and_persists_owner_provenance() {
         .await
         .expect("reader mutation");
     assert_eq!(reader_write.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        reader_write.json::<Value>().await.expect("reader refusal body")["error"],
+        "insufficient_scope"
+    );
     let reader_kg = client
         .post(format!("{gateway_base}/v1/kg/facts"))
         .bearer_auth(&token_reader)
@@ -475,6 +479,10 @@ async fn public_gateway_enforces_current_roles_and_persists_owner_provenance() {
         .await
         .expect("writer hard delete");
     assert_eq!(writer_delete.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        writer_delete.json::<Value>().await.expect("hard-delete refusal body")["error"],
+        "insufficient_scope"
+    );
 
     let snapshot = access.snapshot().expect("policy revision");
     let mut users = snapshot.users;
@@ -501,7 +509,12 @@ async fn public_gateway_enforces_current_roles_and_persists_owner_provenance() {
         .send()
         .await
         .expect("old grant after disable");
-    assert_ne!(after_disable.status(), StatusCode::OK);
+    assert_eq!(after_disable.status(), StatusCode::UNAUTHORIZED);
+    assert!(after_disable.headers().contains_key(reqwest::header::WWW_AUTHENTICATE));
+    assert_eq!(
+        after_disable.json::<Value>().await.expect("disabled grant body")["error"],
+        "invalid_token"
+    );
 
     engine_task.abort();
     let _ = engine_task.await;

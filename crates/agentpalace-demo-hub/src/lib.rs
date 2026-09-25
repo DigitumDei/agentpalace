@@ -473,6 +473,7 @@ struct DeviceGrant {
     polls: u32,
     verify_attempts: u32,
     denied: bool,
+    not_admitted: bool,
     /// Allocation order, used to evict the oldest decided grant first.
     issued: u64,
 }
@@ -827,7 +828,7 @@ impl Gateway {
         {
             return Err(ProtocolError::InvalidRequest);
         }
-        let decision = self.resolve_identity(&identity)?.ok_or(ProtocolError::AccessDenied)?;
+        let decision = self.resolve_identity(&identity)?.ok_or(ProtocolError::NotAdmitted)?;
         let ceiling = decision.role;
         let owner = decision.admission;
         let code = secret("code", client_id, challenge);
@@ -1048,6 +1049,7 @@ impl Gateway {
                 polls: 0,
                 verify_attempts: 0,
                 denied: false,
+                not_admitted: false,
                 issued,
             },
         );
@@ -1097,7 +1099,8 @@ impl Gateway {
             None => {
                 // The polling client learns of the refusal instead of waiting for expiry.
                 grant.denied = true;
-                Err(ProtocolError::AccessDenied)
+                grant.not_admitted = true;
+                Err(ProtocolError::NotAdmitted)
             }
         }
     }
@@ -1192,6 +1195,7 @@ impl Gateway {
             return Err(ProtocolError::ExpiredToken);
         }
         grant.denied = true;
+        grant.not_admitted = false;
         Ok(())
     }
 
@@ -1204,7 +1208,11 @@ impl Gateway {
             return Err(ProtocolError::ExpiredToken);
         }
         if grant.denied {
-            return Err(ProtocolError::AccessDenied);
+            return Err(if grant.not_admitted {
+                ProtocolError::NotAdmitted
+            } else {
+                ProtocolError::AccessDenied
+            });
         }
         grant.polls = grant.polls.saturating_add(1);
         let poll_time = Instant::now();
@@ -1622,6 +1630,8 @@ pub enum ProtocolError {
     InvalidGrant,
     /// `access_denied`: the user or the admission policy refused.
     AccessDenied,
+    /// `access_denied` with a safe reason: the verified account is not admitted by policy.
+    NotAdmitted,
     /// `authorization_pending`: the device grant is not yet approved.
     AuthorizationPending,
     /// `slow_down`: the client polled faster than the interval.
@@ -1640,11 +1650,19 @@ impl ProtocolError {
             Self::InvalidRequest => "invalid_request",
             Self::InvalidGrant => "invalid_grant",
             Self::AccessDenied => "access_denied",
+            Self::NotAdmitted => "access_denied",
             Self::AuthorizationPending => "authorization_pending",
             Self::SlowDown => "slow_down",
             Self::ExpiredToken => "expired_token",
             Self::ServerError => "server_error",
             Self::TemporarilyUnavailable => "temporarily_unavailable",
+        }
+    }
+
+    fn description(self) -> Option<&'static str> {
+        match self {
+            Self::NotAdmitted => Some("account_not_admitted"),
+            _ => None,
         }
     }
 }
@@ -1654,7 +1672,11 @@ impl IntoResponse for ProtocolError {
             Self::TemporarilyUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::BAD_REQUEST,
         };
-        (status, Json(serde_json::json!({"error": self.code()}))).into_response()
+        let mut body = serde_json::json!({"error": self.code()});
+        if let Some(description) = self.description() {
+            body["error_description"] = serde_json::json!(description);
+        }
+        (status, Json(body)).into_response()
     }
 }
 #[derive(Debug, Deserialize)]
@@ -1803,7 +1825,17 @@ fn if_match_revision(headers: &HeaderMap) -> Result<u64, Response> {
 
 fn rest_auth_challenge(g: &Gateway) -> Response {
     let metadata = format!("{}/.well-known/oauth-protected-resource", g.config.issuer.trim_end_matches('/'));
-    (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, format!("Bearer resource_metadata=\"{metadata}\""))]).into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, format!("Bearer error=\"invalid_token\", resource_metadata=\"{metadata}\""))],
+        Json(serde_json::json!({"error": "invalid_token"})),
+    )
+        .into_response()
+}
+
+fn insufficient_scope_response() -> Response {
+    (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "insufficient_scope"})))
+        .into_response()
 }
 
 async fn forward_rest(State(g): State<Gateway>, request: Request) -> Response {
@@ -1821,10 +1853,13 @@ async fn forward_rest(State(g): State<Gateway>, request: Request) -> Response {
     let uri = request.uri().clone();
     let mut headers = request.headers().clone();
     let (owner, role) = if method == axum::http::Method::DELETE {
-        if g.hard_delete_policy == HardDeletePolicy::Disabled { return StatusCode::FORBIDDEN.into_response(); }
+        if g.hard_delete_policy == HardDeletePolicy::Disabled {
+            return insufficient_scope_response();
+        }
         let csrf = headers.get("x-csrf-token").and_then(|value| value.to_str().ok()).map(str::to_owned);
         match admin_actor(&g, &headers, AdminCsrf::Required(csrf)) {
             Ok((_, owner, _)) => (owner, DemoRole::Admin),
+            Err(ProtocolError::AccessDenied) => return insufficient_scope_response(),
             Err(error) => return response_for_admin_error(error),
         }
     } else {
@@ -1838,7 +1873,9 @@ async fn forward_rest(State(g): State<Gateway>, request: Request) -> Response {
                 AccessRole::Write => DemoRole::Write,
                 AccessRole::Admin => DemoRole::Write,
             }),
-            Err(ProtocolError::InvalidGrant) => return rest_auth_challenge(&g),
+            Err(ProtocolError::InvalidGrant | ProtocolError::AccessDenied) => {
+                return rest_auth_challenge(&g);
+            }
             Err(error) => return error.into_response(),
         }
     };
@@ -1878,7 +1915,7 @@ async fn forward_rest(State(g): State<Gateway>, request: Request) -> Response {
             *response.headers_mut() = upstream.headers;
             response
         }
-        Err(forwarding::ForwardError::Forbidden) => StatusCode::FORBIDDEN.into_response(),
+        Err(forwarding::ForwardError::Forbidden) => insufficient_scope_response(),
         Err(forwarding::ForwardError::SpoofedIdentity) => StatusCode::BAD_REQUEST.into_response(),
         Err(forwarding::ForwardError::UnsupportedRoute) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::BAD_GATEWAY.into_response(),
@@ -2164,8 +2201,13 @@ async fn google_consent(
         }
         // `complete_browser_authorization` already consumed the transaction; a denial (the
         // identity was not admitted) is still delivered to the waiting native client.
-        Err(ProtocolError::AccessDenied) => {
-            client_error_redirect(&redirect_uri, &client_state, "access_denied")
+        Err(ProtocolError::NotAdmitted) => {
+            client_error_redirect(
+                &redirect_uri,
+                &client_state,
+                "access_denied",
+                Some("account_not_admitted"),
+            )
         }
         Err(error) => error.into_response(),
     }
@@ -2217,7 +2259,7 @@ fn end_browser_transaction(
     });
     match removed {
         Some(transaction) => {
-            client_error_redirect(&transaction.redirect_uri, &transaction.state, error)
+            client_error_redirect(&transaction.redirect_uri, &transaction.state, error, None)
         }
         None => ProtocolError::InvalidGrant.into_response(),
     }
@@ -2226,11 +2268,15 @@ fn client_error_redirect(
     redirect_uri: &str,
     client_state: &str,
     error: &str,
+    error_description: Option<&str>,
 ) -> axum::response::Response {
     let Ok(mut url) = reqwest::Url::parse(redirect_uri) else {
         return ProtocolError::InvalidRequest.into_response();
     };
     url.query_pairs_mut().append_pair("error", error).append_pair("state", client_state);
+    if let Some(description) = error_description {
+        url.query_pairs_mut().append_pair("error_description", description);
+    }
     // This helper also handles denied consent (a POST); redirect the browser with GET.
     Redirect::to(url.as_str()).into_response()
 }
@@ -2971,7 +3017,7 @@ mod tests {
                 "nonce",
                 "nonce"
             ),
-            Err(ProtocolError::AccessDenied)
+            Err(ProtocolError::NotAdmitted)
         );
     }
 

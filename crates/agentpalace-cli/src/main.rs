@@ -399,14 +399,13 @@ enum AuthCommands {
         #[arg(long, value_enum)]
         mode: Option<CliOAuthLoginMode>,
     },
-    /// Clear the locally stored grant. Revocation is issuer-specific and is performed by the
-    /// library when metadata is supplied by an embedding application.
+    /// Clear the locally stored grant, discovering the issuer from the remote by default.
     Logout {
         #[arg(long)]
         remote: String,
-        /// Issuer URL used to identify the stored grant.
-        #[arg(long)]
-        issuer: String,
+        /// Override the discovered issuer URL used to identify the stored grant.
+        #[arg(long, value_name = "URL")]
+        issuer: Option<String>,
     },
 }
 
@@ -758,7 +757,7 @@ fn execute_auth(
 
 enum AuthOperation {
     Login(String, Option<OAuthLoginMode>),
-    Logout(String),
+    Logout(Option<String>),
 }
 
 /// Run one `auth` operation against a client built by [`cli_remote_client`], so the stored
@@ -778,10 +777,28 @@ async fn run_auth_operation(
                     .to_owned()
             })
         }
-        AuthOperation::Logout(issuer) => {
+        AuthOperation::Logout(issuer_override) => {
+            let (issuer, discovered_metadata) = if let Some(issuer) = issuer_override {
+                (issuer, None)
+            } else {
+                let challenge = client
+                    .oauth_resource_metadata_challenge()
+                    .await?
+                    .ok_or_else(|| {
+                        RemoteError::InvalidResponse {
+                            remote: "configured remote".to_owned(),
+                            message: "the remote did not advertise OAuth protected-resource metadata; pass --issuer to override discovery".to_owned(),
+                        }
+                    })?;
+                let (_, metadata) = client.discover(&challenge).await?;
+                (metadata.issuer.clone(), Some(metadata))
+            };
             // Revocation is best effort and needs validated issuer metadata; the local delete
             // happens regardless and its outcome (including a store failure) is always reported.
-            let metadata = client.authorization_server_metadata(&issuer).await.ok();
+            let metadata = match discovered_metadata {
+                Some(metadata) => Some(metadata),
+                None => client.authorization_server_metadata(&issuer).await.ok(),
+            };
             let outcome = client.logout(Some(&issuer), metadata.as_ref()).await?;
             let mut text = match outcome.store {
                 agentpalace_remote::ClearOutcome::Removed => "OAuth session cleared.".to_owned(),
@@ -3209,6 +3226,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn auth_logout_discovers_the_issuer_by_default_and_accepts_an_override() {
+        let discovered = Cli::try_parse_from([
+            "agentpalace",
+            "auth",
+            "logout",
+            "--remote",
+            "demo",
+        ])
+        .expect("issuer-free logout should parse");
+        assert!(matches!(
+            discovered.command,
+            Some(Commands::Auth {
+                command: AuthCommands::Logout { issuer: None, .. }
+            })
+        ));
+
+        let overridden = Cli::try_parse_from([
+            "agentpalace",
+            "auth",
+            "logout",
+            "--remote",
+            "demo",
+            "--issuer",
+            "https://issuer.example",
+        ])
+        .expect("issuer override should parse");
+        assert!(matches!(
+            overridden.command,
+            Some(Commands::Auth {
+                command: AuthCommands::Logout {
+                    issuer: Some(ref issuer),
+                    ..
+                }
+            }) if issuer == "https://issuer.example"
+        ));
+    }
+
     fn oauth_test_remote(allow_in_memory: bool) -> agentpalace_config::ResolvedRemote {
         agentpalace_config::ResolvedRemote {
             name: "demo".to_owned(),
@@ -3294,7 +3349,7 @@ mod tests {
         let text = runtime
             .block_on(run_auth_operation(
                 &client,
-                AuthOperation::Logout("https://issuer.example".to_owned()),
+                AuthOperation::Logout(Some("https://issuer.example".to_owned())),
                 false,
             ))
             .unwrap();
@@ -3309,7 +3364,7 @@ mod tests {
         let again = runtime
             .block_on(run_auth_operation(
                 &client,
-                AuthOperation::Logout("https://issuer.example".to_owned()),
+                AuthOperation::Logout(Some("https://issuer.example".to_owned())),
                 false,
             ))
             .unwrap();
@@ -3320,12 +3375,90 @@ mod tests {
         let text = runtime
             .block_on(run_auth_operation(
                 &slash_client,
-                AuthOperation::Logout("https://issuer.example".to_owned()),
+                AuthOperation::Logout(Some("https://issuer.example".to_owned())),
                 false,
             ))
             .unwrap();
         assert!(text.starts_with("OAuth session cleared."), "{text}");
         assert_eq!(stored("https://hub.example/api/"), None);
+    }
+
+    #[test]
+    fn auth_logout_discovers_issuer_from_the_configured_remote() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            use axum::http::{StatusCode, header};
+            use axum::response::IntoResponse;
+            use axum::routing::get;
+
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let challenge_base = base.clone();
+            let protected_base = base.clone();
+            let metadata_base = base.clone();
+            let app = axum::Router::new()
+                .route(
+                    "/v1/info",
+                    get(move || {
+                        let metadata = format!(
+                            "{challenge_base}/.well-known/oauth-protected-resource"
+                        );
+                        async move {
+                            (
+                                StatusCode::UNAUTHORIZED,
+                                [(
+                                    header::WWW_AUTHENTICATE,
+                                    format!("Bearer resource_metadata=\"{metadata}\""),
+                                )],
+                            )
+                                .into_response()
+                        }
+                    }),
+                )
+                .route(
+                    "/.well-known/oauth-protected-resource",
+                    get(move || {
+                        let base = protected_base.clone();
+                        async move {
+                            axum::Json(serde_json::json!({
+                                "resource": base,
+                                "authorization_servers": [base],
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/.well-known/oauth-authorization-server",
+                    get(move || {
+                        let base = metadata_base.clone();
+                        async move {
+                            axum::Json(serde_json::json!({
+                                "issuer": base,
+                                "authorization_endpoint": format!("{base}/authorize"),
+                                "token_endpoint": format!("{base}/token"),
+                            }))
+                        }
+                    }),
+                );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let store = Arc::new(agentpalace_remote::InMemoryTokenStore::default());
+            let context = scripted_context(store.clone());
+            let mut remote = path_remote(&base);
+            remote.oauth.as_mut().unwrap().allow_loopback_demo = true;
+            let client = cli_remote_client(&context, &remote).unwrap();
+            let resource = client.oauth_resource().to_owned();
+            let mut session = path_session(&resource, "access");
+            session.issuer = base.clone();
+            store.save(session).await.unwrap();
+
+            let text = run_auth_operation(&client, AuthOperation::Logout(None), false).await.unwrap();
+            assert!(text.starts_with("OAuth session cleared."), "{text}");
+            assert!(
+                store.load(&resource, &base, "cli-test", Some("owner")).await.unwrap().is_none()
+            );
+            server.abort();
+        });
     }
 
     #[test]
@@ -3337,7 +3470,7 @@ mod tests {
         let error = runtime
             .block_on(run_auth_operation(
                 &client,
-                AuthOperation::Logout("https://issuer.example".to_owned()),
+                AuthOperation::Logout(Some("https://issuer.example".to_owned())),
                 false,
             ))
             .expect_err("an unavailable store is not 'nothing to clear'");
