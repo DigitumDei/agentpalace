@@ -76,6 +76,7 @@ fn test_config(tempdir: &TempDir) -> AgentPalaceConfig {
         },
         federation: FederationRuntimeConfig::default(),
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
     }
 }
 
@@ -133,6 +134,7 @@ async fn round_trip_drawers_and_changes() {
             added_by: Some("e2e".to_owned()),
             drawer_id: None,
             operation_id: None,
+            allow_near_duplicate: false,
         })
         .await
         .unwrap();
@@ -147,6 +149,7 @@ async fn round_trip_drawers_and_changes() {
             room: None,
             limit: Some(5),
             view: None,
+            prefer: None,
         })
         .await
         .unwrap();
@@ -278,6 +281,7 @@ async fn duplicate_add_is_remote_rejected_409() {
         added_by: None,
         drawer_id: None,
         operation_id: None,
+        allow_near_duplicate: false,
     };
 
     // First add — must succeed
@@ -318,6 +322,7 @@ async fn diary_write_is_remote_rejected() {
             added_by: None,
             drawer_id: None,
             operation_id: None,
+            allow_near_duplicate: false,
         })
         .await;
 
@@ -396,6 +401,7 @@ async fn version_skew_is_hard_error() {
             room: None,
             limit: None,
             view: None,
+            prefer: None,
         })
         .await;
     match first {
@@ -411,6 +417,7 @@ async fn version_skew_is_hard_error() {
             room: None,
             limit: None,
             view: None,
+            prefer: None,
         })
         .await;
     match second {
@@ -527,6 +534,7 @@ async fn ingest_batch_round_trip() {
             room: None,
             limit: Some(5),
             view: None,
+            prefer: None,
         })
         .await
         .unwrap();
@@ -1025,6 +1033,7 @@ async fn replication_wire_fields_accepted_by_server() {
             added_by: Some("e2e".to_owned()),
             drawer_id: Some("stable-local-drawer-id-e2e".to_owned()),
             operation_id: Some("op-add-e2e-1".to_owned()),
+            allow_near_duplicate: false,
         })
         .await
         .unwrap();
@@ -1043,6 +1052,7 @@ async fn replication_wire_fields_accepted_by_server() {
         added_by: None,
         drawer_id: None,
         operation_id: None,
+        allow_near_duplicate: false,
     });
     let second = again.await.unwrap();
     assert!(second.success);

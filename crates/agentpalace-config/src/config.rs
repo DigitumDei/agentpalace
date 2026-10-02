@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use agentpalace_core::{EmbeddingProfile, AgentPalaceError, Result};
+use agentpalace_core::{AgentPalaceError, EmbeddingProfile, Freshness, Result};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Builder, Runtime};
 
@@ -348,6 +348,87 @@ impl MaintenanceRuntimeConfig {
     }
 }
 
+/// Default half-life, in hours, of the search freshness lift.
+pub const DEFAULT_FRESHNESS_HALF_LIFE_HOURS: u32 = 24;
+
+/// File-level representation of the optional `search` config section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchConfigFileV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<FreshnessConfigFileV1>,
+}
+
+/// File-level representation of `search.freshness`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshnessConfigFileV1 {
+    /// `relevant`, `balanced` or `recent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub half_life_hours: Option<u32>,
+    /// `wing/room` pairs whose drawers never receive a freshness lift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_lift_rooms: Option<Vec<String>>,
+}
+
+/// Resolved search ranking configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchRuntimeConfig {
+    /// Freshness mode used when a request does not say (default: `relevant`).
+    pub freshness_default: Freshness,
+    /// Half-life of the freshness lift in hours (default: 24).
+    pub half_life_hours: u32,
+    /// `(wing, room)` pairs that never receive a freshness lift.
+    pub no_lift_rooms: BTreeSet<(String, String)>,
+}
+
+impl SearchRuntimeConfig {
+    pub fn defaults() -> Self {
+        Self {
+            freshness_default: Freshness::Relevant,
+            half_life_hours: DEFAULT_FRESHNESS_HALF_LIFE_HOURS,
+            no_lift_rooms: BTreeSet::new(),
+        }
+    }
+
+    fn with_overrides(mut self, file: Option<SearchConfigFileV1>, config_path: &Path) -> Result<Self> {
+        let Some(freshness) = file.and_then(|file| file.freshness) else {
+            return Ok(self);
+        };
+        let invalid = |message: String| AgentPalaceError::ConfigParse {
+            path: config_path.to_path_buf(),
+            message,
+        };
+        if let Some(mode) = freshness.default {
+            self.freshness_default = Freshness::parse(&mode).ok_or_else(|| {
+                invalid(format!(
+                    "search.freshness.default must be one of relevant, balanced, recent; got `{mode}`"
+                ))
+            })?;
+        }
+        if let Some(hours) = freshness.half_life_hours {
+            if hours == 0 {
+                return Err(invalid("search.freshness.half_life_hours must be at least 1".to_owned()));
+            }
+            self.half_life_hours = hours;
+        }
+        for entry in freshness.no_lift_rooms.unwrap_or_default() {
+            let parsed = entry.split_once('/').filter(|(wing, room)| {
+                !wing.is_empty() && !room.is_empty() && !room.contains('/')
+            });
+            let Some((wing, room)) = parsed else {
+                return Err(invalid(format!(
+                    "search.freshness.no_lift_rooms entries must be `wing/room`; got `{entry}`"
+                )));
+            };
+            self.no_lift_rooms.insert((wing.to_owned(), room.to_owned()));
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigFileV1 {
     #[serde(default = "default_version")]
@@ -371,6 +452,9 @@ pub struct ConfigFileV1 {
     /// Optional maintenance subsystem configuration.
     #[serde(default)]
     pub maintenance: Option<MaintenanceConfigFileV1>,
+    /// Optional search ranking configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<SearchConfigFileV1>,
 }
 
 impl Default for ConfigFileV1 {
@@ -385,6 +469,7 @@ impl Default for ConfigFileV1 {
             federation: None,
             coordination: None,
             maintenance: None,
+            search: None,
         }
     }
 }
@@ -407,6 +492,8 @@ pub struct AgentPalaceConfig {
     pub federation: FederationRuntimeConfig,
     /// Maintenance subsystem configuration.
     pub maintenance: MaintenanceRuntimeConfig,
+    /// Search ranking configuration.
+    pub search: SearchRuntimeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -563,6 +650,7 @@ impl ConfigLoader {
             server,
             federation,
             maintenance,
+            search: SearchRuntimeConfig::defaults().with_overrides(file.search, &paths.config_file)?,
         })
     }
 
@@ -1361,6 +1449,7 @@ mod tests {
         MaintenanceConfigFileV1, MaintenanceRuntimeConfig, ProjectConfig, ProjectRegistryEntryV1,
         ProjectRoomConfig, expand_path, resolve_coordination_default_wing, resolve_paths_with_env,
     };
+    use super::{Freshness, FreshnessConfigFileV1, SearchConfigFileV1, SearchRuntimeConfig};
 
     fn temp_dir() -> PathBuf {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -2311,6 +2400,86 @@ mod tests {
         );
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    // ─── Search freshness config tests ───────────────────────────────────────
+
+    #[test]
+    fn search_freshness_defaults_to_relevant_on_both_profiles() {
+        for profile in ["balanced", "low_cpu"] {
+            let base = temp_dir();
+            fs::create_dir_all(&base).unwrap();
+            fs::write(
+                base.join("config.json"),
+                format!(r#"{{"version":1,"embedding_profile":"{profile}"}}"#),
+            )
+            .unwrap();
+            let config = ConfigLoader::load_with_env(Some(&base)).unwrap();
+            assert_eq!(config.search, SearchRuntimeConfig::defaults());
+            assert_eq!(config.search.freshness_default, Freshness::Relevant);
+            assert_eq!(config.search.half_life_hours, 24);
+            assert!(config.search.no_lift_rooms.is_empty());
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn search_freshness_overrides_are_loaded_from_config() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("config.json"),
+            r#"{"version":1,"search":{"freshness":{"default":"recent","half_life_hours":6,"no_lift_rooms":["wing_ops/how-to"]}}}"#,
+        )
+        .unwrap();
+        let config = ConfigLoader::load_with_env(Some(&base)).unwrap();
+        assert_eq!(config.search.freshness_default, Freshness::Recent);
+        assert_eq!(config.search.half_life_hours, 6);
+        assert!(config.search.no_lift_rooms.contains(&("wing_ops".to_owned(), "how-to".to_owned())));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn invalid_search_freshness_values_are_rejected() {
+        let parse = |freshness: FreshnessConfigFileV1| {
+            SearchRuntimeConfig::defaults()
+                .with_overrides(
+                    Some(SearchConfigFileV1 { freshness: Some(freshness) }),
+                    Path::new("config.json"),
+                )
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(
+            parse(FreshnessConfigFileV1 { default: Some("latest".to_owned()), ..Default::default() })
+                .contains("search.freshness.default")
+        );
+        assert!(
+            parse(FreshnessConfigFileV1 { half_life_hours: Some(0), ..Default::default() })
+                .contains("half_life_hours must be at least 1")
+        );
+        for bad in ["how-to", "/room", "wing/", "wing/a/b"] {
+            assert!(
+                parse(FreshnessConfigFileV1 {
+                    no_lift_rooms: Some(vec![bad.to_owned()]),
+                    ..Default::default()
+                })
+                .contains("no_lift_rooms"),
+                "{bad} should be rejected"
+            );
+        }
+        let balanced = SearchRuntimeConfig::defaults()
+            .with_overrides(
+                Some(SearchConfigFileV1 {
+                    freshness: Some(FreshnessConfigFileV1 {
+                        default: Some("balanced".to_owned()),
+                        ..Default::default()
+                    }),
+                }),
+                Path::new("config.json"),
+            )
+            .unwrap();
+        assert_eq!(balanced.freshness_default, Freshness::Balanced);
     }
 
     // ─── Maintenance config tests ────────────────────────────────────────────

@@ -110,6 +110,16 @@ impl Default for MaintenanceStatus {
     }
 }
 
+/// `/v1/info` capability: the server honours `DrawerSearchRequest.prefer`,
+/// returns `filed_at`/`date`/`ingest_mode` on search results, and ranks
+/// before excluding caller-invisible rows.
+pub const SEARCH_FRESHNESS_CAPABILITY: &str = "search_freshness";
+
+/// `/v1/info` capability: the server classifies duplicate matches
+/// (`exact` / `series_update` / `near_duplicate`), accepts series updates, and
+/// honours `AddDrawerRequest.allow_near_duplicate`.
+pub const DUPLICATE_SERIES_CAPABILITY: &str = "duplicate_series";
+
 // ─── Drawer search ────────────────────────────────────────────────────────────
 
 /// Request body for `POST /drawers/search`.
@@ -130,6 +140,11 @@ pub struct DrawerSearchRequest {
     /// Maximum number of results to return.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Freshness ranking intent: `relevant`, `balanced` or `recent`. Absent
+    /// means the server's configured default. Servers that do not advertise
+    /// `search_freshness` ignore it and return semantic ranks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer: Option<String>,
 }
 
 /// Response body for `POST /drawers/search`.
@@ -154,7 +169,8 @@ pub struct RemoteDrawerResult {
     pub room: String,
     /// 1-based rank within this server's result set.
     pub rank: usize,
-    /// Normalised similarity score in `[0, 1]`.
+    /// Similarity score, `1 - distance` (can be negative). Not comparable
+    /// across servers; merge by `rank`.
     pub score: f32,
     /// Full drawer content text.
     pub content: String,
@@ -164,9 +180,16 @@ pub struct RemoteDrawerResult {
     /// BLAKE3 hex hash of the content at ingest time.
     #[serde(default)]
     pub content_hash: Option<String>,
-    /// RFC 3339 timestamp when the drawer was filed.
+    /// RFC 3339 timestamp when the drawer was filed. For mined rows this is the
+    /// mining time, not when the content was authored.
     #[serde(default)]
     pub filed_at: Option<String>,
+    /// Authored or event date (`YYYY-MM-DD`), when one was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    /// How the drawer was written (`mcp`, `diary`, `projects`, `convos`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_mode: Option<String>,
     /// Agent name recorded at ingest time.
     #[serde(default)]
     pub added_by: Option<String>,
@@ -220,6 +243,11 @@ pub struct AddDrawerRequest {
     /// Omitted from the JSON wire when `None` so old servers see no new field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
+    /// File over near-duplicate (but never exact-duplicate) matches.
+    ///
+    /// Omitted from the JSON wire when `false` so old servers see no new field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_near_duplicate: bool,
 }
 
 /// Response body for `POST /drawers`.
@@ -236,6 +264,10 @@ pub struct AddDrawerResponse {
     /// Resolved room, present when `success` is `true`.
     #[serde(default)]
     pub room: Option<String>,
+    /// Existing drawers this one continues as a series (`relation:
+    /// series_update`). Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub similar: Vec<Value>,
 }
 
 // ─── Duplicate check ──────────────────────────────────────────────────────────
@@ -245,7 +277,7 @@ pub struct AddDrawerResponse {
 pub struct CheckDuplicateRequest {
     /// Content to test for near-duplicates.
     pub content: String,
-    /// Similarity threshold in `[0, 1]`; defaults to server's configured value.
+    /// Similarity threshold; defaults to the fixed 0.9 used by `add_drawer`.
     #[serde(default)]
     pub threshold: Option<f32>,
 }
@@ -1192,6 +1224,8 @@ mod tests {
                 added_by: None,
                 provenance: None,
                 stale: false,
+                date: None,
+                ingest_mode: None,
             }],
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -1220,6 +1254,7 @@ mod tests {
             added_by: Some("claude".to_owned()),
             drawer_id: Some("drw_stable_local_id".to_owned()),
             operation_id: Some("op-add-42".to_owned()),
+            allow_near_duplicate: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("drw_stable_local_id"), "drawer_id must serialize: {json}");
@@ -1240,6 +1275,7 @@ mod tests {
             added_by: None,
             drawer_id: None,
             operation_id: None,
+            allow_near_duplicate: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("drawer_id"), "None drawer_id must be omitted: {json}");

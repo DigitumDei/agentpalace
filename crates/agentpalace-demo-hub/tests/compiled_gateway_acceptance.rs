@@ -141,6 +141,7 @@ async fn public_gateway_enforces_current_roles_and_persists_owner_provenance() {
             background_enabled: false,
             ..MaintenanceRuntimeConfig::defaults()
         },
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
     };
     let engine_tokens = TokenRegistry::load(token_file.clone()).expect("engine tokens");
     let (engine_router, engine_state) = build_router(

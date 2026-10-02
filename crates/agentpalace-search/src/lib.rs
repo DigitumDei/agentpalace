@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,7 +11,11 @@ pub use agentpalace_dialect as dialect;
 pub use agentpalace_embeddings as embeddings;
 pub use agentpalace_storage as storage;
 
-use agentpalace_core::{DrawerRecord, SearchQuery, SearchResult, WingId, resolve_records};
+use agentpalace_core::{
+    DIARY_ROOM, DrawerRecord, Freshness, SHARED_AGENT_DIARY_WING, SearchQuery, SearchResult,
+    WingId, is_mined_ingest_mode, resolve_records,
+};
+use time::OffsetDateTime;
 use agentpalace_dialect::{Dialect, WakeUpAaaKConfig};
 use agentpalace_embeddings::{EmbeddingProvider, EmbeddingRequest};
 use agentpalace_storage::{DrawerFilter, DrawerMatch, DrawerStore, SearchRequest};
@@ -127,9 +131,44 @@ pub struct SearchRuntime<P> {
     policy: SearchRuntimePolicy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SearchRuntimePolicy {
     pub rerank_enabled: bool,
+    pub freshness: FreshnessPolicy,
+}
+
+/// How drawer age affects ranking. The default is `relevant`, which keeps the
+/// historical semantic order exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshnessPolicy {
+    /// Mode used when a query does not set `freshness`.
+    pub default: Freshness,
+    /// Half-life of the lift, in hours. At least 1.
+    pub half_life_hours: u32,
+    /// `(wing, room)` pairs that never receive a lift.
+    pub no_lift_rooms: BTreeSet<(String, String)>,
+}
+
+impl Default for FreshnessPolicy {
+    fn default() -> Self {
+        Self { default: Freshness::Relevant, half_life_hours: 24, no_lift_rooms: BTreeSet::new() }
+    }
+}
+
+impl FreshnessPolicy {
+    /// Whether a drawer can receive a freshness lift. Mined, locator-backed and
+    /// diary rows cannot: their `filed_at` is ingest or session time, which says
+    /// nothing about how current the content is.
+    pub fn is_lift_eligible(&self, record: &DrawerRecord) -> bool {
+        !(is_mined_ingest_mode(&record.ingest_mode)
+            || record.locator.is_some()
+            || record.ingest_mode == "diary"
+            || record.room.as_str() == DIARY_ROOM
+            || record.wing.as_str() == SHARED_AGENT_DIARY_WING
+            || self
+                .no_lift_rooms
+                .contains(&(record.wing.as_str().to_owned(), record.room.as_str().to_owned())))
+    }
 }
 
 impl<P> SearchRuntime<P>
@@ -168,13 +207,44 @@ where
         &self.dialect
     }
 
+    pub fn policy(&self) -> &SearchRuntimePolicy {
+        &self.policy
+    }
+
+    /// The freshness mode a query runs with: its own, else the policy default.
+    pub fn effective_freshness(&self, query: &SearchQuery) -> Freshness {
+        query.freshness.unwrap_or(self.policy.freshness.default)
+    }
+
     pub async fn search<S>(&mut self, store: &S, query: &SearchQuery) -> Result<Vec<SearchResult>>
     where
         S: DrawerStore,
     {
-        self.search_with_rerank(store, query, self.policy.rerank_enabled).await
+        self.search_filtered(store, query, |_| true).await
     }
 
+    /// Search, dropping candidates the caller must not see before ranking.
+    ///
+    /// `keep` runs after view-overlay filtering and before freshness reference
+    /// times and truncation, so excluded rows neither take result slots nor
+    /// influence how visible rows are ordered.
+    pub async fn search_filtered<S, F>(
+        &mut self,
+        store: &S,
+        query: &SearchQuery,
+        keep: F,
+    ) -> Result<Vec<SearchResult>>
+    where
+        S: DrawerStore,
+        F: Fn(&DrawerRecord) -> bool,
+    {
+        let rerank = self.policy.rerank_enabled;
+        let freshness = self.effective_freshness(query);
+        self.search_with(store, query, rerank, freshness, keep).await
+    }
+
+    /// Pure semantic search for threshold-sensitive callers such as duplicate
+    /// detection: no rerank blending and no freshness, whatever the policy says.
     pub async fn search_semantic<S>(
         &mut self,
         store: &S,
@@ -183,17 +253,20 @@ where
     where
         S: DrawerStore,
     {
-        self.search_with_rerank(store, query, false).await
+        self.search_with(store, query, false, Freshness::Relevant, |_| true).await
     }
 
-    async fn search_with_rerank<S>(
+    async fn search_with<S, F>(
         &mut self,
         store: &S,
         query: &SearchQuery,
         rerank_enabled: bool,
+        freshness: Freshness,
+        keep: F,
     ) -> Result<Vec<SearchResult>>
     where
         S: DrawerStore,
+        F: Fn(&DrawerRecord) -> bool,
     {
         let provider_profile = self.provider.profile().profile;
         if provider_profile != query.profile {
@@ -230,9 +303,15 @@ where
         // A low-scoring branch replacement must shadow its canonical path without
         // causing unrelated later candidates to disappear from the response.
         let max_candidate_limit = query.limit.saturating_mul(10).max(query.limit);
-        let mut candidate_limit =
-            if rerank_enabled { query.limit.saturating_mul(2) } else { query.limit }
-                .min(max_candidate_limit);
+        let base_limit = if rerank_enabled { query.limit.saturating_mul(2) } else { query.limit };
+        // A newer look-alike outside the semantic top-k can only be promoted if
+        // it is fetched, so freshness-aware modes start from a wider pool.
+        let mut candidate_limit = if freshness == Freshness::Relevant {
+            base_limit
+        } else {
+            base_limit.max(query.limit.saturating_mul(4))
+        }
+        .min(max_candidate_limit);
         let mut matches;
         loop {
             // LanceDB has no offset paging for vector queries, so each bounded
@@ -291,6 +370,7 @@ where
                     visible_in_view(&entry.record, view, &view_hall, &overridden_paths)
                 });
             }
+            matches.retain(|entry| keep(&entry.record));
             if matches.len() >= query.limit || candidate_count < candidate_limit {
                 break;
             }
@@ -301,19 +381,40 @@ where
             candidate_limit = next_limit.min(max_candidate_limit);
         }
 
-        // Resolve locator-backed records in place BEFORE ranking so that
-        // rerank's lexical_overlap_score operates on real text.
-        let mut records: Vec<DrawerRecord> = matches.iter().map(|m| m.record.clone()).collect();
-        let stale_flags = resolve_records(&mut records);
-        // Write resolved content back into the matches.
-        for (m, resolved) in matches.iter_mut().zip(records.into_iter()) {
-            m.record.content = resolved.content;
-        }
-
         let ranked = if rerank_enabled {
-            rerank_matches(&query.text, matches, stale_flags, query.limit)
+            // Rerank's lexical overlap needs real text, so resolve locator-backed
+            // records BEFORE ranking.
+            let stale_flags = resolve_matches(&mut matches);
+            rank_candidates(
+                Some(&query.text),
+                matches,
+                stale_flags,
+                freshness,
+                &self.policy.freshness,
+                query.limit,
+            )
         } else {
-            rank_matches(matches, stale_flags, query.limit)
+            // Semantic ranking ignores content, so only the survivors of
+            // truncation are resolved; a wider pool reads no extra source files.
+            // Locator-backed rows are never lifted, so resolving late cannot
+            // change their rank.
+            let stale_flags = vec![false; matches.len()];
+            let mut ranked = rank_candidates(
+                None,
+                matches,
+                stale_flags,
+                freshness,
+                &self.policy.freshness,
+                query.limit,
+            );
+            let mut records: Vec<DrawerRecord> =
+                ranked.iter().map(|entry| entry.record.clone()).collect();
+            let stale_flags = resolve_records(&mut records);
+            for ((entry, resolved), stale) in ranked.iter_mut().zip(records).zip(stale_flags) {
+                entry.record.content = resolved.content;
+                entry.stale = stale;
+            }
+            ranked
         };
 
         Ok(ranked
@@ -344,6 +445,9 @@ where
                     content_hash: Some(entry.record.content_hash.clone()),
                     view,
                     provenance: entry.record.provenance.as_ref().and_then(|value| serde_json::to_value(value.response()).ok()),
+                    filed_at: Some(entry.record.filed_at),
+                    date: entry.record.date,
+                    ingest_mode: Some(entry.record.ingest_mode.clone()),
                 }
             })
             .collect())
@@ -511,6 +615,18 @@ pub fn render_search_results(
             result.room.as_str()
         ));
         lines.push(format!("      Source: {}", result.source_file));
+        if let Some(filed_at) = result.filed_at {
+            // Mined rows carry ingest time, which says nothing about authorship.
+            let label = if result.ingest_mode.as_deref().is_some_and(is_mined_ingest_mode) {
+                "Mined: "
+            } else {
+                "Filed: "
+            };
+            lines.push(format!("      {label} {}", format_utc_minute(filed_at)));
+        }
+        if let Some(date) = result.date {
+            lines.push(format!("      Dated:  {date}"));
+        }
         lines.push(format!("      Match:  {}", trim_similarity(result.score)));
         lines.push(String::new());
 
@@ -613,43 +729,49 @@ where
     Ok(drawers)
 }
 
-fn rank_matches(
-    matches: Vec<DrawerMatch>,
-    stale_flags: Vec<bool>,
-    limit: usize,
-) -> Vec<RankedMatch> {
-    let mut ranked = matches
-        .into_iter()
-        .zip(stale_flags)
-        .map(|(matched, stale)| RankedMatch {
-            score: normalize_score(matched.distance),
-            distance: matched.distance,
-            record: matched.record,
-            stale,
-        })
-        .collect::<Vec<_>>();
-
-    ranked.sort_by(compare_ranked_matches);
-    ranked.truncate(limit);
-    ranked
+/// Resolve locator-backed match content in place, returning per-match stale flags.
+fn resolve_matches(matches: &mut [DrawerMatch]) -> Vec<bool> {
+    let mut records: Vec<DrawerRecord> = matches.iter().map(|m| m.record.clone()).collect();
+    let stale_flags = resolve_records(&mut records);
+    for (m, resolved) in matches.iter_mut().zip(records) {
+        m.record.content = resolved.content;
+    }
+    stale_flags
 }
 
-fn rerank_matches(
-    query: &str,
+/// Score, apply the freshness lift, sort and truncate a candidate pool.
+///
+/// `score` stays the semantic (or rerank-blended) similarity. Ordering uses
+/// `rank_key = score + lift`, where a lift-eligible drawer gets
+/// `w * 2^(-age / half_life)` and `age` is measured from the newest
+/// lift-eligible drawer of the same `(wing, room, source label)` in this pool
+/// (see [`freshness_group`]), not from the wall clock. A drawer can therefore never pass another that is more than `w`
+/// more similar, and the result does not depend on when the query runs.
+fn rank_candidates(
+    rerank_query: Option<&str>,
     matches: Vec<DrawerMatch>,
     stale_flags: Vec<bool>,
+    freshness: Freshness,
+    policy: &FreshnessPolicy,
     limit: usize,
 ) -> Vec<RankedMatch> {
-    let query_terms = normalized_terms(query);
+    let query_terms = rerank_query.map(normalized_terms);
     let mut ranked = matches
         .into_iter()
         .zip(stale_flags)
         .map(|(matched, stale)| {
             let base_score = normalize_score(matched.distance);
-            // lexical overlap uses record.content which has been resolved in place
-            let lexical_score = lexical_overlap_score(&query_terms, &matched.record.content);
+            let score = match &query_terms {
+                // Lexical overlap uses record.content, which was resolved in place.
+                Some(terms) => {
+                    (base_score * 0.7)
+                        + (lexical_overlap_score(terms, &matched.record.content) * 0.3)
+                }
+                None => base_score,
+            };
             RankedMatch {
-                score: (base_score * 0.7) + (lexical_score * 0.3),
+                score,
+                rank_key: f64::from(score),
                 distance: matched.distance,
                 record: matched.record,
                 stale,
@@ -657,9 +779,64 @@ fn rerank_matches(
         })
         .collect::<Vec<_>>();
 
-    ranked.sort_by(compare_ranked_matches);
+    if freshness != Freshness::Relevant {
+        apply_freshness_lift(&mut ranked, freshness, policy);
+        ranked.sort_by(compare_fresh_ranked_matches);
+    } else {
+        ranked.sort_by(compare_ranked_matches);
+    }
     ranked.truncate(limit);
     ranked
+}
+
+/// The set a drawer's age is measured within: its wing, room and full stored
+/// source label, so each recurring series is compared only with its own runs.
+/// Drawers with no source label share their wing and room's group.
+fn freshness_group(record: &DrawerRecord) -> (&str, &str, &str) {
+    (record.wing.as_str(), record.room.as_str(), record.source_file.as_str())
+}
+
+fn apply_freshness_lift(ranked: &mut [RankedMatch], freshness: Freshness, policy: &FreshnessPolicy) {
+    let weight = f64::from(freshness.weight());
+    let half_life_secs = f64::from(policy.half_life_hours.max(1)) * 3_600.0;
+    let mut reference: HashMap<(&str, &str, &str), OffsetDateTime> = HashMap::new();
+    let eligible: Vec<bool> =
+        ranked.iter().map(|entry| policy.is_lift_eligible(&entry.record)).collect();
+    for (entry, eligible) in ranked.iter().zip(&eligible) {
+        if *eligible {
+            let key = freshness_group(&entry.record);
+            let newest = reference.entry(key).or_insert(entry.record.filed_at);
+            if entry.record.filed_at > *newest {
+                *newest = entry.record.filed_at;
+            }
+        }
+    }
+    let lifts: Vec<f64> = ranked
+        .iter()
+        .zip(&eligible)
+        .map(|(entry, eligible)| {
+            if !eligible {
+                return 0.0;
+            }
+            let Some(newest) = reference.get(&freshness_group(&entry.record)) else { return 0.0 };
+            let age_secs = (*newest - entry.record.filed_at).as_seconds_f64().max(0.0);
+            weight * (-age_secs / half_life_secs).exp2()
+        })
+        .collect();
+    for (entry, lift) in ranked.iter_mut().zip(lifts) {
+        entry.rank_key = f64::from(entry.score) + lift;
+    }
+}
+
+fn compare_fresh_ranked_matches(left: &RankedMatch, right: &RankedMatch) -> Ordering {
+    right
+        .rank_key
+        .partial_cmp(&left.rank_key)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| right.score.partial_cmp(&left.score).unwrap_or(Ordering::Equal))
+        .then_with(|| compare_distance(left.distance, right.distance))
+        .then_with(|| right.record.filed_at.cmp(&left.record.filed_at))
+        .then_with(|| compare_identity(left, right))
 }
 
 fn compare_ranked_matches(left: &RankedMatch, right: &RankedMatch) -> Ordering {
@@ -668,7 +845,14 @@ fn compare_ranked_matches(left: &RankedMatch, right: &RankedMatch) -> Ordering {
         .partial_cmp(&left.score)
         .unwrap_or(Ordering::Equal)
         .then_with(|| compare_distance(left.distance, right.distance))
-        .then_with(|| left.record.wing.as_str().cmp(right.record.wing.as_str()))
+        .then_with(|| compare_identity(left, right))
+}
+
+fn compare_identity(left: &RankedMatch, right: &RankedMatch) -> Ordering {
+    left.record
+        .wing
+        .as_str()
+        .cmp(right.record.wing.as_str())
         .then_with(|| left.record.room.as_str().cmp(right.record.room.as_str()))
         .then_with(|| {
             source_label(&left.record.source_file).cmp(&source_label(&right.record.source_file))
@@ -692,6 +876,19 @@ fn order_layer_drawers(drawers: &mut [DrawerRecord]) {
 
 fn normalize_score(distance: Option<f32>) -> f32 {
     distance.map_or(0.0, |value| 1.0 - value)
+}
+
+/// `YYYY-MM-DD HH:MM UTC`: unambiguous, and short enough to scan.
+fn format_utc_minute(value: OffsetDateTime) -> String {
+    let utc = value.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} UTC",
+        utc.year(),
+        u8::from(utc.month()),
+        utc.day(),
+        utc.hour(),
+        utc.minute()
+    )
 }
 
 fn trim_similarity(score: f32) -> String {
@@ -744,6 +941,8 @@ fn source_label(source_file: &str) -> &str {
 #[derive(Debug, Clone, PartialEq)]
 struct RankedMatch {
     score: f32,
+    /// Ordering key: `score` plus any freshness lift.
+    rank_key: f64,
     distance: Option<f32>,
     record: DrawerRecord,
     stale: bool,
@@ -1109,6 +1308,7 @@ mod tests {
             limit: 5,
             profile: EmbeddingProfile::Balanced,
             view: None,
+            freshness: None,
         };
 
         let results = runtime.search(&store, &query).await.unwrap();
@@ -1139,6 +1339,7 @@ mod tests {
                     limit: 5,
                     profile: EmbeddingProfile::Balanced,
                     view: None,
+                    freshness: None,
                 },
             )
             .await
@@ -1162,6 +1363,7 @@ mod tests {
                     limit: 0,
                     profile: EmbeddingProfile::Balanced,
                     view: None,
+                    freshness: None,
                 },
             )
             .await
@@ -1184,6 +1386,7 @@ mod tests {
                     limit: 5,
                     profile: EmbeddingProfile::LowCpu,
                     view: None,
+                    freshness: None,
                 },
             )
             .await
@@ -1224,6 +1427,7 @@ mod tests {
             limit: 5,
             profile: EmbeddingProfile::Balanced,
             view: None,
+            freshness: None,
         };
 
         let results = runtime.search(&store, &query).await.unwrap();
@@ -1259,6 +1463,7 @@ mod tests {
             limit: 3,
             profile: EmbeddingProfile::Balanced,
             view: None,
+            freshness: None,
         };
 
         let results = runtime.search(&store, &query).await.unwrap();
@@ -1298,7 +1503,7 @@ mod tests {
         };
         let runtime = &mut SearchRuntime::with_policy(
             StubProvider { response: vec![embedding(0.0)] },
-            SearchRuntimePolicy { rerank_enabled: true },
+            SearchRuntimePolicy { rerank_enabled: true, ..SearchRuntimePolicy::default() },
         );
 
         let results = runtime
@@ -1311,6 +1516,7 @@ mod tests {
                     limit: 1,
                     profile: EmbeddingProfile::Balanced,
                     view: None,
+                    freshness: None,
                 },
             )
             .await
@@ -1350,7 +1556,7 @@ mod tests {
         };
         let runtime = &mut SearchRuntime::with_policy(
             StubProvider { response: vec![embedding(0.0)] },
-            SearchRuntimePolicy { rerank_enabled: true },
+            SearchRuntimePolicy { rerank_enabled: true, ..SearchRuntimePolicy::default() },
         );
         let query = SearchQuery {
             text: "session refresh auth".to_owned(),
@@ -1359,6 +1565,7 @@ mod tests {
             limit: 1,
             profile: EmbeddingProfile::Balanced,
             view: None,
+            freshness: None,
         };
 
         let reranked = runtime.search(&store, &query).await.unwrap();
@@ -1410,6 +1617,7 @@ mod tests {
                     limit: 1,
                     profile: EmbeddingProfile::Balanced,
                     view: None,
+                    freshness: None,
                 },
             )
             .await
@@ -1436,6 +1644,7 @@ mod tests {
                     limit: 5,
                     profile: EmbeddingProfile::Balanced,
                     view: None,
+                    freshness: None,
                 },
             )
             .await
@@ -1464,6 +1673,7 @@ mod tests {
                     limit: 5,
                     profile: EmbeddingProfile::Balanced,
                     view: None,
+                    freshness: None,
                 },
             )
             .await
@@ -1489,6 +1699,7 @@ mod tests {
                     limit: 5,
                     profile: EmbeddingProfile::Balanced,
                     view: None,
+                    freshness: None,
                 },
             )
             .await
@@ -1542,6 +1753,7 @@ mod tests {
                     limit: 5,
                     profile: EmbeddingProfile::Balanced,
                     view: Some("canonical".to_owned()),
+                    freshness: None,
                 },
             )
             .await
@@ -1595,6 +1807,7 @@ mod tests {
                     limit: 5,
                     profile: EmbeddingProfile::Balanced,
                     view: Some("feature-x".to_owned()),
+                    freshness: None,
                 },
             )
             .await
@@ -1648,6 +1861,7 @@ mod tests {
                     limit: 1,
                     profile: EmbeddingProfile::Balanced,
                     view: Some("feature-x".to_owned()),
+                    freshness: None,
                 },
             )
             .await
@@ -1727,6 +1941,7 @@ mod tests {
                     limit: 2,
                     profile: EmbeddingProfile::Balanced,
                     view: Some("feature-x".to_owned()),
+                    freshness: None,
                 },
             )
             .await
@@ -1781,6 +1996,7 @@ mod tests {
                     limit: 1,
                     profile: EmbeddingProfile::Balanced,
                     view: Some("feature-x".to_owned()),
+                    freshness: None,
                 },
             )
             .await
@@ -1806,6 +2022,9 @@ mod tests {
                     content_hash: None,
                     view: None,
                     provenance: None,
+                    date: None,
+                    filed_at: None,
+                    ingest_mode: None,
                 },
                 agentpalace_core::SearchResult {
                     drawer_id: None,
@@ -1819,6 +2038,9 @@ mod tests {
                     content_hash: None,
                     view: None,
                     provenance: None,
+                    date: None,
+                    filed_at: None,
+                    ingest_mode: None,
                 },
             ],
             None,
@@ -2189,6 +2411,7 @@ mod tests {
                     limit: 5,
                     profile: EmbeddingProfile::Balanced,
                     view: None,
+                    freshness: None,
                 },
             )
             .await
@@ -2211,6 +2434,7 @@ mod tests {
                     limit: 2,
                     profile: EmbeddingProfile::Balanced,
                     view: None,
+                    freshness: None,
                 },
             )
             .await
@@ -2707,6 +2931,7 @@ mod tests {
             limit: 5,
             profile: EmbeddingProfile::Balanced,
             view: None,
+            freshness: None,
         };
 
         let results = runtime.search(&store, &query).await.unwrap();
@@ -2761,6 +2986,7 @@ mod tests {
             limit: 5,
             profile: EmbeddingProfile::Balanced,
             view: None,
+            freshness: None,
         };
 
         let results = runtime.search(&store, &query).await.unwrap();
@@ -2814,5 +3040,399 @@ mod tests {
             rendered.contains("recall"),
             "recall output must contain resolved text; got: {rendered}"
         );
+    }
+    // ─── Freshness ranking tests ──────────────────────────────────────────────
+
+    use super::FreshnessPolicy;
+    use agentpalace_core::Freshness;
+
+    /// An authored (lift-eligible) drawer at `distance` from the query, with no
+    /// source label, so freshness groups it by wing and room.
+    fn authored(id: &str, wing: &str, room: &str, distance: f32, filed_at: time::OffsetDateTime) -> DrawerRecord {
+        let mut drawer = record(
+            &format!("{wing}/{room}/{id}"),
+            wing,
+            room,
+            "",
+            id,
+            Some(distance),
+            filed_at,
+        );
+        drawer.ingest_mode = "mcp".to_owned();
+        drawer
+    }
+
+    fn spy(drawers: Vec<DrawerRecord>) -> SearchSpyStore {
+        SearchSpyStore {
+            drawers,
+            list_calls: Arc::new(Mutex::new(0)),
+            search_limits: Arc::new(Mutex::new(Vec::new())),
+            include_cutoff_ties: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    const SERIES_LABEL: &str = "/var/monitor/web-01.status";
+
+    fn labelled(mut drawer: DrawerRecord, source: &str) -> DrawerRecord {
+        drawer.source_file = source.to_owned();
+        drawer
+    }
+
+    /// Seven snapshots S1..S7 of one series (one shared source label), 20h
+    /// apart; S7 is newest and the least similar (0.800), S1 oldest and the
+    /// most similar (0.830).
+    fn fixture_a(shift: time::Duration) -> Vec<DrawerRecord> {
+        (1..=7)
+            .map(|n| {
+                labelled(
+                    authored(
+                        &format!("S{n}"),
+                        "wing_ops",
+                        "snapshots",
+                        0.165 + 0.005 * n as f32,
+                        datetime!(2026-09-20 00:00:00 UTC) + time::Duration::hours(20 * n) + shift,
+                    ),
+                    SERIES_LABEL,
+                )
+            })
+            .collect()
+    }
+
+    fn policy(default: Freshness) -> SearchRuntimePolicy {
+        SearchRuntimePolicy {
+            rerank_enabled: false,
+            freshness: FreshnessPolicy { default, ..FreshnessPolicy::default() },
+        }
+    }
+
+    fn query(limit: usize, freshness: Option<Freshness>) -> SearchQuery {
+        SearchQuery {
+            text: "latest snapshot".to_owned(),
+            wing: None,
+            room: None,
+            limit,
+            profile: EmbeddingProfile::Balanced,
+            view: None,
+            freshness,
+        }
+    }
+
+    async fn ranked_ids(
+        drawers: Vec<DrawerRecord>,
+        policy: SearchRuntimePolicy,
+        query: &SearchQuery,
+    ) -> (Vec<String>, Vec<super::SearchResult>, Vec<usize>) {
+        let store = spy(drawers);
+        let mut runtime =
+            SearchRuntime::with_policy(StubProvider { response: vec![embedding(0.0)] }, policy);
+        let results = runtime.search(&store, query).await.unwrap();
+        let ids = results.iter().map(|r| r.content.clone()).collect();
+        let limits = store.search_limits.lock().unwrap().clone();
+        (ids, results, limits)
+    }
+
+    #[tokio::test]
+    async fn relevant_mode_misses_newest_look_alike() {
+        let (ids, _, limits) =
+            ranked_ids(fixture_a(time::Duration::ZERO), policy(Freshness::Relevant), &query(5, None))
+                .await;
+        assert_eq!(limits, vec![5]);
+        assert_eq!(ids, vec!["S1", "S2", "S3", "S4", "S5"]);
+    }
+
+    #[tokio::test]
+    async fn balanced_freshness_widens_pool_and_promotes_newest_look_alike() {
+        let (ids, results, limits) =
+            ranked_ids(fixture_a(time::Duration::ZERO), policy(Freshness::Balanced), &query(5, None))
+                .await;
+        assert_eq!(limits, vec![20]);
+        assert_eq!(ids, vec!["S7", "S6", "S1", "S2", "S5"]);
+        // Similarity is reported unchanged; only the order moves.
+        assert!((results[0].score - 0.800).abs() < 1e-5, "score was {}", results[0].score);
+        assert_eq!(results[0].filed_at, Some(datetime!(2026-09-25 20:00:00 UTC)));
+        assert_eq!(results[0].ingest_mode.as_deref(), Some("mcp"));
+    }
+
+    #[tokio::test]
+    async fn newer_unrelated_drawer_does_not_suppress_series_lift() {
+        let mut drawers = fixture_a(time::Duration::ZERO);
+        drawers.push(authored(
+            "unrelated",
+            "wing_ops",
+            "notes",
+            0.3,
+            datetime!(2026-09-25 20:00:00 UTC) + time::Duration::hours(72),
+        ));
+        let (ids, _, _) = ranked_ids(drawers, policy(Freshness::Balanced), &query(5, None)).await;
+        assert_eq!(ids, vec!["S7", "S6", "S1", "S2", "S5"]);
+    }
+
+    #[tokio::test]
+    async fn series_lift_is_measured_within_its_source_label() {
+        // A newer drawer in the same wing and room but under another label (an
+        // operator note) does not age the series: S7 keeps the full lift.
+        let mut drawers = fixture_a(time::Duration::ZERO);
+        drawers.push(labelled(
+            authored(
+                "note",
+                "wing_ops",
+                "snapshots",
+                0.3,
+                datetime!(2026-09-25 20:00:00 UTC) + time::Duration::hours(72),
+            ),
+            "notes/web-01.md",
+        ));
+        let (ids, _, _) =
+            ranked_ids(drawers.clone(), policy(Freshness::Balanced), &query(5, None)).await;
+        assert_eq!(ids, vec!["S7", "S6", "S1", "S2", "S5"]);
+
+        // Without labels the same drawers share one wing/room group, so the later
+        // note becomes the reference time and S7's lift shrinks to about 6%.
+        let unlabelled: Vec<_> = drawers.into_iter().map(|d| labelled(d, "")).collect();
+        let (ids, _, _) = ranked_ids(unlabelled, policy(Freshness::Balanced), &query(5, None)).await;
+        assert_eq!(ids[0], "S1", "room fallback: {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn a_new_label_per_run_leaves_semantic_order() {
+        // Every drawer is alone in its group, so each gets the same full lift
+        // and the order stays semantic.
+        let drawers: Vec<_> = fixture_a(time::Duration::ZERO)
+            .into_iter()
+            .map(|d| {
+                let label = format!("runs/{}.log", d.content);
+                labelled(d, &label)
+            })
+            .collect();
+        for mode in [Freshness::Balanced, Freshness::Recent] {
+            let (ids, _, _) = ranked_ids(drawers.clone(), policy(mode), &query(5, None)).await;
+            assert_eq!(ids, vec!["S1", "S2", "S3", "S4", "S5"], "mode {mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn recent_freshness_orders_series_newest_first() {
+        let (ids, _, _) =
+            ranked_ids(fixture_a(time::Duration::ZERO), policy(Freshness::Recent), &query(5, None))
+                .await;
+        assert_eq!(ids, vec!["S7", "S6", "S5", "S4", "S3"]);
+    }
+
+    #[tokio::test]
+    async fn freshness_lift_is_bounded_by_weight() {
+        let newest = datetime!(2026-09-30 12:00:00 UTC);
+        let how_to = authored("howto", "wing_ops", "notes", 0.45, newest - time::Duration::days(90));
+        for (note_distance, balanced_first, recent_first) in
+            [(0.70, "howto", "howto"), (0.55, "howto", "note")]
+        {
+            let note = authored("note", "wing_ops", "notes", note_distance, newest);
+            for (mode, expected) in
+                [(Freshness::Balanced, balanced_first), (Freshness::Recent, recent_first)]
+            {
+                let (ids, _, _) =
+                    ranked_ids(vec![how_to.clone(), note.clone()], policy(mode), &query(5, None))
+                        .await;
+                assert_eq!(ids[0], expected, "note distance {note_distance}, mode {mode:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_lift_rooms_receive_no_lift() {
+        let newest = datetime!(2026-09-30 12:00:00 UTC);
+        let old = newest - time::Duration::days(30);
+        let drawers = vec![
+            authored("exempt-old", "wing_a", "howto", 0.45, old),
+            authored("exempt-new", "wing_a", "howto", 0.46, newest),
+            authored("other-old", "wing_b", "howto", 0.45, old),
+            authored("other-new", "wing_b", "howto", 0.46, newest),
+        ];
+        let mut exempt = policy(Freshness::Recent);
+        exempt.freshness.no_lift_rooms.insert(("wing_a".to_owned(), "howto".to_owned()));
+        let (ids, _, _) = ranked_ids(drawers, exempt, &query(5, None)).await;
+        let position = |id: &str| ids.iter().position(|value| value == id).unwrap();
+        assert!(position("exempt-old") < position("exempt-new"), "{ids:?}");
+        assert!(position("other-new") < position("other-old"), "{ids:?}");
+    }
+
+    #[tokio::test]
+    async fn remined_chunk_does_not_outrank_unchanged_chunk() {
+        let mut unchanged = authored("unchanged", "wing_code", "src", 0.40, datetime!(2026-01-01 00:00:00 UTC));
+        let mut remined = authored("remined", "wing_code", "src", 0.41, datetime!(2026-09-30 00:00:00 UTC));
+        unchanged.ingest_mode = "projects".to_owned();
+        remined.ingest_mode = "projects".to_owned();
+        for mode in [Freshness::Balanced, Freshness::Recent] {
+            let (ids, _, _) =
+                ranked_ids(vec![remined.clone(), unchanged.clone()], policy(mode), &query(5, None))
+                    .await;
+            assert_eq!(ids[0], "unchanged", "mode {mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn diary_rows_receive_no_lift() {
+        let reference =
+            authored("reference", "wing_ops", "notes", 0.40, datetime!(2026-01-01 00:00:00 UTC));
+        let mut diary =
+            authored("diary", "wing_ops", "diary", 0.41, datetime!(2026-09-30 00:00:00 UTC));
+        diary.ingest_mode = "diary".to_owned();
+        let mut shared =
+            authored("shared", "wing_agents", "notes", 0.41, datetime!(2026-09-30 00:00:00 UTC));
+        shared.ingest_mode = "mcp".to_owned();
+        let (ids, _, _) =
+            ranked_ids(vec![diary, shared, reference], policy(Freshness::Recent), &query(5, None))
+                .await;
+        assert_eq!(ids[0], "reference");
+        // A diary row filed in the same room as an authored note does not set
+        // that room's reference time: the note keeps the full lift.
+        let note = authored("note", "wing_ops", "notes", 0.30, datetime!(2026-09-01 00:00:00 UTC));
+        let mut room_diary =
+            authored("room-diary", "wing_ops", "notes", 0.50, datetime!(2026-09-30 00:00:00 UTC));
+        room_diary.ingest_mode = "diary".to_owned();
+        let old = authored("old", "wing_ops", "notes", 0.26, datetime!(2026-08-01 00:00:00 UTC));
+        let (ids, _, _) =
+            ranked_ids(vec![note, room_diary, old], policy(Freshness::Balanced), &query(5, None))
+                .await;
+        // note: 0.70 + 0.05 = 0.75 beats old (0.74 + ~0) only while the note keeps
+        // its full lift; had the diary row set the reference time, the note would
+        // be 29 days old and rank below.
+        assert_eq!(ids[0], "note");
+    }
+
+    #[tokio::test]
+    async fn same_ingest_microsecond_offsets_do_not_reorder() {
+        let at = datetime!(2026-09-30 00:00:00 UTC);
+        let drawers = vec![
+            authored("a", "wing_ops", "notes", 0.400, at),
+            authored("b", "wing_ops", "notes", 0.401, at + time::Duration::microseconds(1)),
+            authored("c", "wing_ops", "notes", 0.402, at + time::Duration::microseconds(2)),
+        ];
+        let (ids, _, _) = ranked_ids(drawers, policy(Freshness::Recent), &query(5, None)).await;
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn reference_time_is_pool_newest_not_wall_clock() {
+        let (now_ids, _, _) =
+            ranked_ids(fixture_a(time::Duration::ZERO), policy(Freshness::Balanced), &query(5, None))
+                .await;
+        let (shifted_ids, _, _) = ranked_ids(
+            fixture_a(-time::Duration::days(365)),
+            policy(Freshness::Balanced),
+            &query(5, None),
+        )
+        .await;
+        assert_eq!(now_ids, shifted_ids);
+    }
+
+    #[tokio::test]
+    async fn per_query_prefer_overrides_policy() {
+        let (ids, _, limits) = ranked_ids(
+            fixture_a(time::Duration::ZERO),
+            policy(Freshness::Balanced),
+            &query(5, Some(Freshness::Relevant)),
+        )
+        .await;
+        assert_eq!(limits, vec![5]);
+        assert_eq!(ids, vec!["S1", "S2", "S3", "S4", "S5"]);
+    }
+
+    #[tokio::test]
+    async fn search_semantic_ignores_freshness() {
+        let store = spy(fixture_a(time::Duration::ZERO));
+        let mut runtime = SearchRuntime::with_policy(
+            StubProvider { response: vec![embedding(0.0)] },
+            policy(Freshness::Recent),
+        );
+        let results = runtime.search_semantic(&store, &query(5, Some(Freshness::Recent))).await.unwrap();
+        assert_eq!(store.search_limits.lock().unwrap().as_slice(), &[5]);
+        assert_eq!(results[0].content, "S1");
+    }
+
+    #[tokio::test]
+    async fn freshness_keeps_negative_scores_bounded() {
+        let newest = datetime!(2026-09-30 00:00:00 UTC);
+        let drawers = vec![
+            authored("old", "wing_ops", "notes", 1.30, newest - time::Duration::days(30)),
+            authored("new", "wing_ops", "notes", 1.36, newest),
+        ];
+        // Scores are -0.30 and -0.36: within w=0.20 the newer drawer wins ...
+        let (ids, _, _) =
+            ranked_ids(drawers.clone(), policy(Freshness::Recent), &query(5, None)).await;
+        assert_eq!(ids, vec!["new", "old"]);
+        // ... but within w=0.05 it cannot overcome a 0.06 gap.
+        let (ids, _, _) = ranked_ids(drawers, policy(Freshness::Balanced), &query(5, None)).await;
+        assert_eq!(ids, vec!["old", "new"]);
+    }
+
+    #[tokio::test]
+    async fn freshness_ties_prefer_newer_but_relevant_keeps_identity_order() {
+        let drawers = vec![
+            authored("b-newer", "wing_b", "notes", 0.5, datetime!(2026-09-30 00:00:00 UTC)),
+            authored("a-older", "wing_a", "notes", 0.5, datetime!(2026-09-30 00:00:00 UTC) - time::Duration::days(1)),
+        ];
+        // Different groups, so each is its group's newest and gets the full lift:
+        // an exact rank_key tie, broken by filed_at.
+        let (ids, _, _) =
+            ranked_ids(drawers.clone(), policy(Freshness::Balanced), &query(5, None)).await;
+        assert_eq!(ids, vec!["b-newer", "a-older"]);
+        let (ids, _, _) = ranked_ids(drawers, policy(Freshness::Relevant), &query(5, None)).await;
+        assert_eq!(ids, vec!["a-older", "b-newer"]);
+    }
+
+    #[tokio::test]
+    async fn search_filtered_excludes_rows_before_reference_time_and_truncation() {
+        let mut drawers = fixture_a(time::Duration::ZERO);
+        // A hidden row in the same group, much newer: if it set the reference
+        // time it would shrink S7's lift and change the order.
+        drawers.push(labelled(
+            authored(
+                "hidden",
+                "wing_ops",
+                "snapshots",
+                0.10,
+                datetime!(2026-09-25 20:00:00 UTC) + time::Duration::hours(240),
+            ),
+            SERIES_LABEL,
+        ));
+        let store = spy(drawers);
+        let mut runtime = SearchRuntime::with_policy(
+            StubProvider { response: vec![embedding(0.0)] },
+            policy(Freshness::Balanced),
+        );
+        let results = runtime
+            .search_filtered(&store, &query(5, None), |record| !record.id.as_str().ends_with("hidden"))
+            .await
+            .unwrap();
+        let ids: Vec<_> = results.iter().map(|r| r.content.as_str()).collect();
+        assert_eq!(ids, vec!["S7", "S6", "S1", "S2", "S5"]);
+    }
+
+    #[test]
+    fn rendered_results_show_filed_or_mined_time_in_utc() {
+        let base = agentpalace_core::SearchResult {
+            drawer_id: None,
+            wing: WingId::new("wing_ops").unwrap(),
+            room: RoomId::new("notes").unwrap(),
+            score: 0.5,
+            content: "body".to_owned(),
+            source_file: "a.txt".to_owned(),
+            stale: false,
+            content_hash: None,
+            view: None,
+            provenance: None,
+            filed_at: Some(datetime!(2026-09-30 23:30:00 -02:00)),
+            date: Some(date!(2026 - 09 - 28)),
+            ingest_mode: Some("mcp".to_owned()),
+        };
+        let mined = agentpalace_core::SearchResult {
+            ingest_mode: Some("projects".to_owned()),
+            date: None,
+            ..base.clone()
+        };
+        let rendered = render_search_results("q", &[base, mined], None, None);
+        assert!(rendered.contains("Filed:  2026-10-01 01:30 UTC"), "{rendered}");
+        assert!(rendered.contains("Dated:  2026-09-28"), "{rendered}");
+        assert!(rendered.contains("Mined:  2026-10-01 01:30 UTC"), "{rendered}");
     }
 }

@@ -251,8 +251,20 @@ Flags:
   Scope the search to a repository view. Omitted (or `canonical`) searches canonical
   snapshots and excludes branch views. A branch name composes that branch's changed paths
   over the canonical snapshot. `full` searches every stored repository view independently.
+- `--prefer <relevant|balanced|recent>`
+  How much drawer age weighs in ranking. Omitted, the `search.freshness.default` config
+  value applies (default `relevant`: pure semantic order). `balanced` and `recent` give newer
+  drawers a bounded lift (at most 0.05 and 0.20) over near-equal matches, measured within each
+  drawer's wing, room and source label (wing and room when it has no label); mined,
+  locator-backed and diary drawers never receive it. The printed `Match:` score
+  is unchanged. See [Config Schema](Config-Schema.md#search).
 
 Behavior:
+- Each result prints when it was written: `Filed:  YYYY-MM-DD HH:MM UTC`, or `Mined:` for
+  rows from `projects`/`convos` mining (whose time is the mining time, not when the content
+  was authored), plus `Dated:  YYYY-MM-DD` when the drawer records an authored date. Age is
+  context, not proof that a drawer is current or obsolete; `stale` (source changed since
+  mining) is a separate signal.
 - In low-CPU mode, the requested result count is clamped to the effective low-CPU search limit.
 - Search fails with a non-zero result if no palace exists at the resolved palace path.
 - With a branch view selected, each canonical row whose `(wing, source_file)` is also present

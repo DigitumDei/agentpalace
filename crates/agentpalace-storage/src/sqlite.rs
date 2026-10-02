@@ -272,6 +272,12 @@ ON change_log(operation_id, event_type);
 ALTER TABLE knowledge_graph_facts ADD COLUMN provenance_json TEXT;
         "#,
     ),
+    (
+        "0012_diary_summary_last_updated_at",
+        r#"
+ALTER TABLE diary_summaries ADD COLUMN last_updated_at TEXT;
+        "#,
+    ),
 ];
 
 pub trait IngestManifestStore {
@@ -579,6 +585,7 @@ impl SqliteOperationalStore {
             "0009_agent_lineages",
             "0010_change_log_operation_identity",
             "0011_provenance_columns",
+            "0012_diary_summary_last_updated_at",
         ]
     }
 
@@ -670,6 +677,23 @@ pub trait DiaryStore {
     fn get_diary_summary(&self, entry_id: &DrawerId) -> Result<Option<String>>;
     fn get_diary_summaries(&self, entry_ids: &[DrawerId]) -> Result<Vec<(DrawerId, String)>>;
     fn delete_diary_summary(&self, entry_id: &DrawerId) -> Result<()>;
+    /// When each entry was last written, for entries that record it. Entries
+    /// written before last_updated_at existed are absent; read them as their
+    /// drawer's iled_at.
+    fn get_diary_last_updated(
+        &self,
+        entry_ids: &[DrawerId],
+    ) -> Result<Vec<(DrawerId, OffsetDateTime)>>;
+    /// Record an in-place update of a diary entry: set last_updated_at, and
+    /// the summary when summary is given. A legacy entry with no summary row
+    /// gets one, using allback_summary when no summary is given.
+    fn touch_diary_entry(
+        &self,
+        entry_id: &DrawerId,
+        summary: Option<&str>,
+        fallback_summary: &str,
+        updated_at: OffsetDateTime,
+    ) -> Result<()>;
 }
 
 impl DiaryStore for SqliteOperationalStore {
@@ -734,6 +758,59 @@ impl DiaryStore for SqliteOperationalStore {
             .execute("DELETE FROM diary_summaries WHERE entry_id = ?1", [entry_id.as_str()])?;
         Ok(())
     }
+
+    fn get_diary_last_updated(
+        &self,
+        entry_ids: &[DrawerId],
+    ) -> Result<Vec<(DrawerId, OffsetDateTime)>> {
+        if entry_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.open_connection()?;
+        let placeholders = std::iter::repeat_n("?", entry_ids.len()).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT entry_id, last_updated_at FROM diary_summaries
+             WHERE last_updated_at IS NOT NULL AND entry_id IN ({placeholders})"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let params: Vec<&str> = entry_ids.iter().map(DrawerId::as_str).collect();
+        let rows = statement
+            .query_map(params_from_iter(params), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(id, raw)| {
+                let id = DrawerId::new(id).map_err(|err| StorageError::Invariant(err.to_string()))?;
+                Ok((id, decode_time(raw)?))
+            })
+            .collect()
+    }
+
+    fn touch_diary_entry(
+        &self,
+        entry_id: &DrawerId,
+        summary: Option<&str>,
+        fallback_summary: &str,
+        updated_at: OffsetDateTime,
+    ) -> Result<()> {
+        let inserted_summary = summary.unwrap_or(fallback_summary);
+        if inserted_summary.chars().count() > DIARY_SUMMARY_MAX_CHARS {
+            return Err(StorageError::Invariant(format!(
+                "diary summary exceeds maximum length of {DIARY_SUMMARY_MAX_CHARS} characters"
+            )));
+        }
+        let connection = self.open_connection()?;
+        // One statement, so the summary and the timestamp move together.
+        connection.execute(
+            "INSERT INTO diary_summaries (entry_id, summary, last_updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(entry_id) DO UPDATE SET
+                 last_updated_at = excluded.last_updated_at,
+                 summary = CASE WHEN ?4 THEN excluded.summary ELSE diary_summaries.summary END",
+            params![entry_id.as_str(), inserted_summary, encode_time(updated_at), summary.is_some()],
+        )?;
+        Ok(())
+    }
 }
 
 impl SqliteOperationalStore {
@@ -748,6 +825,7 @@ impl SqliteOperationalStore {
         entries: &[IngestManifestEntry],
         drawer_id: &DrawerId,
         summary: &str,
+        entry_filed_at: OffsetDateTime,
         created_at: OffsetDateTime,
     ) -> Result<Option<IngestRun>> {
         if summary.chars().count() > DIARY_SUMMARY_MAX_CHARS {
@@ -780,10 +858,11 @@ impl SqliteOperationalStore {
             )?;
         }
 
+        // A new entry's timespan starts and ends at its filing time.
         let summary_inserted = transaction.execute(
-            "INSERT INTO diary_summaries (entry_id, summary) VALUES (?1, ?2)
+            "INSERT INTO diary_summaries (entry_id, summary, last_updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(entry_id) DO NOTHING",
-            params![drawer_id.as_str(), summary],
+            params![drawer_id.as_str(), summary, encode_time(entry_filed_at)],
         )?;
 
         // The summary's unique entry ID is the atomic duplicate gate for a
@@ -3928,6 +4007,7 @@ VALUES ('chat/file.txt', 'legacy-hash', '2026-04-11T12:00:00Z', 'convos', 2);
             &did,
             &"x".repeat(401),
             datetime!(2026-07-01 00:00:00 UTC),
+            datetime!(2026-07-01 00:00:00 UTC),
         );
         assert!(result.is_err(), "expected error for overlong summary in create_pending_diary_run");
         let err = result.unwrap_err().to_string();
@@ -3963,6 +4043,7 @@ VALUES ('chat/file.txt', 'legacy-hash', '2026-04-11T12:00:00Z', 'convos', 2);
                 &did,
                 "first summary",
                 datetime!(2026-07-01 00:00:00 UTC),
+                datetime!(2026-07-01 00:00:00 UTC),
             )
             .unwrap();
         assert!(first.is_some());
@@ -3974,6 +4055,7 @@ VALUES ('chat/file.txt', 'legacy-hash', '2026-04-11T12:00:00Z', 'convos', 2);
                 &[entry],
                 &did,
                 "second summary",
+                datetime!(2026-07-01 00:00:01 UTC),
                 datetime!(2026-07-01 00:00:01 UTC),
             )
             .unwrap();

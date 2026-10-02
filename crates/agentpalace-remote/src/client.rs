@@ -1050,6 +1050,12 @@ impl RemoteApi for RemoteClient {
         Ok(Some(info.capabilities.iter().any(|capability| capability == "idempotent_mutations")))
     }
 
+    /// Return whether the remote handshake advertised `capability`.
+    async fn has_capability(&self, capability: &str) -> Result<Option<bool>> {
+        let info = self.ensure_handshake().await?;
+        Ok(Some(info.capabilities.iter().any(|advertised| advertised == capability)))
+    }
+
     /// Search drawers using semantic full-text matching (`POST /v1/drawers/search`).
     async fn search_drawers(&self, req: DrawerSearchRequest) -> Result<DrawerSearchResponse> {
         self.ensure_handshake().await?;
@@ -1637,6 +1643,7 @@ mod tests {
             added_by: None,
             drawer_id: None,
             operation_id: None,
+            allow_near_duplicate: false,
         }
     }
 
@@ -1963,6 +1970,7 @@ mod tests {
                 room: None,
                 view: None,
                 limit: None,
+                prefer: None,
             })
             .await;
         match result {
@@ -2331,6 +2339,7 @@ mod tests {
             added_by: None,
             drawer_id: None,
             operation_id: None,
+            allow_near_duplicate: false,
         }
     }
 

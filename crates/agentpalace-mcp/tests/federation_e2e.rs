@@ -77,6 +77,7 @@ fn server_config(dir: &TempDir) -> AgentPalaceConfig {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation: FederationRuntimeConfig::default(),
     }
 }
@@ -154,6 +155,7 @@ async fn mcp_server_with_hub(
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation,
     };
 
@@ -256,6 +258,7 @@ async fn mcp_server_with_hub_multi_default(
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation,
     };
 
@@ -341,6 +344,7 @@ async fn wait_for_hub_drawer(hub_url: &str, content: &str, wing: &str, room: &st
                     room: Some(room),
                     limit: Some(20),
                     view: None,
+                    prefer: None,
                 };
                 match client.search_drawers(req).await {
                     Ok(resp) => resp.results.iter().any(|r| r.content == content),
@@ -815,6 +819,7 @@ async fn different_embedding_profiles_per_side() {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation,
     };
 
@@ -959,6 +964,7 @@ async fn remote_down_degrades_reads() {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation,
     };
 
@@ -1165,6 +1171,36 @@ async fn diary_room_never_routes_remote() {
         local_count >= 1,
         "wing_diary_test must have at least 1 drawer (local diary add); got: {list_wings}"
     );
+
+    // ── 3. A project diary entry in the remoted wing, updated in place, stays local.
+    let written = call_tool(
+        &server,
+        3,
+        "agentpalace_diary_write",
+        json!({
+            "agent_name": "diary-test",
+            "entry": "project diary entry in a remoted wing",
+            "summary": "Project diary.",
+            "scope": "project",
+            "wing": "wing_diary_test"
+        }),
+    )
+    .await;
+    assert_eq!(written["success"], true, "{written}");
+    let updated = call_tool(
+        &server,
+        4,
+        "agentpalace_diary_update",
+        json!({
+            "entry_id": written["entry_id"],
+            "agent_name": "diary-test",
+            "entry": "project diary entry in a remoted wing, revised"
+        }),
+    )
+    .await;
+    assert_eq!(updated["success"], true, "diary_update must apply locally: {updated}");
+    assert_eq!(updated["content_changed"], true, "{updated}");
+    assert!(updated.get("origin").is_none(), "diary_update must never route remote: {updated}");
 }
 
 // ─── Test 6: wing_availability_reflects_rules ────────────────────────────────
@@ -1407,6 +1443,7 @@ async fn wake_up_with_down_remote_marks_unreachable_and_succeeds() {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation,
     };
 
@@ -1614,6 +1651,7 @@ async fn diary_events_never_appear_in_remote_changes() {
                     checkouts: std::collections::BTreeMap::new(),
                 },
                 maintenance: MaintenanceRuntimeConfig::defaults(),
+                search: agentpalace_config::SearchRuntimeConfig::defaults(),
                 federation: FederationRuntimeConfig::default(),
             },
             DeterministicStubProvider::new(EmbeddingProfile::Balanced),
@@ -1728,6 +1766,36 @@ async fn diary_events_never_appear_in_remote_changes() {
     assert!(
         local_diary_event.is_some(),
         "local diary_written event must appear with origin=local; events: {events:?}"
+    );
+
+    // ── Step 7: an in-place diary update stays local too.
+    let entry_id = local_diary["entry_id"].as_str().expect("entry_id").to_owned();
+    let updated = call_tool(
+        &server,
+        5,
+        "agentpalace_diary_update",
+        json!({"entry_id": entry_id, "agent_name": "local-agent", "summary": "Updated locally."}),
+    )
+    .await;
+    assert_eq!(updated["success"], true, "diary_update must succeed locally: {updated}");
+    assert!(updated.get("origin").is_none(), "diary_update must not report a remote origin: {updated}");
+
+    let changes = call_tool(
+        &server,
+        6,
+        "agentpalace_get_changes_since",
+        json!({"since": "2000-01-01T00:00:00Z"}),
+    )
+    .await;
+    let events = changes["events"].as_array().expect("events must be array");
+    assert!(
+        events.iter().any(|e| e["event_type"] == "diary_updated" && e["origin"] == "local"),
+        "local diary_updated event must appear with origin=local; events: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e["event_type"] == "diary_updated"
+            && e["origin"].as_str().is_some_and(|o| o.starts_with("remote:"))),
+        "no diary_updated event may come from a remote; events: {events:?}"
     );
 }
 
@@ -1968,6 +2036,7 @@ async fn add_drawer_both_replication_fails_with_remote_rejection() {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation,
     };
 
@@ -2126,6 +2195,7 @@ async fn add_drawer_both_duplicate_replication() {
             room: None,
             limit: Some(20),
             view: None,
+            prefer: None,
         })
         .await
         .expect("hub search must succeed");
@@ -2197,6 +2267,7 @@ async fn add_drawer_both_near_duplicate_same_wing_room_rejected() {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation,
     };
 
@@ -2327,6 +2398,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation: federation_a,
     };
     let server_a =
@@ -2424,6 +2496,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation: federation_b,
     };
     let server_b =
@@ -2490,6 +2563,7 @@ async fn add_drawer_both_retry_reuses_local_drawer_and_replicates() {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation: FederationRuntimeConfig::default(),
     };
     let local_only_server = McpServer::from_parts(
@@ -2589,6 +2663,7 @@ async fn delete_both_retry_after_local_delete_replays_same_operation() {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation,
     };
     let server =
@@ -2707,6 +2782,7 @@ async fn delete_both_retry_after_restart_replays_same_operation() {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation: make_federation(),
     };
 
@@ -2837,6 +2913,7 @@ async fn add_drawer_both_replication_fails_with_down_remote() {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation,
     };
 
@@ -3002,6 +3079,7 @@ async fn kg_add_both_replication_fails_with_down_remote() {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation,
     };
 
@@ -3217,6 +3295,7 @@ async fn kg_invalidate_both_replication_fails_with_down_remote() {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation,
     };
 
@@ -3515,6 +3594,7 @@ async fn kg_add_both_replication_fails_with_remote_rejection() {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation,
     };
 
@@ -3638,6 +3718,7 @@ async fn kg_invalidate_both_replication_fails_with_remote_rejection() {
             checkouts: std::collections::BTreeMap::new(),
         },
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
         federation,
     };
 

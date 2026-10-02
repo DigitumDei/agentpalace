@@ -430,6 +430,14 @@ impl LanceDrawerStore {
     }
 }
 
+#[cfg(test)]
+impl LanceDrawerStore {
+    /// Current table version, for tests that assert a write is one commit.
+    pub(crate) async fn table_version(&self) -> Result<u64> {
+        Ok(self.table().await?.version().await?)
+    }
+}
+
 #[async_trait]
 impl DrawerStore for LanceDrawerStore {
     async fn ensure_schema(&self) -> Result<()> {
@@ -549,6 +557,27 @@ impl DrawerStore for LanceDrawerStore {
         table.add(drawers_to_reader(self.schema(), drawers)?).execute().await?;
         self.ensure_indices(&table).await?;
         Ok(())
+    }
+
+    async fn replace_drawer(&self, drawer: &DrawerRecord) -> Result<bool> {
+        let expected_dimensions = self.profile.metadata().dimensions;
+        if drawer.embedding.len() != expected_dimensions {
+            return Err(StorageError::InvalidEmbeddingDimensions {
+                drawer_id: drawer.id.as_str().to_owned(),
+                expected: expected_dimensions,
+                actual: drawer.embedding.len(),
+            });
+        }
+        let table = self.table().await?;
+        // An update-only merge commits as one table version: unlike Overwrite's
+        // delete-then-add, a failure cannot leave the row missing, and a
+        // missing id inserts nothing.
+        let mut merge = table.merge_insert(&["id"]);
+        merge.when_matched_update_all(None);
+        let result = merge
+            .execute(drawers_to_reader(self.schema(), std::slice::from_ref(drawer))?)
+            .await?;
+        Ok(result.num_updated_rows > 0)
     }
 
     async fn get_drawer(&self, id: &DrawerId) -> Result<Option<DrawerRecord>> {

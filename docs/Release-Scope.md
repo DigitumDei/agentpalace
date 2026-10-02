@@ -47,7 +47,7 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `balanced`
 - `low_cpu`
 
-### MCP tool surface (71 tools)
+### MCP tool surface (72 tools)
 
 - `agentpalace_wake_up`
 - `agentpalace_status`
@@ -72,6 +72,7 @@ Full flag reference: [CLI Surface](CLI-Surface.md).
 - `agentpalace_delete_drawer`
 - `agentpalace_diary_write`
 - `agentpalace_diary_read`
+- `agentpalace_diary_update`
 - `agentpalace_get_changes_since`
 - `agentpalace_identity_read`
 - `agentpalace_identity_update`
@@ -128,6 +129,18 @@ which is a two-write sequence (the record, then the raw wire envelope stored as 
 `protocol_envelope` artifact) with no remote transaction available to make it atomic, so no
 remote path is offered rather than one that can half-apply. Neither adapter has an HTTP surface
 of its own; this tool surface is the only entry point.
+
+`agentpalace_search` results carry temporal context: `filed_at` (UTC; for mined rows the mining
+time), `date` when an authored or event date was recorded, and `ingest_mode`; the response
+carries `retrieved_at` and the effective `prefer` mode. `prefer` (`relevant` | `balanced` |
+`recent`; default from `search.freshness.default`, shipped as `relevant`) adds a bounded ranking
+lift for newer drawers without changing `similarity`. `agentpalace_add_drawer` and
+`agentpalace_check_duplicate` classify each match as `exact`, `series_update` (a new run of a
+recurring snapshot, which is filed rather than refused) or `near_duplicate`;
+`agentpalace_add_drawer` accepts `allow_near_duplicate` and reports series members under
+`similar`. `agentpalace_diary_update` replaces a diary entry's body and/or summary in place,
+keeping its id; diary reads and wake-up order and window entries by their last update
+(`last_updated_at`). Diary tools remain local-only.
 
 The five self-continuity tools are local-only. `agentpalace_wake_up` compiles the MCP-bound or
 palace-default lineage into an identity packet; model-facing calls cannot select or override it.
