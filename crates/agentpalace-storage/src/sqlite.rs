@@ -678,15 +678,15 @@ pub trait DiaryStore {
     fn get_diary_summaries(&self, entry_ids: &[DrawerId]) -> Result<Vec<(DrawerId, String)>>;
     fn delete_diary_summary(&self, entry_id: &DrawerId) -> Result<()>;
     /// When each entry was last written, for entries that record it. Entries
-    /// written before last_updated_at existed are absent; read them as their
-    /// drawer's iled_at.
+    /// written before `last_updated_at` existed are absent; read them as their
+    /// drawer's `filed_at`.
     fn get_diary_last_updated(
         &self,
         entry_ids: &[DrawerId],
     ) -> Result<Vec<(DrawerId, OffsetDateTime)>>;
-    /// Record an in-place update of a diary entry: set last_updated_at, and
-    /// the summary when summary is given. A legacy entry with no summary row
-    /// gets one, using allback_summary when no summary is given.
+    /// Record an in-place update of a diary entry: set `last_updated_at`, and
+    /// the summary when `summary` is given. A legacy entry with no summary row
+    /// gets one, using `fallback_summary` when no summary is given.
     fn touch_diary_entry(
         &self,
         entry_id: &DrawerId,

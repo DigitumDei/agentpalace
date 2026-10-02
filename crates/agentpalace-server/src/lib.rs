@@ -1814,7 +1814,7 @@ where
     let receipts = state.storage.receipt_store();
 
     if let Some((op, operation_key)) = operation.as_ref() {
-        let request_hash = mutation_request_hash(&[
+        let mut hashed = vec![
             ("wing", json!(body.wing)),
             ("room", json!(body.room)),
             ("content", json!(&body.content)),
@@ -1824,7 +1824,14 @@ where
             // replay or race the same receipt and receive credit for one another's drawer.
             ("effective_added_by", json!(&effective_added_by)),
             ("drawer_id", json!(&body.drawer_id)),
-        ]);
+        ];
+        // The override decides whether the duplicate check refuses or applies the add, so
+        // it is part of the mutation's identity. Hashed only when set, so receipts written
+        // before the flag existed keep their hashes.
+        if body.allow_near_duplicate {
+            hashed.push(("allow_near_duplicate", json!(true)));
+        }
+        let request_hash = mutation_request_hash(&hashed);
         let outcome = receipts.begin_receipt(&NewReceipt {
             operation_key: (*operation_key).clone(),
             operation_kind: RECEIPT_KIND_DRAWER_ADD.to_owned(),
@@ -1866,11 +1873,23 @@ where
                             receipt.target_id
                         )));
                     }
-                    let response = serde_json::to_value(add_drawer_response(
-                        &receipt.target_id,
+                    // The original response listed the series this drawer joined. Recompute it,
+                    // excluding the recovered drawer itself, so a recovered add answers like
+                    // the live path did.
+                    let (_, similar) = classified_add_matches(
+                        &state,
+                        &auth.0,
+                        &body.content,
                         wing.as_str(),
-                        room.as_str(),
-                    ))?;
+                        body.source_file.as_deref(),
+                        body.allow_near_duplicate,
+                        Some(receipt.target_id.as_str()),
+                    )
+                    .await?;
+                    let response = serde_json::to_value(AddDrawerResponse {
+                        similar,
+                        ..add_drawer_response(&receipt.target_id, wing.as_str(), room.as_str())
+                    })?;
                     // Recover the finding-6-class crash window: the add committed but the
                     // `drawer_added` change event never landed. Restore exactly one event —
                     // atomically, so a crash between the restore and `complete_receipt`, or two
@@ -1908,28 +1927,16 @@ where
     // read, because that duplicate is invisible to this check. The
     // alternative — reporting it — would disclose that wing's content to a
     // caller not authorized to read it, which is worse.
-    let visibility = auth.0.visible_wings(Operation::Read);
-    let duplicates = find_duplicates(
+    let (duplicates, similar) = classified_add_matches(
         &state,
+        &auth.0,
         &body.content,
-        DEFAULT_DUPLICATE_THRESHOLD,
-        Some(wing.as_str()),
-        body.source_file.as_deref().filter(|source| !source.is_empty()),
+        wing.as_str(),
+        body.source_file.as_deref(),
+        body.allow_near_duplicate,
+        None,
     )
     .await?;
-    let (duplicates, similar): (Vec<Value>, Vec<Value>) = duplicates
-        .into_iter()
-        .filter(|m| {
-            let dup_wing = m.get("wing").and_then(Value::as_str).unwrap_or("");
-            let dup_room = m.get("room").and_then(Value::as_str).unwrap_or("");
-            !is_diary_wing_or_room(dup_wing, dup_room) && visibility.contains(dup_wing)
-        })
-        // A forced near-duplicate neither blocks nor counts as a series member.
-        .filter(|m| {
-            duplicate_relation_blocks(m, body.allow_near_duplicate)
-                || m.get("relation").and_then(Value::as_str) == Some("series_update")
-        })
-        .partition(|m| duplicate_relation_blocks(m, body.allow_near_duplicate));
     if !duplicates.is_empty() {
         return Err(ServerError::Duplicate(
             serde_json::to_value(&duplicates).unwrap_or(Value::Array(vec![])),
@@ -5206,6 +5213,47 @@ where
     Ok(matches)
 }
 
+/// Classified duplicate matches for an add, split into `(blocking, series)`.
+///
+/// Matches in diary rooms or in wings the caller cannot read are dropped first,
+/// because the 409 itself would disclose them. A forced near-duplicate is in
+/// neither list. `exclude_id` leaves out one drawer (the add being recovered).
+async fn classified_add_matches<P>(
+    state: &ServerState<P>,
+    identity: &AuthIdentity,
+    content: &str,
+    wing: &str,
+    source_file: Option<&str>,
+    allow_near_duplicate: bool,
+    exclude_id: Option<&str>,
+) -> Result<(Vec<Value>, Vec<Value>), ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let visibility = identity.visible_wings(Operation::Read);
+    let matches = find_duplicates(
+        state,
+        content,
+        DEFAULT_DUPLICATE_THRESHOLD,
+        Some(wing),
+        source_file.filter(|source| !source.is_empty()),
+    )
+    .await?;
+    Ok(matches
+        .into_iter()
+        .filter(|m| exclude_id.is_none_or(|id| m.get("id").and_then(Value::as_str) != Some(id)))
+        .filter(|m| {
+            let dup_wing = m.get("wing").and_then(Value::as_str).unwrap_or("");
+            let dup_room = m.get("room").and_then(Value::as_str).unwrap_or("");
+            !is_diary_wing_or_room(dup_wing, dup_room) && visibility.contains(dup_wing)
+        })
+        .filter(|m| {
+            duplicate_relation_blocks(m, allow_near_duplicate)
+                || m.get("relation").and_then(Value::as_str) == Some("series_update")
+        })
+        .partition(|m| duplicate_relation_blocks(m, allow_near_duplicate)))
+}
+
 fn duplicate_relation_blocks(entry: &Value, allow_near_duplicate: bool) -> bool {
     relation_blocks(entry.get("relation").and_then(Value::as_str), allow_near_duplicate)
 }
@@ -7361,6 +7409,34 @@ mod tests {
         assert_eq!(forced.status(), StatusCode::OK);
         let exact = harness.router.clone().oneshot(add("ops snapshot cpu 40% disk 71%", true)).await.unwrap();
         assert_eq!(exact.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn allow_near_duplicate_is_part_of_the_operation_identity() {
+        let harness = make_harness().await;
+        let add = |content: &str, force: bool, operation_id: Option<&str>| {
+            let mut body = json!({"wing": "wing_code", "room": "ops", "content": content});
+            if force {
+                body["allow_near_duplicate"] = json!(true);
+            }
+            if let Some(operation_id) = operation_id {
+                body["operation_id"] = json!(operation_id);
+            }
+            authed_json_request(Method::POST, "/v1/drawers", ALICE_TOKEN, body)
+        };
+        let original = harness.router.clone().oneshot(add("ops snapshot cpu 40% disk 71%", false, None)).await.unwrap();
+        assert_eq!(original.status(), StatusCode::OK);
+
+        let paraphrase = "ops: snapshot of cpu 40% and disk 71%";
+        let refused = harness.router.clone().oneshot(add(paraphrase, false, Some("op-near-1"))).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(refused).await["code"], "duplicate");
+
+        // Same operation id, but now forcing the add: a different mutation, so it must
+        // not recover the first attempt's receipt and apply.
+        let forced = harness.router.clone().oneshot(add(paraphrase, true, Some("op-near-1"))).await.unwrap();
+        assert_eq!(forced.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(forced).await["code"], "operation_id_conflict");
     }
 
     #[tokio::test]

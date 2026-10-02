@@ -51,10 +51,12 @@ supplied). Rows written before the migration keep `NULL`, which reads as
 diary reads and wake-up sort by the last update and include an entry in a `since`
 window when its last update falls inside it.
 
-`diary_update` replaces the body with a single update-only LanceDB `merge_insert`
-on `id` (one table version; never inserts, never delete-then-add), then sets the
-summary and `last_updated_at` in one SQLite statement. If that second step fails,
-the entry keeps its new body with the old summary, which the next update repairs.
+`diary_update` first sets the summary and `last_updated_at` in one SQLite statement,
+then replaces the body with a single update-only LanceDB `merge_insert` on `id` (one
+table version; never inserts, never delete-then-add). If the body write fails, the
+stored body still differs from the requested one, so retrying the same request
+rewrites both; the reverse order would leave a new body with stale metadata that a
+retry would treat as a no-op.
 The entry's `diary:<id>` ingest manifest keeps the original content hash; reconcile
 matches committed drawer ids, not hashes.
 

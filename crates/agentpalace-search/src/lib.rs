@@ -312,6 +312,11 @@ where
             base_limit.max(query.limit.saturating_mul(4))
         }
         .min(max_candidate_limit);
+        // The pool the mode ranks over. Overlay or caller filtering can shrink a
+        // fetched window below it; keep widening until the visible pool is this
+        // wide again (or storage or the cap runs out), so hidden rows cannot
+        // starve rerank or freshness of the candidates they need.
+        let pool_target = candidate_limit;
         let mut matches;
         loop {
             // LanceDB has no offset paging for vector queries, so each bounded
@@ -371,7 +376,7 @@ where
                 });
             }
             matches.retain(|entry| keep(&entry.record));
-            if matches.len() >= query.limit || candidate_count < candidate_limit {
+            if matches.len() >= pool_target || candidate_count < candidate_limit {
                 break;
             }
             let next_limit = candidate_limit.saturating_mul(2);
@@ -3406,6 +3411,35 @@ mod tests {
             .unwrap();
         let ids: Vec<_> = results.iter().map(|r| r.content.as_str()).collect();
         assert_eq!(ids, vec!["S7", "S6", "S1", "S2", "S5"]);
+    }
+
+    #[tokio::test]
+    async fn filtered_rows_do_not_starve_the_freshness_pool() {
+        // 15 hidden rows are closer than the whole series, so the first window
+        // of 20 holds only S1..S5 once they are filtered out. The pool must be
+        // widened until S6 and S7 are fetched, or recent mode cannot promote S7.
+        let mut drawers = fixture_a(time::Duration::ZERO);
+        for n in 0..15 {
+            drawers.push(authored(
+                &format!("hidden-{n:02}"),
+                "wing_secret",
+                "notes",
+                0.10 + 0.004 * n as f32,
+                datetime!(2026-09-01 00:00:00 UTC),
+            ));
+        }
+        let store = spy(drawers);
+        let mut runtime = SearchRuntime::with_policy(
+            StubProvider { response: vec![embedding(0.0)] },
+            policy(Freshness::Recent),
+        );
+        let results = runtime
+            .search_filtered(&store, &query(5, None), |record| record.wing.as_str() != "wing_secret")
+            .await
+            .unwrap();
+        let ids: Vec<_> = results.iter().map(|r| r.content.as_str()).collect();
+        assert_eq!(ids, vec!["S7", "S6", "S5", "S4", "S3"]);
+        assert_eq!(store.search_limits.lock().unwrap().as_slice(), &[20, 40]);
     }
 
     #[test]

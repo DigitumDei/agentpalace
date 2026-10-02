@@ -290,12 +290,16 @@ impl StorageEngine {
 
     /// Update a diary entry in place, keeping its id.
     ///
-    /// `drawer`, when given, is the rebuilt row (new body and embedding, same
-    /// id and filing metadata); it replaces the stored row in one Lance write.
-    /// Then the entry's `last_updated_at` (and summary, when given) is set in
-    /// one SQLite statement. Body first: if the SQLite write fails the entry
-    /// keeps its old summary with the new body, which the next update repairs,
-    /// so the error is surfaced without rolling the body back.
+    /// First the entry's `last_updated_at` (and summary, when given) is set in
+    /// one SQLite statement. Then `drawer`, when given (the rebuilt row: new
+    /// body and embedding, same id and filing metadata), replaces the stored
+    /// row in one Lance write.
+    ///
+    /// Metadata first, so a partial failure always repairs on retry: if the
+    /// Lance write fails, the stored body still differs from the requested one,
+    /// so retrying the same request rewrites both. The other order would leave
+    /// the new body with stale metadata, and a retry would see an unchanged
+    /// body and do nothing.
     ///
     /// The `diary:<id>` ingest manifest keeps the original content hash; reconcile
     /// matches committed drawer ids, not hashes, so it is unaffected.
@@ -307,21 +311,23 @@ impl StorageEngine {
         fallback_summary: &str,
         updated_at: OffsetDateTime,
     ) -> Result<()> {
+        if drawer.as_ref().is_some_and(|drawer| drawer.id != *entry_id) {
+            return Err(StorageError::Invariant("diary update must keep the entry id".to_owned()));
+        }
+        self.operational_store.touch_diary_entry(entry_id, summary, fallback_summary, updated_at)?;
         if let Some(drawer) = drawer {
-            if drawer.id != *entry_id {
-                return Err(StorageError::Invariant(
-                    "diary update must keep the entry id".to_owned(),
-                ));
-            }
             self.signal_activity();
             if !self.drawer_store.replace_drawer(&drawer).await? {
+                // The entry vanished (deleted concurrently); drop the summary
+                // row the touch above may have created for it.
+                self.operational_store.delete_diary_summary(entry_id)?;
                 return Err(StorageError::MissingRecord {
                     entity: "diary entry",
                     id: entry_id.as_str().to_owned(),
                 });
             }
         }
-        self.operational_store.touch_diary_entry(entry_id, summary, fallback_summary, updated_at)
+        Ok(())
     }
 
     pub async fn reconcile(&self) -> Result<()> {
@@ -2099,7 +2105,7 @@ mod diary_summary_tests {
     }
 
     #[tokio::test]
-    async fn update_diary_entry_summary_failure_leaves_new_body() {
+    async fn update_diary_entry_metadata_failure_writes_nothing() {
         let tempdir = tempdir().unwrap();
         let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
         committed_diary(&engine, "half", "old body", "old summary").await;
@@ -2116,10 +2122,40 @@ mod diary_summary_tests {
             .await;
         assert!(result.is_err(), "the summary failure must be surfaced");
         let stored = engine.drawer_store().get_drawer(&id).await.unwrap().unwrap();
-        assert_eq!(stored.content, "new body", "the body write is not rolled back");
+        assert_eq!(stored.content, "old body", "metadata is written first, so the body is untouched");
         assert_eq!(
             engine.operational_store().get_diary_summary(&id).unwrap().as_deref(),
             Some("old summary")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_diary_entry_body_failure_is_repaired_by_retry() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        committed_diary(&engine, "retry", "old body", "old summary").await;
+        let id = DrawerId::new("retry").unwrap();
+        let first_try = datetime!(2026-06-02 08:00:00 UTC);
+
+        // The Lance write fails after the metadata write succeeded.
+        let mut broken = diary_record("retry", "new body");
+        broken.embedding.truncate(3);
+        let result = engine.update_diary_entry(Some(broken), &id, None, "unused", first_try).await;
+        assert!(result.is_err());
+        let stored = engine.drawer_store().get_drawer(&id).await.unwrap().unwrap();
+        assert_eq!(stored.content, "old body");
+
+        // The stored body still differs from the request, so a retry rewrites both.
+        let retry_at = datetime!(2026-06-02 08:05:00 UTC);
+        engine
+            .update_diary_entry(Some(diary_record("retry", "new body")), &id, None, "unused", retry_at)
+            .await
+            .unwrap();
+        let stored = engine.drawer_store().get_drawer(&id).await.unwrap().unwrap();
+        assert_eq!(stored.content, "new body");
+        assert_eq!(
+            engine.operational_store().get_diary_last_updated(std::slice::from_ref(&id)).unwrap()[0].1,
+            retry_at
         );
     }
 
