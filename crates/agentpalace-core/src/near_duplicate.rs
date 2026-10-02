@@ -144,6 +144,8 @@ pub struct MaskedTemplate {
 /// ISO-style dates (`dddd-dd-dd`), clock times (`hh:mm[:ss[.f]]`), the `T`
 /// separator between them, and a trailing `Z` or `±hh:mm` offset become `<t>`.
 /// Every other digit run, including a decimal such as `12.5`, becomes `<n>`.
+/// A `-` directly before a number is its sign (so `-1.5` and `1.5` share a
+/// template) unless it follows a letter or digit, as in `web-01` or `10-20`.
 pub fn mask_template(text: &str) -> MaskedTemplate {
     let chars: Vec<char> =
         text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase().chars().collect();
@@ -151,7 +153,11 @@ pub fn mask_template(text: &str) -> MaskedTemplate {
     let mut numbers = Vec::new();
     let mut index = 0;
     while index < chars.len() {
-        if !chars[index].is_ascii_digit() {
+        let signed = chars[index] == '-'
+            && chars.get(index + 1).is_some_and(char::is_ascii_digit)
+            && index.checked_sub(1).is_none_or(|prev| !chars[prev].is_alphanumeric())
+            && match_timestamp(&chars, index + 1).is_none();
+        if !signed && !chars[index].is_ascii_digit() {
             template.push(chars[index]);
             index += 1;
             continue;
@@ -162,7 +168,7 @@ pub fn mask_template(text: &str) -> MaskedTemplate {
             continue;
         }
         let start = index;
-        index = digits_end(&chars, index);
+        index = digits_end(&chars, if signed { index + 1 } else { index });
         if chars.get(index) == Some(&'.') && chars.get(index + 1).is_some_and(char::is_ascii_digit)
         {
             index = digits_end(&chars, index + 1);
@@ -261,6 +267,31 @@ mod tests {
             "snapshot <t> host web-<n>: cpu <n>% mem <n> mb at <t> (+<t> local <t>)"
         );
         assert_eq!(masked.numbers, vec!["01", "12.5", "4096"]);
+    }
+
+    #[test]
+    fn a_leading_minus_is_the_numbers_sign_but_a_hyphen_is_not() {
+        let negative = mask_template("temp -1.5 c on web-01, range 10-20, offset -02:00");
+        let positive = mask_template("temp 1.5 c on web-01, range 10-20, offset -02:00");
+        assert_eq!(negative.template, positive.template);
+        assert_eq!(negative.template, "temp <n> c on web-<n>, range <n>-<n>, offset -<t>");
+        assert_eq!(negative.numbers, vec!["-1.5", "01", "10", "20"]);
+        assert_eq!(positive.numbers, vec!["1.5", "01", "10", "20"]);
+        assert_eq!(mask_template("-3 errors").numbers, vec!["-3"]);
+    }
+
+    #[test]
+    fn a_value_crossing_zero_is_a_series_update() {
+        let before = "ops balance -1.5 at node-a";
+        let after = "ops balance 1.5 at node-a";
+        let (before_hash, after_hash) = (hash_text(before), hash_text(after));
+        assert_eq!(
+            classify_duplicate(
+                &incoming(after, &after_hash, None),
+                &candidate(before, &before_hash, "", datetime!(2026-10-01 11:00:00 UTC))
+            ),
+            DuplicateRelation::SeriesUpdate(SeriesReason::ValuesChanged)
+        );
     }
 
     #[test]
