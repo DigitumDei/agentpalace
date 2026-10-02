@@ -63,6 +63,7 @@ async fn forwarding_writes_and_reads_back_authenticated_owner_provenance() {
             background_enabled: false,
             ..MaintenanceRuntimeConfig::defaults()
         },
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
     };
     let tokens = TokenRegistry::load(token_file.clone()).expect("load real engine token registry");
     let (engine_router, _engine_state) =

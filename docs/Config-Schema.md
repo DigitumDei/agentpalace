@@ -45,6 +45,13 @@ Frozen JSON shape:
   },
   "coordination": {
     "default_wing": "wing_local_tasks"
+  },
+  "search": {
+    "freshness": {
+      "default": "relevant",
+      "half_life_hours": 24,
+      "no_lift_rooms": []
+    }
   }
 }
 ```
@@ -53,6 +60,7 @@ Notes:
 
 - `low_cpu` is optional.
 - `maintenance` is optional.
+- `search` is optional.
 - If the config file does not exist, Rust defaults are used and `init` will create the file.
 - `version != 1` is rejected.
 
@@ -124,6 +132,32 @@ Validation:
 Validation:
 
 - `idle_secs`, `version_retention_hours`, `tail_threshold_rows`, and `small_fragment_threshold` must be greater than `0` when set in the config file. Zero-valued env overrides are also rejected.
+
+### `search`
+
+- Type: object
+- Optional; deliberately not under `low_cpu`, so it applies on every profile.
+- `freshness`: optional object controlling how drawer age affects search ranking.
+  - `default`: `"relevant"` | `"balanced"` | `"recent"` — mode used when a search request does
+    not set `prefer` (MCP) / `--prefer` (CLI) / `prefer` (REST). Default: `"relevant"`, which
+    keeps pure semantic order.
+  - `half_life_hours`: integer, at least `1` — half-life of the freshness lift. Default: `24`.
+    High-cadence series may want a shorter value.
+  - `no_lift_rooms`: array of `"wing/room"` strings whose drawers never receive a lift. Pairs are
+    scoped by wing; a bare room name is rejected. Default: `[]`.
+- Ranking: `rank_key = similarity + w * 2^(-age / half_life)` with `w = 0.05` (`balanced`) or
+  `0.20` (`recent`), where `age` is measured from the newest lift-eligible drawer of the same
+  `(wing, room, source_file)` in the candidate pool, not from the wall clock. Grouping by the full
+  stored source label means each recurring series is compared only with its own runs, so newer
+  notes or other series in the same room do not shrink its lift. Drawers with no `source_file`
+  are grouped by `(wing, room)`. A label that changes on every run makes each drawer its own
+  group: every such drawer gets the full lift, which leaves their relative order unchanged. A drawer can never pass another
+  that is more than `w` more similar, and the reported `similarity` is never changed. Mined
+  (`projects`, `projects-branch`, `convos`), locator-backed and diary drawers are never lifted and
+  never set a reference time. Non-`relevant` modes widen the candidate window to `4 × limit`
+  (capped at `10 × limit`). Duplicate detection always uses pure semantic scores.
+- Validation: an unknown mode, `half_life_hours: 0`, or a `no_lift_rooms` entry that is not
+  `wing/room` fails config load.
 
 ### `coordination`
 

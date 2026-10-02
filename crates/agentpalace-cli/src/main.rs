@@ -306,6 +306,12 @@ enum Commands {
             help = "Use a branch view composed over canonical data; use 'full' to search every stored repository view"
         )]
         view: Option<String>,
+        #[arg(
+            long,
+            value_parser = ["relevant", "balanced", "recent"],
+            help = "How much drawer age weighs in ranking: relevant (pure semantic), balanced, or recent; default from search.freshness.default"
+        )]
+        prefer: Option<String>,
     },
     /// Show what's been filed.
     Status,
@@ -653,12 +659,13 @@ where
                 context,
             )
         }
-        Commands::Search { query, wing, room, results, view } => execute_search(
+        Commands::Search { query, wing, room, results, view, prefer } => execute_search(
             &query,
             wing,
             room,
             results,
             view,
+            prefer.as_deref().and_then(agentpalace_core::Freshness::parse),
             cli.palace.as_deref(),
             context,
             provider_factory,
@@ -2289,12 +2296,25 @@ fn render_remote_mine_summary(
     lines.join("\n")
 }
 
+/// Search ranking policy from the resolved config: rerank and freshness.
+fn search_runtime_policy(config: &AgentPalaceConfig) -> SearchRuntimePolicy {
+    SearchRuntimePolicy {
+        rerank_enabled: config.low_cpu.effective_rerank_enabled(),
+        freshness: agentpalace_search::FreshnessPolicy {
+            default: config.search.freshness_default,
+            half_life_hours: config.search.half_life_hours,
+            no_lift_rooms: config.search.no_lift_rooms.clone(),
+        },
+    }
+}
+
 fn execute_search<F, P>(
     query: &str,
     wing: Option<String>,
     room: Option<String>,
     results: usize,
     view: Option<String>,
+    freshness: Option<agentpalace_core::Freshness>,
     palace_override: Option<&Path>,
     context: &CliContext,
     provider_factory: F,
@@ -2314,10 +2334,7 @@ where
         .map_err(storage_error)?;
     let provider = provider_factory(config.embedding_profile, default_embedding_cache_dir())
         .map_err(provider_error)?;
-    let mut search = SearchRuntime::with_policy(
-        provider,
-        SearchRuntimePolicy { rerank_enabled: config.low_cpu.effective_rerank_enabled() },
-    );
+    let mut search = SearchRuntime::with_policy(provider, search_runtime_policy(&config));
 
     let wing_id = wing.as_deref().map(WingId::normalized).transpose().map_err(id_error)?;
     let room_id = room.as_deref().map(RoomId::new).transpose().map_err(id_error)?;
@@ -2331,6 +2348,7 @@ where
                 limit: clamp_search_results(results, &config),
                 profile: config.embedding_profile,
                 view,
+                freshness,
             },
         ))
         .map_err(search_error)?;
@@ -2513,7 +2531,7 @@ where
         .map_err(provider_error)?;
     let search = SearchRuntime::with_policy(
         provider,
-        SearchRuntimePolicy { rerank_enabled: config.low_cpu.effective_rerank_enabled() },
+        search_runtime_policy(&config),
     );
     let rendered = runtime
         .block_on(search.wake_up(
@@ -5493,6 +5511,7 @@ mod tests {
             },
             federation: FederationRuntimeConfig::default(),
             maintenance: MaintenanceRuntimeConfig::defaults(),
+            search: agentpalace_config::SearchRuntimeConfig::defaults(),
         }
     }
 

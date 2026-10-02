@@ -284,7 +284,22 @@ capability (added in issue #141) indicates support for cursor-paginated
 capability (added in issue #127) is what the durable replication worker checks
 before delivering an outbox operation: a remote that does not advertise it can
 only be reached by non-replicated legacy writes, because there would be no way
-to apply a replayed mutation exactly once. The wire DTOs live in the
+to apply a replayed mutation exactly once. The `"search_freshness"` capability
+(issues #147/#194) means the server honours `DrawerSearchRequest.prefer`
+(`relevant` | `balanced` | `recent`; an unknown value is a 400), returns
+`filed_at` (RFC 3339 UTC), `date` (authored date, `YYYY-MM-DD`), `ingest_mode` and
+`content_hash` on each `RemoteDrawerResult`, and applies diary and visible-wing
+exclusions inside its search runtime before ranking, so hidden rows neither take
+result slots nor influence freshness ordering. The `"duplicate_series"` capability
+(issue #194) means the server classifies each duplicate match with a `relation`
+(`exact`, `series_update`, `near_duplicate`, plus `reason` and `filed_at`), files
+series updates instead of refusing them (listing them in `AddDrawerResponse.similar`),
+honours `AddDrawerRequest.allow_near_duplicate` (never for exact copies), and
+answers `POST /v1/drawers/check_duplicate` with `is_duplicate` true only for
+`exact`/`near_duplicate` matches. A near-duplicate refusal is a 409 `duplicate`
+whose message is `near-duplicate content detected; set allow_near_duplicate=true to
+file it anyway`. All new request and response fields are optional and omitted when
+unset, so older peers see no change. The wire DTOs live in the
 `agentpalace-federation` crate and are shared verbatim by server and client.
 Federated mutation routes (`POST /v1/drawers`, `DELETE /v1/drawers/{id}`,
 `POST /v1/kg/facts`, `POST /v1/kg/facts/invalidate`) accept an optional
@@ -890,6 +905,23 @@ Through the MCP server, federated wings fan out across reads:
 - **Search / taxonomy / wings / rooms / status** — combined wings merge local and
   remote; results and wings are annotated with origin/availability; a down remote
   becomes a warning, not a failure.
+- **Search freshness** — the client resolves the effective `prefer` mode once (the
+  tool argument, else its own `search.freshness.default`) and sends it to every
+  remote, so each upgraded origin ranks with the caller's intent; each server
+  applies its own `half_life_hours`. Freshness runs per origin before ranks are
+  assigned, and the merge stays a pure rank interleave: scores are never compared
+  across origins. A remote that does not advertise `search_freshness` returns
+  semantic ranks, interleaved unchanged, and the response gains a `degradations`
+  entry with `code: "freshness_unsupported"`. `filed_at`, `date` and `ingest_mode`
+  travel end to end and are omitted (not guessed) when an older remote does not
+  send them. A series split across origins can still show an older local item next
+  to a newer remote one, because local goes first at each rank.
+- **Duplicate checks on remote-only writes** — when the target remote advertises
+  `duplicate_series`, the client skips its threshold-only preflight and lets the
+  server classify; otherwise the preflight still runs and any remote match without
+  a `relation` counts as blocking. `allow_near_duplicate` is forwarded on
+  remote-only adds and on durable write:both replication, so a replica does not
+  409 a drawer that was force-filed locally.
 - **`agentpalace_wake_up`** — when federation is active, the response gains
   `remote_changes`: a per-remote map of the last 24 h of change events (each event
   carries `origin: "remote:<name>"`), with unreachable remotes shown as

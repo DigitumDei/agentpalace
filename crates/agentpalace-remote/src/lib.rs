@@ -180,6 +180,15 @@ pub trait RemoteApi: Send + Sync {
         Ok(None)
     }
 
+    /// Return whether this peer advertises `capability` in `/v1/info`.
+    ///
+    /// `Some(false)` is authoritative. The default `None` (unknown) keeps older
+    /// in-process [`RemoteApi`] implementations source-compatible.
+    async fn has_capability(&self, capability: &str) -> Result<Option<bool>> {
+        let _ = capability;
+        Ok(None)
+    }
+
     /// Search drawers using semantic full-text matching (`POST /v1/drawers/search`).
     async fn search_drawers(&self, req: DrawerSearchRequest) -> Result<DrawerSearchResponse>;
 

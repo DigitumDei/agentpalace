@@ -26,6 +26,7 @@ async fn test_server(tempdir: &TempDir) -> McpServer<DeterministicStubProvider> 
         },
         federation: FederationRuntimeConfig::default(),
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
     };
     McpServer::from_parts(config, DeterministicStubProvider::new(EmbeddingProfile::Balanced))
         .await

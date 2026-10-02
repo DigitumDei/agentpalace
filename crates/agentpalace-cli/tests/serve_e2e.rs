@@ -64,6 +64,7 @@ fn test_config(tempdir: &TempDir) -> AgentPalaceConfig {
         },
         federation: FederationRuntimeConfig::default(),
         maintenance: MaintenanceRuntimeConfig::defaults(),
+        search: agentpalace_config::SearchRuntimeConfig::defaults(),
     }
 }
 

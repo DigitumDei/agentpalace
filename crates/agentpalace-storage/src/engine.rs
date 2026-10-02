@@ -246,6 +246,7 @@ impl StorageEngine {
             &manifests,
             &drawer_id,
             diary_summary,
+            request.drawers[0].filed_at,
             now,
         )?
         else {
@@ -285,6 +286,48 @@ impl StorageEngine {
                 Err(error)
             }
         }
+    }
+
+    /// Update a diary entry in place, keeping its id.
+    ///
+    /// First the entry's `last_updated_at` (and summary, when given) is set in
+    /// one SQLite statement. Then `drawer`, when given (the rebuilt row: new
+    /// body and embedding, same id and filing metadata), replaces the stored
+    /// row in one Lance write.
+    ///
+    /// Metadata first, so a partial failure always repairs on retry: if the
+    /// Lance write fails, the stored body still differs from the requested one,
+    /// so retrying the same request rewrites both. The other order would leave
+    /// the new body with stale metadata, and a retry would see an unchanged
+    /// body and do nothing.
+    ///
+    /// The `diary:<id>` ingest manifest keeps the original content hash; reconcile
+    /// matches committed drawer ids, not hashes, so it is unaffected.
+    pub async fn update_diary_entry(
+        &self,
+        drawer: Option<DrawerRecord>,
+        entry_id: &DrawerId,
+        summary: Option<&str>,
+        fallback_summary: &str,
+        updated_at: OffsetDateTime,
+    ) -> Result<()> {
+        if drawer.as_ref().is_some_and(|drawer| drawer.id != *entry_id) {
+            return Err(StorageError::Invariant("diary update must keep the entry id".to_owned()));
+        }
+        self.operational_store.touch_diary_entry(entry_id, summary, fallback_summary, updated_at)?;
+        if let Some(drawer) = drawer {
+            self.signal_activity();
+            if !self.drawer_store.replace_drawer(&drawer).await? {
+                // The entry vanished (deleted concurrently); drop the summary
+                // row the touch above may have created for it.
+                self.operational_store.delete_diary_summary(entry_id)?;
+                return Err(StorageError::MissingRecord {
+                    entity: "diary entry",
+                    id: entry_id.as_str().to_owned(),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub async fn reconcile(&self) -> Result<()> {
@@ -1976,6 +2019,161 @@ mod diary_summary_tests {
         }
     }
 
+    async fn committed_diary(engine: &StorageEngine, id: &str, content: &str, summary: &str) {
+        let record = diary_record(id, content);
+        engine
+            .commit_diary_ingest(
+                IngestCommitRequest {
+                    ingest_kind: "diary".to_owned(),
+                    source_key: format!("diary:{id}"),
+                    source_file: "diary:test".to_owned(),
+                    content_hash: record.content_hash.clone(),
+                    drawers: vec![record],
+                    duplicate_strategy: DuplicateStrategy::Error,
+                },
+                summary,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn replace_drawer_updates_existing_row_in_one_version() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        committed_diary(&engine, "replace_one", "old body", "old summary").await;
+        let before_rows = engine.drawer_store().list_drawers(&Default::default()).await.unwrap().len();
+        let before_version = engine.drawer_store().table_version().await.unwrap();
+
+        let mut updated = diary_record("replace_one", "new body");
+        updated.content_hash = "hash-new".to_owned();
+        assert!(engine.drawer_store().replace_drawer(&updated).await.unwrap());
+
+        assert_eq!(engine.drawer_store().table_version().await.unwrap(), before_version + 1);
+        let after = engine.drawer_store().list_drawers(&Default::default()).await.unwrap();
+        assert_eq!(after.len(), before_rows);
+        let stored = engine
+            .drawer_store()
+            .get_drawer(&DrawerId::new("replace_one").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.content, "new body");
+        assert_eq!(stored.content_hash, "hash-new");
+    }
+
+    #[tokio::test]
+    async fn replace_drawer_returns_false_and_inserts_nothing_when_missing() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        committed_diary(&engine, "present", "body", "summary").await;
+        let missing = diary_record("absent", "body");
+        assert!(!engine.drawer_store().replace_drawer(&missing).await.unwrap());
+        assert!(
+            engine.drawer_store().get_drawer(&missing.id).await.unwrap().is_none(),
+            "replace must never insert"
+        );
+    }
+
+    #[tokio::test]
+    async fn diary_commit_and_update_record_the_entry_timespan() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        committed_diary(&engine, "span", "body", "first summary").await;
+        let id = DrawerId::new("span").unwrap();
+        let store = engine.operational_store();
+        // A new entry's span ends where it starts: at its filing time.
+        assert_eq!(
+            store.get_diary_last_updated(std::slice::from_ref(&id)).unwrap(),
+            vec![(id.clone(), datetime!(2026-06-01 10:00:00 UTC))]
+        );
+
+        // Summary-only update: timestamp and summary move, the drawer does not.
+        let later = datetime!(2026-06-02 08:00:00 UTC);
+        engine.update_diary_entry(None, &id, Some("second summary"), "unused", later).await.unwrap();
+        assert_eq!(store.get_diary_summary(&id).unwrap().as_deref(), Some("second summary"));
+        assert_eq!(store.get_diary_last_updated(std::slice::from_ref(&id)).unwrap()[0].1, later);
+
+        // Body-only update keeps the summary and still advances the timestamp.
+        let latest = datetime!(2026-06-03 08:00:00 UTC);
+        let rebuilt = diary_record("span", "rewritten body");
+        engine.update_diary_entry(Some(rebuilt), &id, None, "unused", latest).await.unwrap();
+        assert_eq!(store.get_diary_summary(&id).unwrap().as_deref(), Some("second summary"));
+        assert_eq!(store.get_diary_last_updated(std::slice::from_ref(&id)).unwrap()[0].1, latest);
+        let stored = engine.drawer_store().get_drawer(&id).await.unwrap().unwrap();
+        assert_eq!(stored.content, "rewritten body");
+    }
+
+    #[tokio::test]
+    async fn update_diary_entry_metadata_failure_writes_nothing() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        committed_diary(&engine, "half", "old body", "old summary").await;
+        let id = DrawerId::new("half").unwrap();
+        let over_limit = "x".repeat(DIARY_SUMMARY_MAX_CHARS + 1);
+        let result = engine
+            .update_diary_entry(
+                Some(diary_record("half", "new body")),
+                &id,
+                Some(&over_limit),
+                "unused",
+                datetime!(2026-06-02 08:00:00 UTC),
+            )
+            .await;
+        assert!(result.is_err(), "the summary failure must be surfaced");
+        let stored = engine.drawer_store().get_drawer(&id).await.unwrap().unwrap();
+        assert_eq!(stored.content, "old body", "metadata is written first, so the body is untouched");
+        assert_eq!(
+            engine.operational_store().get_diary_summary(&id).unwrap().as_deref(),
+            Some("old summary")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_diary_entry_body_failure_is_repaired_by_retry() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        committed_diary(&engine, "retry", "old body", "old summary").await;
+        let id = DrawerId::new("retry").unwrap();
+        let first_try = datetime!(2026-06-02 08:00:00 UTC);
+
+        // The Lance write fails after the metadata write succeeded.
+        let mut broken = diary_record("retry", "new body");
+        broken.embedding.truncate(3);
+        let result = engine.update_diary_entry(Some(broken), &id, None, "unused", first_try).await;
+        assert!(result.is_err());
+        let stored = engine.drawer_store().get_drawer(&id).await.unwrap().unwrap();
+        assert_eq!(stored.content, "old body");
+
+        // The stored body still differs from the request, so a retry rewrites both.
+        let retry_at = datetime!(2026-06-02 08:05:00 UTC);
+        engine
+            .update_diary_entry(Some(diary_record("retry", "new body")), &id, None, "unused", retry_at)
+            .await
+            .unwrap();
+        let stored = engine.drawer_store().get_drawer(&id).await.unwrap().unwrap();
+        assert_eq!(stored.content, "new body");
+        assert_eq!(
+            engine.operational_store().get_diary_last_updated(std::slice::from_ref(&id)).unwrap()[0].1,
+            retry_at
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_diary_entry_without_summary_row_gets_one_on_update() {
+        let tempdir = tempdir().unwrap();
+        let engine = StorageEngine::open(tempdir.path(), EmbeddingProfile::Balanced).await.unwrap();
+        committed_diary(&engine, "legacy", "body", "summary").await;
+        let id = DrawerId::new("legacy").unwrap();
+        engine.operational_store().delete_diary_summary(&id).unwrap();
+        let at = datetime!(2026-06-05 00:00:00 UTC);
+        engine.update_diary_entry(None, &id, None, "derived summary", at).await.unwrap();
+        assert_eq!(
+            engine.operational_store().get_diary_summary(&id).unwrap().as_deref(),
+            Some("derived summary")
+        );
+    }
+
     #[tokio::test]
     async fn store_and_retrieve_exact_400_char_summary_with_multibyte_unicode() {
         let tempdir = tempdir().unwrap();
@@ -2111,6 +2309,7 @@ mod diary_summary_tests {
             &[],
             &drawer_id,
             &over_limit,
+            datetime!(2026-06-01 10:00:00 UTC),
             datetime!(2026-06-01 10:00:00 UTC),
         );
         assert!(

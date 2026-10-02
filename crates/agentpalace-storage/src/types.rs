@@ -375,6 +375,20 @@ pub trait DrawerStore: Send + Sync {
     async fn search_drawers(&self, request: &SearchRequest) -> Result<Vec<DrawerMatch>>;
     async fn list_drawers(&self, filter: &DrawerFilter) -> Result<Vec<DrawerRecord>>;
 
+    /// Atomically replace the stored row whose id equals `drawer.id`.
+    ///
+    /// Returns `Ok(false)` when no such row exists; never inserts. Unlike
+    /// [`DuplicateStrategy::Overwrite`], which deletes and re-adds in two
+    /// steps, an implementation must make the replacement a single write so a
+    /// failure cannot leave the row missing. The default refuses, so stores
+    /// that cannot guarantee that do not silently fall back to delete-and-add.
+    async fn replace_drawer(&self, drawer: &DrawerRecord) -> Result<bool> {
+        let _ = drawer;
+        Err(crate::StorageError::Invariant(
+            "this drawer store does not support atomic replacement".to_owned(),
+        ))
+    }
+
     /// Exact counts by wing and room, ignoring `filter.limit`. Implementations
     /// should stream projected metadata rather than materialize drawer bodies.
     async fn count_by_wing_room(

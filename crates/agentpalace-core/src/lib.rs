@@ -6,6 +6,7 @@ mod error;
 pub mod hash;
 mod ids;
 pub mod locator;
+pub mod near_duplicate;
 mod profiles;
 pub mod provenance;
 mod search;
@@ -30,7 +31,8 @@ pub use provenance::{
     reject_payload_owner_claim,
 };
 pub use search::{
-    DrawerRecord, RepositoryViewMetadata, SearchQuery, SearchResult, compare_layer_drawers,
+    DrawerRecord, Freshness, MINED_INGEST_MODES, RepositoryViewMetadata, SearchQuery,
+    SearchResult, compare_layer_drawers, is_mined_ingest_mode,
 };
 
 /// Version embedded in release binaries.

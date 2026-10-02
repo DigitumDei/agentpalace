@@ -1,11 +1,15 @@
 {
   "mempalace_add_drawer": {
-    "description": "File verbatim content into the palace. Checks for duplicates first.",
+    "description": "File verbatim content into the palace. Checks for duplicates first: an exact copy is always refused; a near-duplicate (paraphrase or near-copy) is refused unless `allow_near_duplicate` is true; a new run of a recurring snapshot (same template, changed numbers, or same source label at least 6h later) is filed and listed under `similar`.",
     "input_schema": {
       "properties": {
         "added_by": {
           "description": "Who is filing this (default: mcp)",
           "type": "string"
+        },
+        "allow_near_duplicate": {
+          "description": "File even when a near-duplicate exists (never overrides an exact duplicate). Default false.",
+          "type": "boolean"
         },
         "content": {
           "description": "Verbatim content to store — exact words, never summarized",
@@ -37,7 +41,7 @@
     }
   },
   "mempalace_check_duplicate": {
-    "description": "Check if content already exists in the palace before filing",
+    "description": "Check if content already exists in the palace before filing. Each match carries `relation`: `exact` (identical content), `series_update` (same template with changed numbers, such as a new run of a status snapshot; not a duplicate) or `near_duplicate` (a paraphrase or near-copy), plus `filed_at`. `is_duplicate` is true only for exact and near-duplicate matches.",
     "input_schema": {
       "properties": {
         "content": {
@@ -52,6 +56,14 @@
       "required": [
         "content"
       ],
+      "type": "object"
+    }
+  },
+  "mempalace_coordination_wings": {
+    "description": "Discover coordination task wings known locally from coordination tasks and audit events, plus configured coordination routes and the effective default. Each entry reports the destination where a newly created task would be written (`local` or `remote:<name>`), whether it is the default, and provenance (`configured`, `in_use`, and/or `built_in`). The legacy `wing_unscoped` wing is excluded because it is not a coordination task wing. This is local discovery; it does not query a remote wing catalog.",
+    "input_schema": {
+      "properties": {},
+      "required": [],
       "type": "object"
     }
   },
@@ -91,7 +103,7 @@
           "type": "integer"
         },
         "since": {
-          "description": "Return entries filed at or after this RFC 3339 timestamp (optional, default: 24 hours ago)",
+          "description": "Return entries last written (filed or updated) at or after this RFC 3339 timestamp (optional, default: 24 hours ago)",
           "type": "string"
         },
         "topic": {
@@ -422,14 +434,6 @@
       "type": "object"
     }
   },
-  "mempalace_coordination_wings": {
-    "description": "Discover coordination task wings known locally from coordination tasks and audit events, plus configured coordination routes and the effective default. Each entry reports the destination where a newly created task would be written (`local` or `remote:<name>`), whether it is the default, and provenance (`configured`, `in_use`, and/or `built_in`). The legacy `wing_unscoped` wing is excluded because it is not a coordination task wing. This is local discovery; it does not query a remote wing catalog.",
-    "input_schema": {
-      "properties": {},
-      "required": [],
-      "type": "object"
-    }
-  },
   "mempalace_list_rooms": {
     "description": "List rooms within a wing (or all rooms if no wing given). When federation is active, includes `wing_availability` (drawer routing) and `coordination_availability` (task placement: local or remote) per wing.",
     "input_schema": {
@@ -518,12 +522,21 @@
     }
   },
   "mempalace_search": {
-    "description": "Semantic search. Returns verbatim drawer content with similarity scores. Results from mined files include `stale: true` when the source file changed since mining. Remote results also include the server's redacted `provenance` (authenticated creator/submitter owner ID and email-at-write) when available. Use `view` to scope to a specific branch view (e.g. 'feature-x'), 'canonical' for the default branch, or 'full' for every stored repository view.",
+    "description": "Semantic search. Returns verbatim drawer content with similarity scores. Each result carries `filed_at` (UTC, when the drawer was written to the palace; for mined rows, `ingest_mode` projects/convos, it is the mining time), `date` when an authored or event date was recorded, and `ingest_mode`; the response carries `retrieved_at`. Age is context, not proof: an old drawer can still be true and a newer one is not assumed to supersede it. `stale: true` means a mined source file changed since mining, which is separate from age. `prefer` sets how much age weighs in ranking; `similarity` is never changed by it. Remote results also include the server's redacted `provenance` (authenticated creator/submitter owner ID and email-at-write) when available. Use `view` to scope to a specific branch view (e.g. 'feature-x'), 'canonical' for the default branch, or 'full' for every stored repository view.",
     "input_schema": {
       "properties": {
         "limit": {
           "description": "Max results (default 5)",
           "type": "integer"
+        },
+        "prefer": {
+          "description": "Use `recent` when asking for the latest or current state of something filed repeatedly, such as status snapshots or run reports; `relevant` for pure semantic order; omit for the palace default. Newer drawers get a bounded ranking boost (at most 0.05 balanced, 0.20 recent); mined, locator-backed and diary drawers never do.",
+          "enum": [
+            "relevant",
+            "balanced",
+            "recent"
+          ],
+          "type": "string"
         },
         "query": {
           "description": "What to search for",

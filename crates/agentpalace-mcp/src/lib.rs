@@ -24,8 +24,9 @@ use agentpalace_config::{
 };
 use agentpalace_core::{
     DIARY_HALL, DIARY_ROOM, DIARY_SUMMARY_MAX_CHARS, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord,
-    EmbeddingProfile, RoomId, SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
+    EmbeddingProfile, Freshness, RoomId, SHARED_AGENT_DIARY_WING, SearchQuery, WingId,
 };
+use agentpalace_core::near_duplicate::{DuplicateCandidate, IncomingDrawer, classify_duplicate};
 use agentpalace_embeddings::{
     EmbeddingError, EmbeddingProvider, EmbeddingRequest, FastembedProvider,
     FastembedProviderConfig, env_flag,
@@ -117,7 +118,7 @@ use replication::expect_applied;
 //   stays `LocalOnly` below.
 //
 // **Always local — never federated:**
-//   DiaryWrite, DiaryRead, WakeUp, GetChangesSince, Traverse, FindTunnels,
+//   DiaryWrite, DiaryRead, DiaryUpdate, WakeUp, GetChangesSince, Traverse, FindTunnels,
 //   GraphStats, IdentityRead, IdentityUpdate, LineageSet,
 //   SelfObservationPropose, SelfObservationReview, IdentityPacket,
 //   MigrationRecord, GetAaaKSpec, CoordinationEventGet. Skill and delegation
@@ -285,6 +286,7 @@ enum ToolName {
     DeleteDrawer,
     DiaryWrite,
     DiaryRead,
+    DiaryUpdate,
     GetChangesSince,
     IdentityRead,
     IdentityUpdate,
@@ -336,7 +338,7 @@ enum ToolName {
 }
 
 impl ToolName {
-    fn all() -> [Self; 71] {
+    fn all() -> [Self; 72] {
         [
             Self::WakeUp,
             Self::Status,
@@ -361,6 +363,7 @@ impl ToolName {
             Self::DeleteDrawer,
             Self::DiaryWrite,
             Self::DiaryRead,
+            Self::DiaryUpdate,
             Self::GetChangesSince,
             Self::IdentityRead,
             Self::IdentityUpdate,
@@ -437,6 +440,7 @@ impl ToolName {
             Self::DeleteDrawer => "agentpalace_delete_drawer",
             Self::DiaryWrite => "agentpalace_diary_write",
             Self::DiaryRead => "agentpalace_diary_read",
+            Self::DiaryUpdate => "agentpalace_diary_update",
             Self::GetChangesSince => "agentpalace_get_changes_since",
             Self::IdentityRead => "agentpalace_identity_read",
             Self::IdentityUpdate => "agentpalace_identity_update",
@@ -643,7 +647,7 @@ impl ToolName {
             },
             Self::Search => ToolDefinition {
                 name: self.as_str(),
-                description: "Semantic search. Returns verbatim drawer content with similarity scores. Results from mined files include `stale: true` when the source file changed since mining. Remote results also include the server's redacted `provenance` (authenticated creator/submitter owner ID and email-at-write) when available. Use `view` to scope to a specific branch view (e.g. 'feature-x'), 'canonical' for the default branch, or 'full' for every stored repository view.",
+                description: "Semantic search. Returns verbatim drawer content with similarity scores. Each result carries `filed_at` (UTC, when the drawer was written to the palace; for mined rows, `ingest_mode` projects/convos, it is the mining time), `date` when an authored or event date was recorded, and `ingest_mode`; the response carries `retrieved_at`. Age is context, not proof: an old drawer can still be true and a newer one is not assumed to supersede it. `stale: true` means a mined source file changed since mining, which is separate from age. `prefer` sets how much age weighs in ranking; `similarity` is never changed by it. Remote results also include the server's redacted `provenance` (authenticated creator/submitter owner ID and email-at-write) when available. Use `view` to scope to a specific branch view (e.g. 'feature-x'), 'canonical' for the default branch, or 'full' for every stored repository view.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -651,14 +655,15 @@ impl ToolName {
                         "limit":{"type":"integer","description":"Max results (default 5)"},
                         "wing":{"type":"string","description":"Filter by wing (optional)"},
                         "room":{"type":"string","description":"Filter by room (optional)"},
-                        "view":{"type":"string","description":"Scope to a named branch view or 'canonical' (optional)"}
+                        "view":{"type":"string","description":"Scope to a named branch view or 'canonical' (optional)"},
+                        "prefer":{"type":"string","enum":["relevant","balanced","recent"],"description":"Use `recent` when asking for the latest or current state of something filed repeatedly, such as status snapshots or run reports; `relevant` for pure semantic order; omit for the palace default. Newer drawers get a bounded ranking boost (at most 0.05 balanced, 0.20 recent); mined, locator-backed and diary drawers never do."}
                     },
                     "required":["query"]
                 }),
             },
             Self::CheckDuplicate => ToolDefinition {
                 name: self.as_str(),
-                description: "Check if content already exists in the palace before filing",
+                description: "Check if content already exists in the palace before filing. Each match carries `relation`: `exact` (identical content), `series_update` (same template with changed numbers, such as a new run of a status snapshot; not a duplicate) or `near_duplicate` (a paraphrase or near-copy), plus `filed_at`. `is_duplicate` is true only for exact and near-duplicate matches.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -670,7 +675,7 @@ impl ToolName {
             },
             Self::AddDrawer => ToolDefinition {
                 name: self.as_str(),
-                description: "File verbatim content into the palace. Checks for duplicates first.",
+                description: "File verbatim content into the palace. Checks for duplicates first: an exact copy is always refused; a near-duplicate (paraphrase or near-copy) is refused unless `allow_near_duplicate` is true; a new run of a recurring snapshot (same template, changed numbers, or same source label at least 6h later) is filed and listed under `similar`.",
                 input_schema: json!({
                     "type":"object",
                     "properties":{
@@ -679,7 +684,8 @@ impl ToolName {
                         "content":{"type":"string","description":"Verbatim content to store — exact words, never summarized"},
                         "source_file":{"type":"string","description":"Where this came from (optional)"},
                         "added_by":{"type":"string","description":"Who is filing this (default: mcp)"},
-                        "operation_id":{"type":"string","description":"Stable idempotency key for a remote or durable dual-write retry (optional)"}
+                        "operation_id":{"type":"string","description":"Stable idempotency key for a remote or durable dual-write retry (optional)"},
+                        "allow_near_duplicate":{"type":"boolean","description":"File even when a near-duplicate exists (never overrides an exact duplicate). Default false."}
                     },
                     "required":["wing","room","content"]
                 }),
@@ -712,6 +718,20 @@ impl ToolName {
                     "required":["agent_name","entry","summary"]
                 }),
             },
+            Self::DiaryUpdate => ToolDefinition {
+                name: self.as_str(),
+                description: "Replace the body and/or summary of an existing diary entry in place. The entry ID, author, wing, topic and filed_at are preserved, and the server records `last_updated_at` (callers never supply timestamps). Only the original author can update an entry. Use it to keep one living entry per session: diary_write at the first checkpoint, then diary_update with the returned entry_id. Always local; never federated.",
+                input_schema: json!({
+                    "type":"object",
+                    "properties":{
+                        "entry_id":{"type":"string","description":"The entry_id returned by diary_write"},
+                        "agent_name":{"type":"string","description":"Your name; must match the entry's author"},
+                        "entry":{"type":"string","description":"New full body; replaces the old body (optional)"},
+                        "summary":{"type":"string","description":"New summary of at most 400 characters (optional)"}
+                    },
+                    "required":["entry_id","agent_name"]
+                }),
+            },
             Self::DiaryRead => ToolDefinition {
                 name: self.as_str(),
                 description: "Read complete diary entries by entry_id for full detail, or list recent entries with filters. Always local; never federated.",
@@ -722,7 +742,7 @@ impl ToolName {
                         "wing":{"type":"string","description":"Filter by wing (optional, default: all wings)"},
                         "topic":{"type":"string","description":"Filter by topic tag (optional, default: all topics)"},
                         "entry_id":{"type":"string","description":"Retrieve the complete entry for this wake-up entry identifier"},
-                        "since":{"type":"string","description":"Return entries filed at or after this RFC 3339 timestamp (optional, default: 24 hours ago)"},
+                        "since":{"type":"string","description":"Return entries last written (filed or updated) at or after this RFC 3339 timestamp (optional, default: 24 hours ago)"},
                         "last_n":{"type":"integer","description":"Number of recent entries to read (default: 10)"}
                     }
                 }),
@@ -1109,6 +1129,7 @@ impl ToolName {
             | Self::RemoteAuthStatus
             | Self::DiaryWrite
             | Self::DiaryRead
+            | Self::DiaryUpdate
             | Self::GetChangesSince
             | Self::Traverse
             | Self::FindTunnels
@@ -1564,6 +1585,7 @@ where
                     ToolName::GetAaaKSpec => runtime.tool_get_aaak_spec().await,
                     ToolName::DiaryWrite => runtime.tool_diary_write(&arguments).await,
                     ToolName::DiaryRead => runtime.tool_diary_read(&arguments).await,
+                    ToolName::DiaryUpdate => runtime.tool_diary_update(&arguments).await,
                     ToolName::GetChangesSince => {
                         runtime.tool_get_changes_since(&arguments).await
                     }
@@ -1889,7 +1911,14 @@ where
         let mut runtime = Self {
             search: SearchRuntime::with_policy(
                 provider,
-                SearchRuntimePolicy { rerank_enabled: config.low_cpu.effective_rerank_enabled() },
+                SearchRuntimePolicy {
+                    rerank_enabled: config.low_cpu.effective_rerank_enabled(),
+                    freshness: agentpalace_search::FreshnessPolicy {
+                        default: config.search.freshness_default,
+                        half_life_hours: config.search.half_life_hours,
+                        no_lift_rooms: config.search.no_lift_rooms.clone(),
+                    },
+                },
             ),
             config,
             bound_lineage_id,
@@ -3145,6 +3174,18 @@ where
         let room =
             optional_string(arguments, "room")?.map(|value| parse_room_id(&value)).transpose()?;
         let view = optional_string(arguments, "view")?;
+        let prefer = optional_string(arguments, "prefer")?
+            .map(|value| {
+                Freshness::parse(&value).ok_or_else(|| {
+                    ToolError::InvalidParams(format!(
+                        "prefer must be one of relevant, balanced, recent; got `{value}`"
+                    ))
+                })
+            })
+            .transpose()?;
+        // Resolve once so every origin ranks with the caller's intent.
+        let freshness = prefer.unwrap_or(self.config.search.freshness_default);
+        let retrieved_at = format_rfc3339(OffsetDateTime::now_utc())?;
 
         // ── Federation path ──
         if let Some(router) = &self.federation {
@@ -3170,6 +3211,7 @@ where
                                     limit: candidate_limit,
                                     profile: self.config.embedding_profile,
                                     view: view.clone(),
+                                    freshness: Some(freshness),
                                 },
                             )
                             .await
@@ -3192,6 +3234,7 @@ where
                                 if let Some(ref v) = result.view {
                                     obj["view"] = json!(v);
                                 }
+                                insert_temporal_fields(&mut obj, &result);
                                 obj
                             })
                             .collect()
@@ -3207,6 +3250,7 @@ where
                             view.as_deref(),
                             candidate_limit,
                             &remote_targets,
+                            freshness,
                         )
                         .await?;
                     let candidate_count = payload["results"].as_array().map_or(0, Vec::len);
@@ -3222,6 +3266,8 @@ where
                         if let Some(results) = payload["results"].as_array_mut() {
                             results.truncate(limit);
                         }
+                        payload["prefer"] = json!(freshness.as_str());
+                        payload["retrieved_at"] = json!(retrieved_at);
                         return Ok(payload);
                     }
                     candidate_limit = candidate_limit.saturating_mul(2).min(max_candidate_limit);
@@ -3240,6 +3286,7 @@ where
                     limit,
                     profile: self.config.embedding_profile,
                     view: view.clone(),
+                    freshness: Some(freshness),
                 },
             )
             .await
@@ -3252,8 +3299,11 @@ where
                 "room": room.as_ref().map(|value| value.to_string()),
                 "view": view,
             },
+            "prefer": freshness.as_str(),
+            "retrieved_at": retrieved_at,
             "results": results.into_iter().map(|result| {
                 let mut obj = json!({
+                    "drawer_id": result.drawer_id,
                     "wing": result.wing,
                     "room": result.room,
                     "similarity": round_similarity(result.score),
@@ -3266,6 +3316,7 @@ where
                 if let Some(ref v) = result.view {
                     obj["view"] = json!(v);
                 }
+                insert_temporal_fields(&mut obj, &result);
                 obj
             }).collect::<Vec<_>>()
         });
@@ -3329,7 +3380,7 @@ where
         let content = required_string(arguments, "content")?;
         let threshold =
             optional_f32(arguments, "threshold")?.unwrap_or(DEFAULT_DUPLICATE_THRESHOLD);
-        let mut matches = self.find_duplicates(&content, threshold).await?;
+        let mut matches = self.find_duplicates(&content, threshold, None, None).await?;
 
         // ── Federation path ──
         if let Some(router) = &self.federation {
@@ -3338,7 +3389,7 @@ where
         }
 
         Ok(json!({
-            "is_duplicate": !matches.is_empty(),
+            "is_duplicate": matches.iter().any(|entry| duplicate_match_blocks(entry, false)),
             "matches": matches,
         }))
     }
@@ -3350,6 +3401,7 @@ where
         let source_file = optional_string(arguments, "source_file")?.unwrap_or_default();
         let added_by = optional_string(arguments, "added_by")?.unwrap_or_else(|| "mcp".to_owned());
         let requested_operation_id = optional_string(arguments, "operation_id")?;
+        let allow_near_duplicate = optional_bool(arguments, "allow_near_duplicate")?.unwrap_or(false);
         let content_hash = hash_text(&content);
 
         // ── Resolve federation route once, reuse for dual-write decisions ──
@@ -3379,6 +3431,7 @@ where
                             route,
                             DEFAULT_DUPLICATE_THRESHOLD,
                             requested_operation_id.as_deref(),
+                            allow_near_duplicate,
                         )
                         .await?
                     {
@@ -3410,7 +3463,17 @@ where
         }
 
         let duplicates_started = std::time::Instant::now();
-        let duplicates = self.find_duplicates(&content, DEFAULT_DUPLICATE_THRESHOLD).await?;
+        let (duplicates, similar): (Vec<Value>, Vec<Value>) = self
+            .find_duplicates(
+                &content,
+                DEFAULT_DUPLICATE_THRESHOLD,
+                Some(wing.as_str()),
+                (!source_file.is_empty()).then_some(source_file.as_str()),
+            )
+            .await?
+            .into_iter()
+            .filter(|entry| duplicate_match_blocks(entry, allow_near_duplicate) || is_series_match(entry))
+            .partition(|entry| duplicate_match_blocks(entry, allow_near_duplicate));
         self.metrics.record("duplicate_search", duplicates_started.elapsed());
         if !duplicates.is_empty() {
             // ── Both-mode: same wing+room → retry, reuse local, retry remote ──
@@ -3466,6 +3529,7 @@ where
                                     added_by: Some(added_by.clone()),
                                     drawer_id: Some(existing_drawer_id.to_owned()),
                                     operation_id: None,
+                                    allow_near_duplicate,
                                 },
                             },
                         )
@@ -3495,11 +3559,18 @@ where
                     return Ok(result);
                 }
             }
-            return Ok(json!({
+            let mut refusal = json!({
                 "success": false,
                 "reason": "duplicate",
                 "matches": duplicates,
-            }));
+            });
+            // Only a near-duplicate can be overridden; an exact copy cannot.
+            if !allow_near_duplicate
+                && duplicates.iter().any(|entry| entry["relation"] == "near_duplicate")
+            {
+                refusal["hint"] = json!("allow_near_duplicate");
+            }
+            return Ok(refusal);
         }
 
         let now = OffsetDateTime::now_utc();
@@ -3561,6 +3632,7 @@ where
                             added_by: Some(added_by.clone()),
                             drawer_id: Some(drawer_id.as_str().to_owned()),
                             operation_id: None,
+                            allow_near_duplicate,
                         },
                     },
                 )
@@ -3631,6 +3703,10 @@ where
             if let Some(obj) = result.as_object_mut() {
                 obj.insert("applied_to".to_owned(), json!("local"));
             }
+        }
+        // Earlier runs of the same series, so the caller knows it filed into one.
+        if !similar.is_empty() {
+            result["similar"] = json!(similar);
         }
 
         if let Some(staged) = staged {
@@ -3927,7 +4003,14 @@ where
             })
             .await
             .map_tool()?;
-        drawers.retain(|drawer| diary_entry_matches(drawer, &filters));
+        drawers.retain(|drawer| drawer.ingest_mode == "diary");
+        // An entry spans filed_at..last_updated_at; it is in the window when that
+        // span reaches into it, and its recency is its last update.
+        let last_updated = self.diary_last_updated(&drawers)?;
+        let updated_at = |drawer: &DrawerRecord| {
+            last_updated.get(&drawer.id).copied().unwrap_or(drawer.filed_at)
+        };
+        drawers.retain(|drawer| diary_entry_matches(drawer, updated_at(drawer), &filters));
 
         if drawers.is_empty() {
             return Ok(json!({
@@ -3941,12 +4024,17 @@ where
             }));
         }
 
-        drawers.sort_by(|left, right| right.filed_at.cmp(&left.filed_at));
+        drawers.sort_by(|left, right| {
+            updated_at(right).cmp(&updated_at(left)).then_with(|| right.filed_at.cmp(&left.filed_at))
+        });
         let total = drawers.len();
         let entries = drawers
             .into_iter()
             .take(filters.last_n)
-            .map(|drawer| render_diary_entry(drawer, true, None))
+            .map(|drawer| {
+                let updated = updated_at(&drawer);
+                render_diary_entry(drawer, true, None, Some(updated))
+            })
             .collect::<ToolResult<Vec<_>>>()?;
 
         Ok(json!({
@@ -3966,29 +4054,15 @@ where
         entry_id: DrawerId,
         filters: &DiaryReadFilters,
     ) -> ToolResult<Value> {
-        let drawer = self.storage.drawer_store().get_drawer(&entry_id).await.map_tool()?;
-
-        let Some(drawer) = drawer else {
-            return Ok(json!({
-                "entry_id": entry_id.as_str(),
-                "message": "Diary entry not found.",
-            }));
+        let drawer = match self.load_diary_drawer(&entry_id).await? {
+            Ok(drawer) => drawer,
+            Err(message) => {
+                return Ok(json!({
+                    "entry_id": entry_id.as_str(),
+                    "message": message,
+                }));
+            }
         };
-
-        let diary_room = parse_room_id(DIARY_ROOM)?;
-        if drawer.room != diary_room {
-            return Ok(json!({
-                "entry_id": entry_id.as_str(),
-                "message": "Diary entry not found.",
-            }));
-        }
-
-        if drawer.ingest_mode != "diary" {
-            return Ok(json!({
-                "entry_id": entry_id.as_str(),
-                "message": "Entry is not a diary entry.",
-            }));
-        }
 
         if let Some(agent_name) = filters.agent_name.as_deref() {
             if drawer.added_by != agent_name {
@@ -4015,7 +4089,164 @@ where
             }
         }
 
-        render_diary_entry(drawer, true, None)
+        let updated =
+            self.diary_last_updated(std::slice::from_ref(&drawer))?.get(&drawer.id).copied();
+        render_diary_entry(drawer, true, None, updated)
+    }
+
+    /// Load a diary entry by id, or the refusal message for an id that does
+    /// not name one. Shared by `diary_read` and `diary_update` so the two never
+    /// disagree about what counts as a diary entry.
+    async fn load_diary_drawer(
+        &self,
+        entry_id: &DrawerId,
+    ) -> ToolResult<std::result::Result<DrawerRecord, &'static str>> {
+        let Some(drawer) = self.storage.drawer_store().get_drawer(entry_id).await.map_tool()?
+        else {
+            return Ok(Err("Diary entry not found."));
+        };
+        if drawer.room.as_str() != DIARY_ROOM {
+            return Ok(Err("Diary entry not found."));
+        }
+        if drawer.ingest_mode != "diary" {
+            return Ok(Err("Entry is not a diary entry."));
+        }
+        Ok(Ok(drawer))
+    }
+
+    /// Recorded `last_updated_at` per entry; entries missing from the map were
+    /// never updated (or predate the column) and read as their `filed_at`.
+    fn diary_last_updated(
+        &self,
+        drawers: &[DrawerRecord],
+    ) -> ToolResult<HashMap<DrawerId, OffsetDateTime>> {
+        let ids: Vec<DrawerId> = drawers.iter().map(|drawer| drawer.id.clone()).collect();
+        Ok(self
+            .storage
+            .operational_store()
+            .get_diary_last_updated(&ids)
+            .map_tool()?
+            .into_iter()
+            .collect())
+    }
+
+    async fn tool_diary_update(&mut self, arguments: &Value) -> ToolResult<Value> {
+        let entry_id = parse_drawer_id(&required_string(arguments, "entry_id")?)?;
+        let agent_name = required_string(arguments, "agent_name")?;
+        let entry = optional_string(arguments, "entry")?;
+        let summary = optional_string(arguments, "summary")?;
+        if entry.is_none() && summary.is_none() {
+            return Err(ToolError::InvalidParams(
+                "diary_update requires `entry`, `summary`, or both".to_owned(),
+            ));
+        }
+        if let Some(summary) = summary.as_deref() {
+            validate_diary_summary(summary)?;
+        }
+
+        let refusal = |message: &str| {
+            json!({ "success": false, "entry_id": entry_id.as_str(), "error": message })
+        };
+        let drawer = match self.load_diary_drawer(&entry_id).await? {
+            Ok(drawer) => drawer,
+            Err(message) => return Ok(refusal(message)),
+        };
+        if drawer.added_by != agent_name {
+            return Ok(refusal("Diary entry not found for this agent."));
+        }
+
+        let content_changed =
+            entry.as_deref().is_some_and(|entry| hash_text(entry) != drawer.content_hash);
+        let summary_changed = summary.is_some();
+        let topic = diary_entry_topic(&drawer).to_owned();
+        let wing = drawer.wing.as_str().to_owned();
+        let stored_summary = self
+            .storage
+            .operational_store()
+            .get_diary_summary(&entry_id)
+            .map_tool()?;
+        if !content_changed && !summary_changed {
+            // Identical body and no summary: nothing to write, nothing to log.
+            let updated =
+                self.diary_last_updated(std::slice::from_ref(&drawer))?.get(&entry_id).copied();
+            return Ok(json!({
+                "success": true,
+                "entry_id": entry_id.as_str(),
+                "agent": agent_name,
+                "topic": topic,
+                "wing": wing,
+                "timestamp": format_rfc3339(drawer.filed_at)?,
+                "last_updated_at": format_rfc3339(updated.unwrap_or(drawer.filed_at))?,
+                "summary": stored_summary.unwrap_or_else(|| legacy_diary_summary(&drawer.content)),
+                "content_changed": false,
+                "summary_changed": false,
+            }));
+        }
+
+        let previous_content_hash = drawer.content_hash.clone();
+        let fallback_summary = legacy_diary_summary(entry.as_deref().unwrap_or(&drawer.content));
+        let rebuilt = match entry.filter(|_| content_changed) {
+            Some(body) => {
+                // Same id and filing metadata; only the body and its embedding change.
+                let mut record = self
+                    .build_drawer_record(
+                        drawer.id.clone(),
+                        drawer.wing.clone(),
+                        drawer.room.clone(),
+                        drawer.hall.clone(),
+                        drawer.date,
+                        drawer.source_file.clone(),
+                        drawer.added_by.clone(),
+                        drawer.ingest_mode.clone(),
+                        body,
+                        drawer.filed_at,
+                    )
+                    .await?;
+                record.locator = drawer.locator.clone();
+                record.view_metadata = drawer.view_metadata.clone();
+                record.provenance = drawer.provenance.clone();
+                Some(record)
+            }
+            None => None,
+        };
+        let now = OffsetDateTime::now_utc();
+        self.storage
+            .update_diary_entry(rebuilt, &entry_id, summary.as_deref(), &fallback_summary, now)
+            .await
+            .map_tool()?;
+
+        self.log_change(ChangeEvent {
+            event_type: "diary_updated".to_owned(),
+            occurred_at: now,
+            entity_id: entry_id.as_str().to_owned(),
+            actor: Some(agent_name.clone()),
+            details_json: Some(
+                json!({
+                    "wing": wing,
+                    "topic": topic,
+                    "previous_content_hash": previous_content_hash,
+                    "content_changed": content_changed,
+                    "summary_changed": summary_changed,
+                })
+                .to_string(),
+            ),
+        });
+
+        let current_summary = summary
+            .or(stored_summary)
+            .unwrap_or(fallback_summary);
+        Ok(json!({
+            "success": true,
+            "entry_id": entry_id.as_str(),
+            "agent": agent_name,
+            "topic": topic,
+            "wing": wing,
+            "timestamp": format_rfc3339(drawer.filed_at)?,
+            "last_updated_at": format_rfc3339(now)?,
+            "summary": current_summary,
+            "content_changed": content_changed,
+            "summary_changed": summary_changed,
+        }))
     }
 
     async fn wake_up_diary_payload(
@@ -4032,12 +4263,20 @@ where
             .await
             .map_tool()?;
         drawers.retain(|drawer| drawer.ingest_mode == "diary");
-        drawers.sort_by(|left, right| right.filed_at.cmp(&left.filed_at));
+        // Order and window by the entry's last update, so a long-running session
+        // updated this morning is listed first even if it started yesterday.
+        let last_updated = self.diary_last_updated(&drawers)?;
+        let updated_at = |drawer: &DrawerRecord| {
+            last_updated.get(&drawer.id).copied().unwrap_or(drawer.filed_at)
+        };
+        drawers.sort_by(|left, right| {
+            updated_at(right).cmp(&updated_at(left)).then_with(|| right.filed_at.cmp(&left.filed_at))
+        });
 
         let entries = drawers
             .into_iter()
             .scan(0usize, |shown, drawer| {
-                if drawer.filed_at < since && *shown >= minimum_entries {
+                if updated_at(&drawer) < since && *shown >= minimum_entries {
                     None
                 } else {
                     *shown += 1;
@@ -4063,7 +4302,8 @@ where
                     .get(&drawer.id)
                     .cloned()
                     .unwrap_or_else(|| legacy_diary_summary(&drawer.content));
-                render_diary_entry(drawer, true, Some(summary))
+                let updated = updated_at(&drawer);
+                render_diary_entry(drawer, true, Some(summary), Some(updated))
             })
             .collect::<ToolResult<Vec<_>>>()?;
 
@@ -4562,7 +4802,19 @@ where
         derive_palace_graph_from_store(self.storage.drawer_store()).await.map_tool_internal()
     }
 
-    async fn find_duplicates(&mut self, content: &str, threshold: f32) -> ToolResult<Vec<Value>> {
+    /// Semantic matches at or above `threshold`, each classified against the
+    /// incoming drawer (see [`agentpalace_core::near_duplicate`]).
+    ///
+    /// `wing` and `source_file` describe the incoming drawer; without them only
+    /// the content-based rules apply (as for `check_duplicate`). Freshness never
+    /// affects this check: it uses pure semantic search.
+    async fn find_duplicates(
+        &mut self,
+        content: &str,
+        threshold: f32,
+        wing: Option<&str>,
+        source_file: Option<&str>,
+    ) -> ToolResult<Vec<Value>> {
         // Duplicate prevention is a write-path correctness check, so keep a fixed semantic
         // search window instead of applying low-CPU UX caps or rerank score blending.
         let query = SearchQuery {
@@ -4572,28 +4824,63 @@ where
             limit: DUPLICATE_SEARCH_LIMIT,
             profile: self.config.embedding_profile,
             view: None,
+            freshness: None,
         };
         let results =
             self.search.search_semantic(self.storage.drawer_store(), &query).await.map_tool()?;
-        Ok(results
-            .into_iter()
-            .filter(|result| result.score >= threshold)
-            .map(|result| {
-                let snippet = if result.content.chars().count() > 200 {
-                    format!("{}...", result.content.chars().take(200).collect::<String>())
-                } else {
-                    result.content
-                };
-                json!({
-                    "id": result.drawer_id,
-                    "wing": result.wing,
-                    "room": result.room,
-                    "similarity": round_similarity(result.score),
-                    "content": snippet,
-                    "content_hash": result.content_hash,
-                })
-            })
-            .collect())
+        let incoming_hash = hash_text(content);
+        let incoming = IncomingDrawer {
+            content,
+            content_hash: &incoming_hash,
+            wing,
+            source_file,
+            now: OffsetDateTime::now_utc(),
+        };
+        let mut matches = Vec::new();
+        for result in results.into_iter().filter(|result| result.score >= threshold) {
+            // Search results carry only the source base name; series identity
+            // needs the full stored path.
+            let full_source = match &result.drawer_id {
+                Some(id) => self
+                    .storage
+                    .drawer_store()
+                    .get_drawer(id)
+                    .await
+                    .map_tool()?
+                    .map(|record| record.source_file),
+                None => None,
+            };
+            let relation = classify_duplicate(
+                &incoming,
+                &DuplicateCandidate {
+                    content: &result.content,
+                    content_hash: result.content_hash.as_deref().unwrap_or_default(),
+                    wing: result.wing.as_str(),
+                    source_file: full_source.as_deref().unwrap_or_default(),
+                    filed_at: result.filed_at,
+                },
+            );
+            let snippet = if result.content.chars().count() > 200 {
+                format!("{}...", result.content.chars().take(200).collect::<String>())
+            } else {
+                result.content.clone()
+            };
+            let mut entry = json!({
+                "id": result.drawer_id,
+                "wing": result.wing,
+                "room": result.room,
+                "similarity": round_similarity(result.score),
+                "content": snippet,
+                "content_hash": result.content_hash,
+                "relation": relation.as_str(),
+            });
+            if let Some(reason) = relation.reason() {
+                entry["reason"] = json!(reason);
+            }
+            insert_temporal_fields(&mut entry, &result);
+            matches.push(entry);
+        }
+        Ok(matches)
     }
 
     async fn build_drawer_record(
@@ -6099,6 +6386,38 @@ fn jsonrpc_error(id: Option<Value>, code: ErrorCode, message: String) -> Value {
     })
 }
 
+fn is_series_match(entry: &Value) -> bool {
+    entry.get("relation").and_then(Value::as_str) == Some("series_update")
+}
+
+/// Whether a classified duplicate match prevents filing. A match without a
+/// `relation` comes from an older peer that cannot classify, so it blocks.
+pub(crate) fn duplicate_match_blocks(entry: &Value, allow_near_duplicate: bool) -> bool {
+    agentpalace_core::near_duplicate::relation_blocks(
+        entry.get("relation").and_then(Value::as_str),
+        allow_near_duplicate,
+    )
+}
+
+/// Add a search result's temporal context to its JSON object: `filed_at` (UTC
+/// RFC 3339, when the drawer was written; for mined rows, the mining time),
+/// `date` (authored or event date, when recorded) and `ingest_mode`. Unknown
+/// values are left out rather than invented.
+fn insert_temporal_fields(obj: &mut Value, result: &agentpalace_core::SearchResult) {
+    if let Some(filed_at) = result
+        .filed_at
+        .and_then(|value| format_rfc3339(value.to_offset(time::UtcOffset::UTC)).ok())
+    {
+        obj["filed_at"] = json!(filed_at);
+    }
+    if let Some(date) = result.date {
+        obj["date"] = json!(format_date(date));
+    }
+    if let Some(ingest_mode) = &result.ingest_mode {
+        obj["ingest_mode"] = json!(ingest_mode);
+    }
+}
+
 fn format_rfc3339(timestamp: OffsetDateTime) -> ToolResult<String> {
     timestamp
         .format(&Rfc3339)
@@ -6548,12 +6867,18 @@ fn parse_since_timestamp(value: &str) -> ToolResult<OffsetDateTime> {
     })
 }
 
-fn diary_entry_matches(drawer: &DrawerRecord, filters: &DiaryReadFilters) -> bool {
+/// `updated_at` is the entry's last update (its `filed_at` when never updated):
+/// the entry matches a `since` window when its span reaches into it.
+fn diary_entry_matches(
+    drawer: &DrawerRecord,
+    updated_at: OffsetDateTime,
+    filters: &DiaryReadFilters,
+) -> bool {
     if drawer.ingest_mode != "diary" {
         return false;
     }
     if let Some(since) = filters.since {
-        if drawer.filed_at < since {
+        if updated_at < since {
             return false;
         }
     }
@@ -6574,10 +6899,13 @@ fn diary_entry_topic(drawer: &DrawerRecord) -> &str {
     drawer.source_file.strip_prefix(DIARY_TOPIC_PREFIX).unwrap_or("general")
 }
 
+/// `last_updated_at` is shown only when the entry was updated after filing,
+/// so entries that were never updated render exactly as before.
 fn render_diary_entry(
     drawer: DrawerRecord,
     include_agent: bool,
     summary: Option<String>,
+    last_updated_at: Option<OffsetDateTime>,
 ) -> ToolResult<Value> {
     let topic = diary_entry_topic(&drawer).to_owned();
     let date = drawer.date.map(format_date).unwrap_or_else(|| drawer.filed_at.date().to_string());
@@ -6589,6 +6917,9 @@ fn render_diary_entry(
         "topic": topic,
         "entry_id": drawer.id.as_str(),
     });
+    if let Some(updated) = last_updated_at.filter(|updated| *updated != drawer.filed_at) {
+        entry["last_updated_at"] = json!(format_rfc3339(updated)?);
+    }
     if let Some(summary) = summary {
         entry["summary"] = json!(summary);
     } else {
@@ -8626,6 +8957,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_tool_emits_temporal_context_and_validates_prefer() {
+        let harness = test_harness().await;
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                4,
+                "agentpalace_search",
+                json!({"query":"auth migration parity","limit":2,"prefer":"recent"}),
+            ))
+            .await;
+        let payload = decode_tool_payload(&response).unwrap();
+        assert_eq!(payload["prefer"], "recent");
+        let retrieved_at = payload["retrieved_at"].as_str().expect("retrieved_at");
+        assert!(OffsetDateTime::parse(retrieved_at, &Rfc3339).is_ok(), "{retrieved_at}");
+        let first = &payload["results"][0];
+        assert!(first["drawer_id"].is_string(), "{first}");
+        assert_eq!(first["filed_at"], "2026-04-11T09:00:00Z", "{first}");
+        assert_eq!(first["ingest_mode"], "fixtures", "{first}");
+        assert!(first["date"].is_string(), "authored date must be shown: {first}");
+
+        // Without `prefer`, the palace default (relevant) is reported.
+        let default = harness
+            .server
+            .handle_request(tool_call(5, "agentpalace_search", json!({"query":"auth"})))
+            .await;
+        assert_eq!(decode_tool_payload(&default).unwrap()["prefer"], "relevant");
+
+        let invalid = harness
+            .server
+            .handle_request(tool_call(
+                6,
+                "agentpalace_search",
+                json!({"query":"auth","prefer":"latest"}),
+            ))
+            .await;
+        assert_eq!(invalid["error"]["code"], json!(-32602), "{invalid}");
+    }
+
+    #[tokio::test]
+    async fn add_drawer_accepts_snapshot_series_member() {
+        let harness = test_harness().await;
+        let first = harness
+            .server
+            .handle_request(tool_call(
+                10,
+                "agentpalace_add_drawer",
+                json!({"wing":"wing_ops","room":"snapshots","content":"ops snapshot web-01 cpu 40% disk 71%"}),
+            ))
+            .await;
+        assert_eq!(decode_tool_payload(&first).unwrap()["success"], true);
+
+        // Same template, new numbers: a new run of the series, not a duplicate.
+        let second = harness
+            .server
+            .handle_request(tool_call(
+                11,
+                "agentpalace_add_drawer",
+                json!({"wing":"wing_ops","room":"snapshots","content":"ops snapshot web-01 cpu 55% disk 72%"}),
+            ))
+            .await;
+        let payload = decode_tool_payload(&second).unwrap();
+        assert_eq!(payload["success"], true, "{payload}");
+        assert_eq!(payload["similar"][0]["relation"], "series_update", "{payload}");
+        assert_eq!(payload["similar"][0]["reason"], "values_changed", "{payload}");
+
+        // check_duplicate agrees: a series member is not a duplicate.
+        let check = harness
+            .server
+            .handle_request(tool_call(
+                12,
+                "agentpalace_check_duplicate",
+                json!({"content":"ops snapshot web-01 cpu 61% disk 73%"}),
+            ))
+            .await;
+        let check = decode_tool_payload(&check).unwrap();
+        assert_eq!(check["is_duplicate"], false, "{check}");
+        assert!(
+            check["matches"].as_array().unwrap().iter().all(|m| m["relation"] == "series_update"),
+            "{check}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_drawer_refuses_exact_and_near_duplicates() {
+        let harness = test_harness().await;
+        let add = |id: i64, content: &str, force: Option<bool>| {
+            let mut args = json!({"wing":"wing_ops","room":"runbooks","content":content});
+            if let Some(force) = force {
+                args["allow_near_duplicate"] = json!(force);
+            }
+            tool_call(id, "agentpalace_add_drawer", args)
+        };
+        let original = "ops runbook: restart the web tier carefully";
+        let paraphrase = "ops runbook: carefully restart the web tier";
+        let filed = harness.server.handle_request(add(20, original, None)).await;
+        assert_eq!(decode_tool_payload(&filed).unwrap()["success"], true);
+
+        let exact = decode_tool_payload(&harness.server.handle_request(add(21, original, None)).await)
+            .unwrap();
+        assert_eq!(exact["success"], false, "{exact}");
+        assert_eq!(exact["matches"][0]["relation"], "exact", "{exact}");
+        assert!(exact.get("hint").is_none(), "an exact copy cannot be forced: {exact}");
+
+        let near =
+            decode_tool_payload(&harness.server.handle_request(add(22, paraphrase, None)).await)
+                .unwrap();
+        assert_eq!(near["success"], false, "{near}");
+        assert_eq!(near["matches"][0]["relation"], "near_duplicate", "{near}");
+        assert_eq!(near["hint"], "allow_near_duplicate", "{near}");
+
+        let forced =
+            decode_tool_payload(&harness.server.handle_request(add(23, paraphrase, Some(true))).await)
+                .unwrap();
+        assert_eq!(forced["success"], true, "{forced}");
+
+        let forced_exact =
+            decode_tool_payload(&harness.server.handle_request(add(24, original, Some(true))).await)
+                .unwrap();
+        assert_eq!(forced_exact["success"], false, "{forced_exact}");
+        assert!(
+            forced_exact["matches"].as_array().unwrap().iter().any(|m| m["relation"] == "exact"),
+            "{forced_exact}"
+        );
+    }
+
+    #[tokio::test]
     async fn search_tool_resolves_locator_rows_and_marks_stale_only_when_changed() {
         let harness = test_harness().await;
 
@@ -8833,6 +9290,7 @@ mod tests {
             },
             federation: FederationRuntimeConfig::default(),
             maintenance: MaintenanceRuntimeConfig::defaults(),
+            search: agentpalace_config::SearchRuntimeConfig::defaults(),
         };
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -9683,6 +10141,256 @@ mod tests {
         let response =
             harness.server.handle_request(tool_call(5, "agentpalace_nope", json!({}))).await;
         assert_eq!(response, fixture["error"]);
+    }
+
+    async fn write_diary(harness: &TestHarness, entry: &str, summary: &str) -> String {
+        let response = harness
+            .server
+            .handle_request(tool_call(
+                800,
+                "agentpalace_diary_write",
+                json!({"agent_name":"Updater","entry":entry,"summary":summary,"topic":"living"}),
+            ))
+            .await;
+        let payload = decode_tool_payload(&response).unwrap();
+        assert_eq!(payload["success"], true, "{payload}");
+        payload["entry_id"].as_str().unwrap().to_owned()
+    }
+
+    async fn update_diary(harness: &TestHarness, args: Value) -> Value {
+        decode_tool_payload(
+            &harness.server.handle_request(tool_call(801, "agentpalace_diary_update", args)).await,
+        )
+        .unwrap()
+    }
+
+    async fn diary_change_events(harness: &TestHarness) -> Vec<Value> {
+        let changes = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(802, "agentpalace_get_changes_since", json!({"limit":200})))
+                .await,
+        )
+        .unwrap();
+        changes["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event_type"] == "diary_updated")
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn diary_update_replaces_body_and_summary_and_keeps_id() {
+        let harness = test_harness().await;
+        let first = write_diary(&harness, "plain notes v1", "first checkpoint").await;
+        let second = write_diary(&harness, "other session", "other summary").await;
+
+        let updated = update_diary(
+            &harness,
+            json!({"entry_id":first,"agent_name":"Updater","entry":"plain notes v2","summary":"second checkpoint"}),
+        )
+        .await;
+        assert_eq!(updated["success"], true, "{updated}");
+        assert_eq!(updated["entry_id"], first.as_str());
+        assert_eq!(updated["content_changed"], true);
+        assert_eq!(updated["summary_changed"], true);
+        assert_eq!(updated["topic"], "living");
+        assert_ne!(updated["timestamp"], updated["last_updated_at"], "{updated}");
+
+        let detail = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(803, "agentpalace_diary_read", json!({"entry_id":first})))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(detail["content"], "plain notes v2", "{detail}");
+        assert_eq!(detail["timestamp"], updated["timestamp"], "filed_at is preserved");
+        assert_eq!(detail["last_updated_at"], updated["last_updated_at"]);
+
+        // Wake-up lists the updated entry first, with its new summary.
+        let wake = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(804, "agentpalace_wake_up", json!({"agent_name":"Updater"})))
+                .await,
+        )
+        .unwrap();
+        let entries = wake["diary"]["entries"].as_array().or_else(|| wake["recent_diary"]["entries"].as_array());
+        let entries = entries.unwrap_or_else(|| panic!("wake-up diary entries missing: {wake}"));
+        let ids: Vec<&str> = entries.iter().filter_map(|e| e["entry_id"].as_str()).collect();
+        let first_pos = ids.iter().position(|id| *id == first).unwrap();
+        let second_pos = ids.iter().position(|id| *id == second).unwrap();
+        assert!(first_pos < second_pos, "updated entry must sort first: {ids:?}");
+        assert_eq!(entries[first_pos]["summary"], "second checkpoint");
+
+        // The new body is what search finds.
+        let search = decode_tool_payload(
+            &harness
+                .server
+                .handle_request(tool_call(
+                    805,
+                    "agentpalace_search",
+                    json!({"query":"plain notes","wing":SHARED_AGENT_DIARY_WING,"limit":10}),
+                ))
+                .await,
+        )
+        .unwrap();
+        let texts: Vec<&str> =
+            search["results"].as_array().unwrap().iter().filter_map(|r| r["text"].as_str()).collect();
+        assert!(texts.contains(&"plain notes v2"), "{texts:?}");
+        assert!(!texts.contains(&"plain notes v1"), "{texts:?}");
+
+        let events = diary_change_events(&harness).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        let details = &events[0]["details"];
+        assert_eq!(details["previous_content_hash"], hash_text("plain notes v1"), "{events:?}");
+        assert_eq!(details["content_changed"], true);
+        assert_eq!(details["summary_changed"], true);
+    }
+
+    #[tokio::test]
+    async fn diary_update_summary_only_keeps_body_and_embedding() {
+        let harness = test_harness().await;
+        let id = write_diary(&harness, "rust cli diary body", "first").await;
+        let before = {
+            let runtime = harness.server.runtime.lock().await;
+            runtime.storage.drawer_store().get_drawer(&DrawerId::new(&id).unwrap()).await.unwrap().unwrap()
+        };
+        let updated =
+            update_diary(&harness, json!({"entry_id":id,"agent_name":"Updater","summary":"second"})).await;
+        assert_eq!(updated["content_changed"], false, "{updated}");
+        assert_eq!(updated["summary_changed"], true);
+        assert_eq!(updated["summary"], "second");
+        let after = {
+            let runtime = harness.server.runtime.lock().await;
+            runtime.storage.drawer_store().get_drawer(&DrawerId::new(&id).unwrap()).await.unwrap().unwrap()
+        };
+        assert_eq!(after.content_hash, before.content_hash);
+        assert_eq!(after.embedding, before.embedding);
+    }
+
+    #[tokio::test]
+    async fn diary_update_identical_body_is_noop() {
+        let harness = test_harness().await;
+        let id = write_diary(&harness, "same body", "summary").await;
+        let updated =
+            update_diary(&harness, json!({"entry_id":id,"agent_name":"Updater","entry":"same body"})).await;
+        assert_eq!(updated["success"], true, "{updated}");
+        assert_eq!(updated["content_changed"], false);
+        assert_eq!(updated["summary_changed"], false);
+        assert_eq!(updated["summary"], "summary");
+        assert!(diary_change_events(&harness).await.is_empty(), "a no-op must not log an event");
+    }
+
+    #[tokio::test]
+    async fn diary_update_refuses_wrong_agent_missing_and_non_diary_entries() {
+        let harness = test_harness().await;
+        let id = write_diary(&harness, "guarded body", "guarded").await;
+        let wrong_agent =
+            update_diary(&harness, json!({"entry_id":id,"agent_name":"Someone Else","entry":"x"})).await;
+        assert_eq!(wrong_agent["success"], false);
+        assert_eq!(wrong_agent["error"], "Diary entry not found for this agent.");
+
+        let missing = update_diary(
+            &harness,
+            json!({"entry_id":"diary_wing_agents_diary_missing","agent_name":"Updater","entry":"x"}),
+        )
+        .await;
+        assert_eq!(missing["error"], "Diary entry not found.");
+
+        // A seeded fixture drawer outside the diary room.
+        let wrong_room = update_diary(
+            &harness,
+            json!({"entry_id":"wing_code/auth-migration/0001","agent_name":"tests","entry":"x"}),
+        )
+        .await;
+        assert_eq!(wrong_room["error"], "Diary entry not found.");
+
+        // In the diary room but not written by diary_write.
+        {
+            let runtime = harness.server.runtime.lock().await;
+            let mut drawer =
+                test_diary_drawer("not_a_diary_entry", "imported", datetime!(2026-04-11 09:00:00 UTC));
+            drawer.ingest_mode = "convos".to_owned();
+            runtime.storage.drawer_store().put_drawers(&[drawer], DuplicateStrategy::Error).await.unwrap();
+        }
+        let non_diary = update_diary(
+            &harness,
+            json!({"entry_id":"not_a_diary_entry","agent_name":"Wake Test","entry":"x"}),
+        )
+        .await;
+        assert_eq!(non_diary["error"], "Entry is not a diary entry.");
+
+        // Nothing changed.
+        let stored = {
+            let runtime = harness.server.runtime.lock().await;
+            runtime.storage.drawer_store().get_drawer(&DrawerId::new(&id).unwrap()).await.unwrap().unwrap()
+        };
+        assert_eq!(stored.content, "guarded body");
+        assert!(diary_change_events(&harness).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn diary_update_validates_arguments() {
+        let harness = test_harness().await;
+        let id = write_diary(&harness, "validated body", "summary").await;
+        let empty = harness
+            .server
+            .handle_request(tool_call(806, "agentpalace_diary_update", json!({"entry_id":id,"agent_name":"Updater"})))
+            .await;
+        assert_eq!(empty["error"]["code"], json!(-32602), "{empty}");
+
+        let too_long = harness
+            .server
+            .handle_request(tool_call(
+                807,
+                "agentpalace_diary_update",
+                json!({"entry_id":id,"agent_name":"Updater","summary":"x".repeat(401)}),
+            ))
+            .await;
+        assert_eq!(too_long["error"]["code"], json!(-32602), "{too_long}");
+
+        let multibyte = "🔥".repeat(DIARY_SUMMARY_MAX_CHARS);
+        let accepted =
+            update_diary(&harness, json!({"entry_id":id,"agent_name":"Updater","summary":multibyte})).await;
+        assert_eq!(accepted["success"], true, "{accepted}");
+    }
+
+    #[tokio::test]
+    async fn diary_since_window_includes_entries_updated_inside_it() {
+        let harness = test_harness().await;
+        let old_filed = datetime!(2026-01-01 09:00:00 UTC);
+        {
+            let runtime = harness.server.runtime.lock().await;
+            for id in ["long_session", "stale_session"] {
+                let mut drawer = test_diary_drawer(id, &format!("{id} body"), old_filed);
+                drawer.added_by = "Updater".to_owned();
+                runtime.storage.drawer_store().put_drawers(&[drawer], DuplicateStrategy::Error).await.unwrap();
+                runtime.storage.operational_store().store_diary_summary(&DrawerId::new(id).unwrap(), id).unwrap();
+            }
+        }
+        // Legacy rows have no last_updated_at and read as their filed_at, so
+        // neither is inside a recent window yet.
+        let since = (OffsetDateTime::now_utc() - Duration::hours(1)).format(&Rfc3339).unwrap();
+        let read = |id: i64| tool_call(id, "agentpalace_diary_read", json!({"agent_name":"Updater","since":since}));
+        let before = decode_tool_payload(&harness.server.handle_request(read(808)).await).unwrap();
+        assert!(before["entries"].as_array().unwrap().is_empty(), "{before}");
+
+        let updated = update_diary(
+            &harness,
+            json!({"entry_id":"long_session","agent_name":"Updater","summary":"still going"}),
+        )
+        .await;
+        assert_eq!(updated["success"], true, "{updated}");
+        let after = decode_tool_payload(&harness.server.handle_request(read(809)).await).unwrap();
+        let ids: Vec<&str> =
+            after["entries"].as_array().unwrap().iter().filter_map(|e| e["entry_id"].as_str()).collect();
+        assert_eq!(ids, vec!["long_session"], "{after}");
+        assert_eq!(after["entries"][0]["timestamp"], "2026-01-01T09:00:00Z");
+        assert!(after["entries"][0]["last_updated_at"].is_string());
     }
 
     #[tokio::test]
@@ -12867,6 +13575,7 @@ mod tests {
         assert_eq!(ToolName::WakeUp.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::DiaryWrite.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::DiaryRead.routing(), ToolRoutingCategory::LocalOnly);
+        assert_eq!(ToolName::DiaryUpdate.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::GetChangesSince.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::Traverse.routing(), ToolRoutingCategory::LocalOnly);
         assert_eq!(ToolName::FindTunnels.routing(), ToolRoutingCategory::LocalOnly);
@@ -13079,9 +13788,14 @@ mod tests {
                 harness_none_fed.server.handle_request(tool_call(2001, tool, args.clone())).await;
             let mut default_payload = decode_tool_payload(&default_resp).unwrap();
             let mut none_fed_payload = decode_tool_payload(&none_fed_resp).unwrap();
-            // Strip palace_path — each harness uses its own TempDir.
-            default_payload.as_object_mut().map(|obj| obj.remove("palace_path"));
-            none_fed_payload.as_object_mut().map(|obj| obj.remove("palace_path"));
+            // Strip palace_path — each harness uses its own TempDir — and
+            // search's retrieved_at, which is the wall clock at each call.
+            for payload in [&mut default_payload, &mut none_fed_payload] {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.remove("palace_path");
+                    obj.remove("retrieved_at");
+                }
+            }
             // The response body structures must match; wing_availability is
             // omitted when no remotes are configured.
             assert_eq!(
@@ -13523,6 +14237,8 @@ mod tests {
             added_by: None,
             provenance: None,
             stale: false,
+            date: None,
+            ingest_mode: None,
         }];
         let mut remotes: BTreeMap<String, Arc<dyn agentpalace_remote::RemoteApi>> = BTreeMap::new();
         remotes.insert("hub".to_owned(), Arc::new(remote));
@@ -14453,6 +15169,7 @@ mod tests {
                         added_by: Some("mcp".to_owned()),
                         drawer_id: Some(pinned_id.as_str().to_owned()),
                         operation_id: None,
+                        allow_near_duplicate: false,
                     },
                 },
             )
@@ -15533,6 +16250,7 @@ mod tests {
             },
             federation: FederationRuntimeConfig::default(),
             maintenance: MaintenanceRuntimeConfig::defaults(),
+            search: agentpalace_config::SearchRuntimeConfig::defaults(),
         }
     }
 }

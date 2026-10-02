@@ -6,11 +6,12 @@ use agentpalace_config::{
     FederationRuntimeConfig, ReplicationStatus, ResolvedRouteRule, RouteMode, RouteQuery,
     WriteTarget, resolve_coordination_route, resolve_kg_route, resolve_route,
 };
-use agentpalace_core::{DIARY_ROOM, DIARY_TOPIC_PREFIX, SHARED_AGENT_DIARY_WING, WingId, hash_text};
+use agentpalace_core::{DIARY_ROOM, DIARY_TOPIC_PREFIX, Freshness, SHARED_AGENT_DIARY_WING, WingId, hash_text};
 use agentpalace_federation::{
     AckMessageRequest, AddDrawerRequest, ChangesQuery, CoordinationEventsQuery,
     DrawerSearchRequest, InboxQuery, NewArtifactRequest, NewMessageRequest, NewTaskRequest,
-    NewTaskResultRequest, RemoteDrawerResult, TaskLeaseRequest, TransitionTaskRequest,
+    NewTaskResultRequest, RemoteDrawerResult, SEARCH_FRESHNESS_CAPABILITY, TaskLeaseRequest,
+    TransitionTaskRequest,
 };
 use agentpalace_remote::{
     configured_token_store, OAuthConfig, RemoteApi, RemoteClient, RemoteEndpoint, RemoteError, RemoteRevisionedWrite,
@@ -377,13 +378,15 @@ impl FederationRouter {
         view: Option<&str>,
         limit: usize,
         remote_targets: &[String],
+        prefer: Freshness,
     ) -> ToolResult<Value> {
         if remote_targets.is_empty() {
             return Ok(search_payload(query, wing, room, local_results, &[], &[]));
         }
 
         // Fan out to all target remotes concurrently.
-        let mut set: JoinSet<(String, Result<Vec<Value>, agentpalace_remote::RemoteError>)> =
+        type RemoteSearch = (Vec<Value>, Option<bool>);
+        let mut set: JoinSet<(String, Result<RemoteSearch, agentpalace_remote::RemoteError>)> =
             JoinSet::new();
         for name in remote_targets {
             let name = name.clone();
@@ -396,12 +399,15 @@ impl FederationRouter {
                 None => continue,
             };
             set.spawn(async move {
+                // The caller's resolved intent is always sent, so every upgraded
+                // origin ranks the same way regardless of its own default.
                 let req = DrawerSearchRequest {
                     query: query_str,
                     wing: wing_owned,
                     room: room_owned,
                     limit: Some(limit),
                     view: view_owned,
+                    prefer: Some(prefer.as_str().to_owned()),
                 };
                 match api.search_drawers(req).await {
                     Ok(response) => {
@@ -410,7 +416,12 @@ impl FederationRouter {
                             .into_iter()
                             .map(|r| drawer_result_to_value(r, &name))
                             .collect();
-                        (name, Ok(results))
+                        let supports_freshness = if prefer == Freshness::Relevant {
+                            None
+                        } else {
+                            api.has_capability(SEARCH_FRESHNESS_CAPABILITY).await.ok().flatten()
+                        };
+                        (name, Ok((results, supports_freshness)))
                     }
                     Err(e) => (name.clone(), Err(e)),
                 }
@@ -423,7 +434,21 @@ impl FederationRouter {
         let mut degradations: Vec<Value> = Vec::new();
         while let Some(res) = set.join_next().await {
             match res {
-                Ok((name, Ok(results))) => {
+                Ok((name, Ok((results, supports_freshness)))) => {
+                    if supports_freshness == Some(false) {
+                        // Older servers ignore `prefer` and return semantic
+                        // ranks. They are interleaved unchanged, never re-ranked
+                        // here, because scores are not comparable across origins.
+                        degradations.push(json!({
+                            "code": "freshness_unsupported",
+                            "remote": name,
+                            "kind": "search",
+                            "error": format!(
+                                "remote `{name}` does not support `prefer`; its results use semantic order"
+                            ),
+                            "classification": "capability_missing",
+                        }));
+                    }
                     remote_results_by_name.insert(name, results);
                 }
                 Ok((name, Err(error))) => {
@@ -489,6 +514,7 @@ impl FederationRouter {
             route,
             duplicate_threshold,
             None,
+            false,
         )
         .await
     }
@@ -503,6 +529,7 @@ impl FederationRouter {
         route: &ResolvedRouteRule,
         duplicate_threshold: f32,
         operation_id: Option<&str>,
+        allow_near_duplicate: bool,
     ) -> ToolResult<Option<Value>> {
         // ── Diary guard: diary-shaped drawers never write remotely ──────────
         if wing == SHARED_AGENT_DIARY_WING
@@ -550,7 +577,13 @@ impl FederationRouter {
         // duplicate and never reach the server receipt replay, recreating the ambiguous
         //-outcome incident #127 exists to fix. The preflight stays for legacy calls that
         // carry no operation id.
-        if operation_id.is_none() {
+        // A server that classifies duplicates itself (duplicate_series) decides on the add;
+        // a threshold-only preflight would refuse series updates it would accept.
+        let server_classifies = matches!(
+            api.has_capability(agentpalace_federation::DUPLICATE_SERIES_CAPABILITY).await,
+            Ok(Some(true))
+        );
+        if operation_id.is_none() && !server_classifies {
             let pre_check_req = agentpalace_federation::CheckDuplicateRequest {
                 content: content.to_owned(),
                 threshold: Some(duplicate_threshold),
@@ -589,19 +622,24 @@ impl FederationRouter {
             added_by: Some(added_by.to_owned()),
             drawer_id: None,
             operation_id: effective_operation_id.clone(),
+            allow_near_duplicate,
         };
         match api.add_drawer(req).await {
             Ok(resp) => {
                 // resp.success is true on 2xx; keep a defensive branch just in case.
                 if resp.success {
-                    Ok(Some(json!({
+                    let mut result = json!({
                         "success": true,
                         "drawer_id": resp.drawer_id,
                         "wing": resp.wing,
                         "room": resp.room,
                         "origin": remote_name,
                         "applied_to": format_remote_origin(remote_name),
-                    })))
+                    });
+                    if !resp.similar.is_empty() {
+                        result["similar"] = json!(resp.similar);
+                    }
+                    Ok(Some(result))
                 } else {
                     // Defensive: server indicated failure on 2xx (shouldn't happen in v1).
                     Ok(Some(json!({
@@ -740,6 +778,7 @@ impl FederationRouter {
             added_by: Some(added_by.to_owned()),
             drawer_id: None,
             operation_id: None,
+            allow_near_duplicate: false,
         };
         match api.add_drawer(req).await {
             Ok(resp) if resp.success => {
@@ -2785,6 +2824,17 @@ fn drawer_result_to_value(result: RemoteDrawerResult, origin: &str) -> Value {
     if result.stale {
         v["stale"] = json!(true);
     }
+    // Temporal context travels end to end; an older remote that does not send
+    // it leaves the fields absent rather than guessed.
+    if let Some(filed_at) = result.filed_at {
+        v["filed_at"] = json!(filed_at);
+    }
+    if let Some(date) = result.date {
+        v["date"] = json!(date);
+    }
+    if let Some(ingest_mode) = result.ingest_mode {
+        v["ingest_mode"] = json!(ingest_mode);
+    }
     v
 }
 
@@ -3875,6 +3925,17 @@ mod tests {
             Ok(None)
         }
 
+        async fn has_capability(
+            &self,
+            capability: &str,
+        ) -> agentpalace_remote::Result<Option<bool>> {
+            Ok(Some(
+                self.info_response["capabilities"]
+                    .as_array()
+                    .is_some_and(|caps| caps.iter().any(|cap| cap == capability)),
+            ))
+        }
+
         async fn search_drawers(
             &self,
             req: DrawerSearchRequest,
@@ -3898,6 +3959,8 @@ mod tests {
                     added_by: v["added_by"].as_str().map(|s| s.to_owned()),
                     provenance: v.get("provenance").cloned(),
                     stale: false,
+                    date: None,
+                    ingest_mode: None,
                 })
                 .collect();
             Ok(DrawerSearchResponse { results })
@@ -3941,6 +4004,7 @@ mod tests {
                 drawer_id: Some("rem-drawer-1".to_owned()),
                 wing: Some(req.wing),
                 room: Some(req.room),
+                similar: Vec::new(),
             })
         }
 
@@ -5140,7 +5204,7 @@ mod tests {
 
         let local = vec![json!({"wing":"w","room":"r1","similarity":0.9,"text":"local hit"})];
         let result = router
-            .search(local, "test", Some("w"), None, None, 10, &["alpha".to_owned()])
+            .search(local, "test", Some("w"), None, None, 10, &["alpha".to_owned()], Freshness::Relevant)
             .await
             .unwrap();
 
@@ -5178,7 +5242,7 @@ mod tests {
         let router = make_router(remotes);
 
         let result =
-            router.search(vec![], "test", Some("w"), None, None, 10, &["alpha".to_owned()]).await;
+            router.search(vec![], "test", Some("w"), None, None, 10, &["alpha".to_owned()], Freshness::Relevant).await;
         let result = result.expect("remote search succeeds");
         let results = result["results"].as_array().expect("results array");
 
@@ -5195,7 +5259,7 @@ mod tests {
         let router = make_router(remotes);
 
         router
-            .search(vec![], "test", Some("w"), None, Some("feature-x"), 10, &["alpha".to_owned()])
+            .search(vec![], "test", Some("w"), None, Some("feature-x"), 10, &["alpha".to_owned()], Freshness::Relevant)
             .await
             .unwrap();
 
@@ -5216,7 +5280,7 @@ mod tests {
         remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
         let router = make_router(remotes);
         let result = router
-            .search(vec![], "test", None, None, Some("feature-x"), 10, &["alpha".to_owned()])
+            .search(vec![], "test", None, None, Some("feature-x"), 10, &["alpha".to_owned()], Freshness::Relevant)
             .await
             .unwrap();
 
@@ -5233,7 +5297,7 @@ mod tests {
 
         let local = vec![json!({"wing":"w","room":"r1","similarity":0.9,"text":"local only"})];
         let result = router
-            .search(local, "test", Some("w"), None, None, 10, &["alpha".to_owned()])
+            .search(local, "test", Some("w"), None, None, 10, &["alpha".to_owned()], Freshness::Relevant)
             .await
             .unwrap();
 
@@ -5341,6 +5405,7 @@ mod tests {
                 &route,
                 0.9,
                 Some("op-conflict-1"),
+                false,
             )
             .await
             .expect_err("operation-id conflict must remain an authoritative error");
@@ -5384,6 +5449,7 @@ mod tests {
                 &route,
                 0.9,
                 Some("op-replay-1"),
+                false,
             )
             .await
             .unwrap()
@@ -5403,6 +5469,7 @@ mod tests {
                 &route,
                 0.9,
                 Some("op-replay-1"),
+                false,
             )
             .await
             .unwrap()
@@ -5445,6 +5512,7 @@ mod tests {
                 &route,
                 0.9,
                 Some("op-unknown-1"),
+                false,
             )
             .await
             .unwrap()
@@ -5475,7 +5543,7 @@ mod tests {
         let route = make_combined_route("alpha");
         let result = router
             .add_drawer_remote_with_operation(
-                "w", "r", "content", "file.txt", "agent", &route, 0.9, None,
+                "w", "r", "content", "file.txt", "agent", &route, 0.9, None, false,
             )
             .await
             .unwrap()
@@ -5880,6 +5948,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_add_skips_threshold_preflight_only_when_server_classifies_duplicates() {
+        for (capabilities, expected_preflights, expected_success) in [
+            (json!(["drawers", "kg", agentpalace_federation::DUPLICATE_SERIES_CAPABILITY]), 0, true),
+            (json!(["drawers", "kg"]), 1, false),
+        ] {
+            let mut mock = MockRemote::default();
+            mock.info_response["capabilities"] = capabilities.clone();
+            // An older server's threshold-only match carries no `relation`.
+            mock.duplicate_matches =
+                vec![json!({"id": "d1", "wing": "w", "room": "r", "similarity": 0.95})];
+            let preflights = std::sync::Arc::clone(&mock.check_duplicate_calls);
+            let mut remotes = BTreeMap::new();
+            remotes.insert("alpha".to_owned(), Arc::new(mock) as Arc<dyn RemoteApi>);
+            let router = make_router(remotes);
+            let result = router
+                .add_drawer_remote_with_operation(
+                    "w",
+                    "r",
+                    "snapshot 2",
+                    "file.txt",
+                    "agent",
+                    &make_combined_route("alpha"),
+                    0.9,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap()
+                .expect("routed remote add");
+            assert_eq!(
+                preflights.load(std::sync::atomic::Ordering::SeqCst),
+                expected_preflights,
+                "capabilities {capabilities}"
+            );
+            assert_eq!(result["success"], expected_success, "capabilities {capabilities}: {result}");
+        }
+    }
+
+    #[test]
+    fn drawer_result_to_value_forwards_temporal_fields_and_omits_unknown_ones() {
+        let base = RemoteDrawerResult {
+            drawer_id: "d1".to_owned(),
+            wing: "w".to_owned(),
+            room: "r".to_owned(),
+            rank: 1,
+            score: 0.5,
+            content: "c".to_owned(),
+            source_file: None,
+            content_hash: None,
+            filed_at: None,
+            added_by: None,
+            provenance: None,
+            stale: false,
+            date: None,
+            ingest_mode: None,
+        };
+        let legacy = drawer_result_to_value(base.clone(), "alpha");
+        for key in ["filed_at", "date", "ingest_mode"] {
+            assert!(legacy.get(key).is_none(), "{key} must be absent from an older remote: {legacy}");
+        }
+        let current = drawer_result_to_value(
+            RemoteDrawerResult {
+                filed_at: Some("2026-09-30T12:00:00Z".to_owned()),
+                date: Some("2026-09-29".to_owned()),
+                ingest_mode: Some("mcp".to_owned()),
+                ..base
+            },
+            "alpha",
+        );
+        assert_eq!(current["filed_at"], "2026-09-30T12:00:00Z");
+        assert_eq!(current["date"], "2026-09-29");
+        assert_eq!(current["ingest_mode"], "mcp");
+    }
+
+    #[test]
+    fn remote_duplicate_match_without_relation_blocks() {
+        assert!(crate::duplicate_match_blocks(&json!({"similarity": 0.95}), true));
+        assert!(!crate::duplicate_match_blocks(&json!({"relation": "series_update"}), false));
+        assert!(!crate::duplicate_match_blocks(&json!({"relation": "near_duplicate"}), true));
+        assert!(crate::duplicate_match_blocks(&json!({"relation": "exact"}), true));
+    }
+
+    #[test]
+    fn new_wire_fields_are_omitted_when_unset() {
+        let search = DrawerSearchRequest {
+            query: "q".to_owned(),
+            wing: None,
+            room: None,
+            view: None,
+            limit: None,
+            prefer: None,
+        };
+        assert!(serde_json::to_value(&search).unwrap().get("prefer").is_none());
+        let add = AddDrawerRequest {
+            wing: "w".to_owned(),
+            room: "r".to_owned(),
+            content: "c".to_owned(),
+            source_file: None,
+            added_by: None,
+            drawer_id: None,
+            operation_id: None,
+            allow_near_duplicate: false,
+        };
+        assert!(serde_json::to_value(&add).unwrap().get("allow_near_duplicate").is_none());
+        let response = agentpalace_federation::AddDrawerResponse {
+            success: true,
+            drawer_id: None,
+            wing: None,
+            room: None,
+            similar: Vec::new(),
+        };
+        assert!(serde_json::to_value(&response).unwrap().get("similar").is_none());
+    }
+
+    #[tokio::test]
     async fn add_drawer_omitted_operation_id_sends_generated_id_to_remote_on_success() {
         let mock = MockRemote::default();
         let received_ids = std::sync::Arc::clone(&mock.received_add_operation_ids);
@@ -5890,7 +6073,7 @@ mod tests {
         let route = make_combined_route("alpha");
         let result = router
             .add_drawer_remote_with_operation(
-                "w", "r", "content", "file.txt", "agent", &route, 0.9, None,
+                "w", "r", "content", "file.txt", "agent", &route, 0.9, None, false,
             )
             .await
             .unwrap()

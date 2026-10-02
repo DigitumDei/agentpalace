@@ -39,6 +39,27 @@ to LanceDB, do not require embeddings, and are not federated. See
 [Self-Continuity Across Models](Self-Continuity.md) for the lifecycle and wake-up
 semantics.
 
+### Diary entry timespans
+
+Diary bodies live in LanceDB like other drawers; their mutable state lives in the
+`diary_summaries` SQLite table so updates never rewrite unrelated Lance rows.
+Migration `0012_diary_summary_last_updated_at` adds a nullable
+`last_updated_at TEXT` (RFC 3339) column. `diary_write` sets it to the entry's
+`filed_at`; `diary_update` sets it to the update time (server clock, never caller
+supplied). Rows written before the migration keep `NULL`, which reads as
+`filed_at`, so no backfill is needed. An entry spans `filed_at..last_updated_at`:
+diary reads and wake-up sort by the last update and include an entry in a `since`
+window when its last update falls inside it.
+
+`diary_update` first sets the summary and `last_updated_at` in one SQLite statement,
+then replaces the body with a single update-only LanceDB `merge_insert` on `id` (one
+table version; never inserts, never delete-then-add). If the body write fails, the
+stored body still differs from the requested one, so retrying the same request
+rewrites both; the reverse order would leave a new body with stale metadata that a
+retry would treat as a no-op.
+The entry's `diary:<id>` ingest manifest keeps the original content hash; reconcile
+matches committed drawer ids, not hashes.
+
 ### Locator fields
 
 | Field | Type | Description |

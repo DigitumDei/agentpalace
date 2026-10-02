@@ -40,8 +40,11 @@ use agentpalace_config::AgentPalaceConfig;
 use agentpalace_core::{
     BUILD_VERSION, DIARY_ROOM, DIARY_TOPIC_PREFIX, DrawerId, DrawerRecord, PersistedProvenance,
     ProvenanceAction, ProvenanceHistoryEntry, RoomId, RecordingTime, SHARED_AGENT_DIARY_WING,
-    SearchQuery, SourceLocator, StorageOrigin,
+    Freshness, SearchQuery, SourceLocator, StorageOrigin,
     WING_PREFIX, WingId, hash_bytes, mined_drawer_id, resolve_records,
+};
+use agentpalace_core::near_duplicate::{
+    DuplicateCandidate, IncomingDrawer, classify_duplicate, relation_blocks,
 };
 pub use agentpalace_core::{
     reject_payload_owner_claim, AuthenticatedOwner, EmailAtWrite, Issuer, LegacyUnknownOwner,
@@ -291,7 +294,7 @@ impl IntoResponse for ServerError {
             Self::Duplicate(_) => (
                 StatusCode::CONFLICT,
                 "duplicate",
-                "near-duplicate content detected; add check_duplicate first if intentional"
+                "near-duplicate content detected; set allow_near_duplicate=true to file it anyway"
                     .to_owned(),
             ),
             Self::IdempotencyConflict(error) => {
@@ -1183,7 +1186,14 @@ where
     coordination.ensure_schema()?;
     let search = SearchRuntime::with_policy(
         provider,
-        SearchRuntimePolicy { rerank_enabled: config.low_cpu.effective_rerank_enabled() },
+        SearchRuntimePolicy {
+            rerank_enabled: config.low_cpu.effective_rerank_enabled(),
+            freshness: agentpalace_search::FreshnessPolicy {
+                default: config.search.freshness_default,
+                half_life_hours: config.search.half_life_hours,
+                no_lift_rooms: config.search.no_lift_rooms.clone(),
+            },
+        },
     );
 
     // Extract maintenance config before moving `config` into state.
@@ -1623,6 +1633,8 @@ where
             "idempotent_mutations".to_owned(),
             "resumable_ingest".to_owned(),
             "ingest_preflight".to_owned(),
+            agentpalace_federation::SEARCH_FRESHNESS_CAPABILITY.to_owned(),
+            agentpalace_federation::DUPLICATE_SERIES_CAPABILITY.to_owned(),
         ],
         maintenance_enabled: state.config.maintenance.enabled,
         maintenance_background_enabled: state.config.maintenance.background_enabled,
@@ -1665,34 +1677,39 @@ where
         }
     }
     let visibility = wing.is_none().then(|| auth.0.visible_wings(Operation::Read));
+    let freshness = body
+        .prefer
+        .as_deref()
+        .map(|value| {
+            Freshness::parse(value).ok_or_else(|| {
+                ServerError::InvalidParams(format!(
+                    "prefer must be one of relevant, balanced, recent; got `{value}`"
+                ))
+            })
+        })
+        .transpose()?;
 
-    // Over-fetch from the search runtime to compensate for diary rows and
-    // scope-invisible rows filtered out below — the runtime ranks and
-    // truncates to the limit it is given, so asking for exactly `limit` and
-    // then filtering could silently return fewer than `limit` results even
-    // though enough visible candidates exist further down the ranking. This
-    // route still filters visibility post-fetch (unlike `route_drawers_list`,
-    // which now pushes its visible-wing set into the storage query — see the
-    // comment on that route's `restrict_wings`), because search is a ranked
-    // top-K with no continuation promise: a short page here is an acceptable,
-    // bounded trade-off, whereas `route_drawers_list`'s `limit`/`next_cursor`
-    // shape implies the caller can page through everything it can see, which
-    // post-fetch filtering cannot guarantee. Same 2x heuristic as
-    // `route_drawers_list`'s `storage_limit` regardless.
-    let search_limit = limit.saturating_mul(2);
-
+    // Diary rows and scope-invisible rows are excluded inside the search
+    // runtime, before ranking: they neither take result slots (the runtime
+    // widens its candidate window instead) nor set a freshness reference time,
+    // so what another scope filed cannot change the order this caller sees.
     let results = {
         let mut search = state.search.lock().await;
         search
-            .search(
+            .search_filtered(
                 state.storage.drawer_store(),
                 &SearchQuery {
                     text: body.query,
                     wing,
                     room,
-                    limit: search_limit,
+                    limit,
                     profile: state.config.embedding_profile,
                     view,
+                    freshness,
+                },
+                |record| {
+                    !is_diary_wing_or_room(record.wing.as_str(), record.room.as_str())
+                        && visibility.as_ref().is_none_or(|v| v.contains(record.wing.as_str()))
                 },
             )
             .await?
@@ -1700,8 +1717,6 @@ where
 
     let results: Vec<RemoteDrawerResult> = results
         .into_iter()
-        .filter(|r| !is_diary_wing_or_room(r.wing.as_str(), r.room.as_str()))
-        .filter(|r| visibility.as_ref().map(|v| v.contains(r.wing.as_str())).unwrap_or(true))
         .take(limit)
         .enumerate()
         .map(|(index, result)| RemoteDrawerResult {
@@ -1716,11 +1731,15 @@ where
             score: result.score,
             content: result.content,
             source_file: Some(result.source_file).filter(|s| !s.is_empty()),
-            content_hash: None,
-            filed_at: None,
+            content_hash: result.content_hash,
+            filed_at: result
+                .filed_at
+                .and_then(|value| value.to_offset(time::UtcOffset::UTC).format(&Rfc3339).ok()),
             added_by: None,
             provenance: result.provenance,
             stale: result.stale,
+            date: result.date.map(|value| value.to_string()),
+            ingest_mode: result.ingest_mode,
         })
         .collect();
 
@@ -1795,7 +1814,7 @@ where
     let receipts = state.storage.receipt_store();
 
     if let Some((op, operation_key)) = operation.as_ref() {
-        let request_hash = mutation_request_hash(&[
+        let mut hashed = vec![
             ("wing", json!(body.wing)),
             ("room", json!(body.room)),
             ("content", json!(&body.content)),
@@ -1805,7 +1824,14 @@ where
             // replay or race the same receipt and receive credit for one another's drawer.
             ("effective_added_by", json!(&effective_added_by)),
             ("drawer_id", json!(&body.drawer_id)),
-        ]);
+        ];
+        // The override decides whether the duplicate check refuses or applies the add, so
+        // it is part of the mutation's identity. Hashed only when set, so receipts written
+        // before the flag existed keep their hashes.
+        if body.allow_near_duplicate {
+            hashed.push(("allow_near_duplicate", json!(true)));
+        }
+        let request_hash = mutation_request_hash(&hashed);
         let outcome = receipts.begin_receipt(&NewReceipt {
             operation_key: (*operation_key).clone(),
             operation_kind: RECEIPT_KIND_DRAWER_ADD.to_owned(),
@@ -1847,11 +1873,23 @@ where
                             receipt.target_id
                         )));
                     }
-                    let response = serde_json::to_value(add_drawer_response(
-                        &receipt.target_id,
+                    // The original response listed the series this drawer joined. Recompute it,
+                    // excluding the recovered drawer itself, so a recovered add answers like
+                    // the live path did.
+                    let (_, similar) = classified_add_matches(
+                        &state,
+                        &auth.0,
+                        &body.content,
                         wing.as_str(),
-                        room.as_str(),
-                    ))?;
+                        body.source_file.as_deref(),
+                        body.allow_near_duplicate,
+                        Some(receipt.target_id.as_str()),
+                    )
+                    .await?;
+                    let response = serde_json::to_value(AddDrawerResponse {
+                        similar,
+                        ..add_drawer_response(&receipt.target_id, wing.as_str(), room.as_str())
+                    })?;
                     // Recover the finding-6-class crash window: the add committed but the
                     // `drawer_added` change event never landed. Restore exactly one event —
                     // atomically, so a crash between the restore and `complete_receipt`, or two
@@ -1889,16 +1927,16 @@ where
     // read, because that duplicate is invisible to this check. The
     // alternative — reporting it — would disclose that wing's content to a
     // caller not authorized to read it, which is worse.
-    let visibility = auth.0.visible_wings(Operation::Read);
-    let duplicates = find_duplicates(&state, &body.content, DEFAULT_DUPLICATE_THRESHOLD).await?;
-    let duplicates: Vec<Value> = duplicates
-        .into_iter()
-        .filter(|m| {
-            let dup_wing = m.get("wing").and_then(Value::as_str).unwrap_or("");
-            let dup_room = m.get("room").and_then(Value::as_str).unwrap_or("");
-            !is_diary_wing_or_room(dup_wing, dup_room) && visibility.contains(dup_wing)
-        })
-        .collect();
+    let (duplicates, similar) = classified_add_matches(
+        &state,
+        &auth.0,
+        &body.content,
+        wing.as_str(),
+        body.source_file.as_deref(),
+        body.allow_near_duplicate,
+        None,
+    )
+    .await?;
     if !duplicates.is_empty() {
         return Err(ServerError::Duplicate(
             serde_json::to_value(&duplicates).unwrap_or(Value::Array(vec![])),
@@ -1953,11 +1991,10 @@ where
         state.storage.operational_store().append_event(&event)?;
     }
 
-    let response = serde_json::to_value(add_drawer_response(
-        drawer_id.as_str(),
-        wing.as_str(),
-        room.as_str(),
-    ))?;
+    let response = serde_json::to_value(AddDrawerResponse {
+        similar,
+        ..add_drawer_response(drawer_id.as_str(), wing.as_str(), room.as_str())
+    })?;
     if let Some((_, operation_key)) = operation.as_ref() {
         receipts.complete_receipt(operation_key, &response)?;
     }
@@ -1992,7 +2029,8 @@ where
     let visibility = auth.0.visible_wings(Operation::Read);
 
     let threshold = body.threshold.unwrap_or(DEFAULT_DUPLICATE_THRESHOLD);
-    let matches = find_duplicates(&state, &body.content, threshold).await?;
+    // No wing or source here, so only the content-based classifier rules apply.
+    let matches = find_duplicates(&state, &body.content, threshold, None, None).await?;
     // Filter diary matches and matches outside the token's visible wings.
     let matches: Vec<Value> = matches
         .into_iter()
@@ -2002,7 +2040,8 @@ where
             !is_diary_wing_or_room(wing, room) && visibility.contains(wing)
         })
         .collect();
-    let is_duplicate = !matches.is_empty();
+    // A series update is not a duplicate.
+    let is_duplicate = matches.iter().any(|m| duplicate_relation_blocks(m, false));
     Ok(Json(CheckDuplicateResponse { is_duplicate, matches: Value::Array(matches) }))
 }
 
@@ -5102,6 +5141,8 @@ async fn find_duplicates<P>(
     state: &ServerState<P>,
     content: &str,
     threshold: f32,
+    wing: Option<&str>,
+    source_file: Option<&str>,
 ) -> Result<Vec<Value>, ServerError>
 where
     P: EmbeddingProvider + Send + Sync + 'static,
@@ -5113,30 +5154,108 @@ where
         limit: DUPLICATE_SEARCH_LIMIT,
         profile: state.config.embedding_profile,
         view: None,
+        freshness: None,
     };
     let results = {
         let mut search = state.search.lock().await;
         search.search_semantic(state.storage.drawer_store(), &query).await?
     };
-    Ok(results
+    // Same classifier as the MCP path, so local and remote verdicts agree.
+    let incoming_hash = hash_text(content);
+    let incoming = IncomingDrawer {
+        content,
+        content_hash: &incoming_hash,
+        wing,
+        source_file,
+        now: OffsetDateTime::now_utc(),
+    };
+    let mut matches = Vec::new();
+    for r in results.into_iter().filter(|r| r.score >= threshold) {
+        // Series identity needs the full stored source path, not the base name.
+        let full_source = match &r.drawer_id {
+            Some(id) => state.storage.drawer_store().get_drawer(id).await?.map(|d| d.source_file),
+            None => None,
+        };
+        let relation = classify_duplicate(
+            &incoming,
+            &DuplicateCandidate {
+                content: &r.content,
+                content_hash: r.content_hash.as_deref().unwrap_or_default(),
+                wing: r.wing.as_str(),
+                source_file: full_source.as_deref().unwrap_or_default(),
+                filed_at: r.filed_at,
+            },
+        );
+        let snippet = if r.content.chars().count() > 200 {
+            format!("{}...", r.content.chars().take(200).collect::<String>())
+        } else {
+            r.content.clone()
+        };
+        let mut entry = json!({
+            "id": r.drawer_id,
+            "wing": r.wing,
+            "room": r.room,
+            "similarity": r.score,
+            "content": snippet,
+            "content_hash": r.content_hash,
+            "relation": relation.as_str(),
+        });
+        if let Some(reason) = relation.reason() {
+            entry["reason"] = json!(reason);
+        }
+        if let Some(filed_at) =
+            r.filed_at.and_then(|value| value.to_offset(time::UtcOffset::UTC).format(&Rfc3339).ok())
+        {
+            entry["filed_at"] = json!(filed_at);
+        }
+        matches.push(entry);
+    }
+    Ok(matches)
+}
+
+/// Classified duplicate matches for an add, split into `(blocking, series)`.
+///
+/// Matches in diary rooms or in wings the caller cannot read are dropped first,
+/// because the 409 itself would disclose them. A forced near-duplicate is in
+/// neither list. `exclude_id` leaves out one drawer (the add being recovered).
+async fn classified_add_matches<P>(
+    state: &ServerState<P>,
+    identity: &AuthIdentity,
+    content: &str,
+    wing: &str,
+    source_file: Option<&str>,
+    allow_near_duplicate: bool,
+    exclude_id: Option<&str>,
+) -> Result<(Vec<Value>, Vec<Value>), ServerError>
+where
+    P: EmbeddingProvider + Send + Sync + 'static,
+{
+    let visibility = identity.visible_wings(Operation::Read);
+    let matches = find_duplicates(
+        state,
+        content,
+        DEFAULT_DUPLICATE_THRESHOLD,
+        Some(wing),
+        source_file.filter(|source| !source.is_empty()),
+    )
+    .await?;
+    Ok(matches
         .into_iter()
-        .filter(|r| r.score >= threshold)
-        .map(|r| {
-            let snippet = if r.content.chars().count() > 200 {
-                format!("{}...", r.content.chars().take(200).collect::<String>())
-            } else {
-                r.content
-            };
-            json!({
-                "id": r.drawer_id,
-                "wing": r.wing,
-                "room": r.room,
-                "similarity": r.score,
-                "content": snippet,
-                "content_hash": r.content_hash,
-            })
+        .filter(|m| exclude_id.is_none_or(|id| m.get("id").and_then(Value::as_str) != Some(id)))
+        .filter(|m| {
+            let dup_wing = m.get("wing").and_then(Value::as_str).unwrap_or("");
+            let dup_room = m.get("room").and_then(Value::as_str).unwrap_or("");
+            !is_diary_wing_or_room(dup_wing, dup_room) && visibility.contains(dup_wing)
         })
-        .collect())
+        .filter(|m| {
+            duplicate_relation_blocks(m, allow_near_duplicate)
+                || m.get("relation").and_then(Value::as_str) == Some("series_update")
+        })
+        .partition(|m| duplicate_relation_blocks(m, allow_near_duplicate)))
+}
+
+fn duplicate_relation_blocks(entry: &Value, allow_near_duplicate: bool) -> bool {
+    relation_blocks(entry.get("relation").and_then(Value::as_str), allow_near_duplicate)
 }
 
 /// Builds a `DrawerRecord` by computing an embedding for `content`.
@@ -5211,6 +5330,7 @@ fn add_drawer_response(drawer_id: &str, wing: &str, room: &str) -> AddDrawerResp
         drawer_id: Some(drawer_id.to_owned()),
         wing: Some(wing.to_owned()),
         room: Some(room.to_owned()),
+        similar: Vec::new(),
     }
 }
 
@@ -5473,6 +5593,7 @@ mod tests {
                 background_enabled: background_maintenance_enabled,
                 ..MaintenanceRuntimeConfig::defaults()
             },
+            search: agentpalace_config::SearchRuntimeConfig::defaults(),
         };
         let tokens = TokenRegistry::load(token_file).unwrap();
         let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
@@ -6431,6 +6552,7 @@ mod tests {
             },
             federation: FederationRuntimeConfig::default(),
             maintenance: MaintenanceRuntimeConfig::defaults(),
+            search: agentpalace_config::SearchRuntimeConfig::defaults(),
         };
 
         let tokens = TokenRegistry::load(token_file).unwrap();
@@ -6964,6 +7086,7 @@ mod tests {
             },
             federation: FederationRuntimeConfig::default(),
             maintenance: MaintenanceRuntimeConfig::defaults(),
+            search: agentpalace_config::SearchRuntimeConfig::defaults(),
         };
 
         let tokens = TokenRegistry::load(token_file).unwrap();
@@ -7252,6 +7375,132 @@ mod tests {
         assert_eq!(second.status(), StatusCode::CONFLICT);
         let body = body_json(second).await;
         assert_eq!(body["code"], "duplicate");
+    }
+
+    #[tokio::test]
+    async fn add_route_files_series_members_and_honours_allow_near_duplicate() {
+        let harness = make_harness().await;
+        let add = |content: &str, force: bool| {
+            let mut body = json!({"wing": "wing_code", "room": "ops", "content": content});
+            if force {
+                body["allow_near_duplicate"] = json!(true);
+            }
+            authed_json_request(Method::POST, "/v1/drawers", ALICE_TOKEN, body)
+        };
+        let first = harness.router.clone().oneshot(add("ops snapshot cpu 40% disk 71%", false)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // A new run of the series is accepted and reported under `similar`.
+        let series = harness.router.clone().oneshot(add("ops snapshot cpu 55% disk 72%", false)).await.unwrap();
+        assert_eq!(series.status(), StatusCode::OK);
+        let body = body_json(series).await;
+        assert_eq!(body["similar"][0]["relation"], "series_update", "{body}");
+
+        // A paraphrase is refused with the new guidance ...
+        let near = harness.router.clone().oneshot(add("ops: snapshot of cpu 40% and disk 71%", false)).await.unwrap();
+        assert_eq!(near.status(), StatusCode::CONFLICT);
+        let body = body_json(near).await;
+        assert!(
+            body["message"].as_str().unwrap_or_default().contains("allow_near_duplicate"),
+            "{body}"
+        );
+        // ... and filed when forced, while an exact copy never is.
+        let forced = harness.router.clone().oneshot(add("ops: snapshot of cpu 40% and disk 71%", true)).await.unwrap();
+        assert_eq!(forced.status(), StatusCode::OK);
+        let exact = harness.router.clone().oneshot(add("ops snapshot cpu 40% disk 71%", true)).await.unwrap();
+        assert_eq!(exact.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn allow_near_duplicate_is_part_of_the_operation_identity() {
+        let harness = make_harness().await;
+        let add = |content: &str, force: bool, operation_id: Option<&str>| {
+            let mut body = json!({"wing": "wing_code", "room": "ops", "content": content});
+            if force {
+                body["allow_near_duplicate"] = json!(true);
+            }
+            if let Some(operation_id) = operation_id {
+                body["operation_id"] = json!(operation_id);
+            }
+            authed_json_request(Method::POST, "/v1/drawers", ALICE_TOKEN, body)
+        };
+        let original = harness.router.clone().oneshot(add("ops snapshot cpu 40% disk 71%", false, None)).await.unwrap();
+        assert_eq!(original.status(), StatusCode::OK);
+
+        let paraphrase = "ops: snapshot of cpu 40% and disk 71%";
+        let refused = harness.router.clone().oneshot(add(paraphrase, false, Some("op-near-1"))).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(refused).await["code"], "duplicate");
+
+        // Same operation id, but now forcing the add: a different mutation, so it must
+        // not recover the first attempt's receipt and apply.
+        let forced = harness.router.clone().oneshot(add(paraphrase, true, Some("op-near-1"))).await.unwrap();
+        assert_eq!(forced.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(forced).await["code"], "operation_id_conflict");
+    }
+
+    #[tokio::test]
+    async fn search_route_reports_temporal_fields_and_validates_prefer() {
+        let harness = make_harness().await;
+        let added = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers",
+                ALICE_TOKEN,
+                json!({"wing": "wing_code", "room": "auth-migration", "content": "auth migration parity notes"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(added.status(), StatusCode::OK);
+        let search = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                ALICE_TOKEN,
+                json!({"query": "auth migration parity", "limit": 5, "prefer": "recent"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(search.status(), StatusCode::OK);
+        let body = body_json(search).await;
+        let hit = body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["content"] == "auth migration parity notes")
+            .expect("filed drawer is found");
+        let filed_at = hit["filed_at"].as_str().expect("filed_at");
+        assert!(filed_at.ends_with('Z') && OffsetDateTime::parse(filed_at, &Rfc3339).is_ok(), "{hit}");
+        assert_eq!(hit["ingest_mode"], "federation_write", "{hit}");
+        assert!(hit["content_hash"].is_string(), "{hit}");
+
+        let invalid = harness
+            .router
+            .clone()
+            .oneshot(authed_json_request(
+                Method::POST,
+                "/v1/drawers/search",
+                ALICE_TOKEN,
+                json!({"query": "auth", "prefer": "latest"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn info_advertises_search_freshness_and_duplicate_series() {
+        let harness = make_harness().await;
+        let response = harness.router.oneshot(authed_get("/v1/info", ALICE_TOKEN)).await.unwrap();
+        let body = body_json(response).await;
+        let capabilities: Vec<&str> =
+            body["capabilities"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(capabilities.contains(&"search_freshness"), "{capabilities:?}");
+        assert!(capabilities.contains(&"duplicate_series"), "{capabilities:?}");
     }
 
     // ─── 5. Diary rejection ───────────────────────────────────────────────────
@@ -10587,6 +10836,7 @@ mod tests {
             },
             federation: FederationRuntimeConfig::default(),
             maintenance: MaintenanceRuntimeConfig::defaults(),
+            search: agentpalace_config::SearchRuntimeConfig::defaults(),
         };
         let tokens = TokenRegistry::load(token_file).unwrap();
         let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);
@@ -12019,6 +12269,7 @@ mod tests {
             },
             federation: FederationRuntimeConfig::default(),
             maintenance,
+            search: agentpalace_config::SearchRuntimeConfig::defaults(),
         };
         let tokens = TokenRegistry::load(config.server.token_file.clone()).unwrap();
         let provider = DeterministicStubProvider::new(EmbeddingProfile::Balanced);

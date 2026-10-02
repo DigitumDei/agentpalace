@@ -107,6 +107,55 @@ pub struct SearchQuery {
     pub view: Option<String>,
     pub limit: usize,
     pub profile: EmbeddingProfile,
+    /// How much weight drawer age carries in ranking. `None` uses the runtime's
+    /// configured default. Never changes the reported similarity score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<Freshness>,
+}
+
+/// Ranking intent for drawer age.
+///
+/// Age is context, not proof: a newer drawer is never assumed to supersede an
+/// older one. `Balanced` and `Recent` add a small bounded lift to newer drawers
+/// that are otherwise near-equal matches; `Relevant` is pure semantic order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Freshness {
+    /// Pure semantic order; age has no effect.
+    #[default]
+    Relevant,
+    /// Small lift for newer near-equal matches.
+    Balanced,
+    /// Larger lift, for "what is the latest state of X" questions.
+    Recent,
+}
+
+impl Freshness {
+    /// All modes, in increasing order of age weight.
+    pub const ALL: [Self; 3] = [Self::Relevant, Self::Balanced, Self::Recent];
+
+    /// Wire and config name of this mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Relevant => "relevant",
+            Self::Balanced => "balanced",
+            Self::Recent => "recent",
+        }
+    }
+
+    /// Parse a wire or config name.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == value)
+    }
+
+    /// Maximum score lift a drawer can receive for being the newest in its group.
+    pub fn weight(self) -> f32 {
+        match self {
+            Self::Relevant => 0.0,
+            Self::Balanced => 0.05,
+            Self::Recent => 0.20,
+        }
+    }
 }
 
 /// Search result contract shared by CLI, MCP, and library APIs.
@@ -137,6 +186,32 @@ pub struct SearchResult {
     /// Redacted durable provenance when the result came from a provenance-aware drawer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<serde_json::Value>,
+    /// When the drawer was written to the palace (UTC). For mined rows this is
+    /// the mining time, not when the underlying content was authored. Absent
+    /// when the origin did not report it (for example an older remote).
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub filed_at: Option<OffsetDateTime>,
+    /// Authored or event date recorded with the drawer, when one is known.
+    /// Distinct from `filed_at`; absent means no authored date was recorded.
+    #[serde(default, with = "date_only::option", skip_serializing_if = "Option::is_none")]
+    pub date: Option<Date>,
+    /// How the drawer was written (`mcp`, `diary`, `projects`, `convos`, ...).
+    /// Mined modes mean `filed_at` reflects ingest time, not authorship.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_mode: Option<String>,
+}
+
+/// Ingest modes written by bulk mining. Their `filed_at` is ingest time, so it
+/// says nothing about when the underlying content was authored.
+pub const MINED_INGEST_MODES: [&str; 3] = ["projects", "projects-branch", "convos"];
+
+/// Whether `ingest_mode` is a bulk-mining mode (see [`MINED_INGEST_MODES`]).
+pub fn is_mined_ingest_mode(ingest_mode: &str) -> bool {
+    MINED_INGEST_MODES.contains(&ingest_mode)
 }
 
 #[cfg(test)]
@@ -145,7 +220,7 @@ mod tests {
     use serde_json::json;
     use time::macros::{date, datetime};
 
-    use super::{DrawerRecord, SearchResult};
+    use super::{DrawerRecord, Freshness, SearchQuery, SearchResult};
     use crate::{DrawerId, RoomId, WingId};
 
     #[test]
@@ -161,6 +236,9 @@ mod tests {
             content_hash: None,
             view: None,
             provenance: None,
+            filed_at: None,
+            date: None,
+            ingest_mode: None,
         };
 
         let value = serde_json::to_value(&result).unwrap();
@@ -192,12 +270,76 @@ mod tests {
             content_hash: None,
             view: None,
             provenance: None,
+            filed_at: None,
+            date: None,
+            ingest_mode: None,
         };
         let stale = SearchResult { stale: true, ..non_stale.clone() };
         let non_stale_json = serde_json::to_value(&non_stale).unwrap();
         let stale_json = serde_json::to_value(&stale).unwrap();
         assert!(non_stale_json.as_object().unwrap().get("stale").is_none());
         assert_eq!(stale_json.as_object().unwrap().get("stale"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn search_result_temporal_fields_are_absent_when_unknown_and_rfc3339_when_present() {
+        let unknown = SearchResult {
+            drawer_id: None,
+            wing: WingId::new("w").unwrap(),
+            room: RoomId::new("r").unwrap(),
+            score: 0.5,
+            content: "text".to_owned(),
+            source_file: "f.txt".to_owned(),
+            stale: false,
+            content_hash: None,
+            view: None,
+            provenance: None,
+            filed_at: None,
+            date: None,
+            ingest_mode: None,
+        };
+        let value = serde_json::to_value(&unknown).unwrap();
+        let object = value.as_object().unwrap();
+        for key in ["filed_at", "date", "ingest_mode"] {
+            assert!(object.get(key).is_none(), "{key} must be absent when unknown");
+        }
+
+        // A non-UTC offset is preserved as written; the instant is unambiguous.
+        let known = SearchResult {
+            filed_at: Some(datetime!(2026-09-30 23:30:00 -02:00)),
+            date: Some(date!(2026 - 09 - 30)),
+            ingest_mode: Some("mcp".to_owned()),
+            ..unknown
+        };
+        let value = serde_json::to_value(&known).unwrap();
+        assert_eq!(value.get("filed_at"), Some(&json!("2026-09-30T23:30:00-02:00")));
+        assert_eq!(value.get("date"), Some(&json!("2026-09-30")));
+        assert_eq!(value.get("ingest_mode"), Some(&json!("mcp")));
+        let round_trip: SearchResult = serde_json::from_value(value).unwrap();
+        assert_eq!(round_trip, known);
+        assert_eq!(
+            round_trip.filed_at.unwrap().to_offset(time::UtcOffset::UTC),
+            datetime!(2026-10-01 01:30:00 UTC)
+        );
+    }
+
+    #[test]
+    fn search_query_without_freshness_serializes_without_key() {
+        let query = SearchQuery {
+            text: "q".to_owned(),
+            wing: None,
+            room: None,
+            view: None,
+            limit: 5,
+            profile: crate::EmbeddingProfile::Balanced,
+            freshness: None,
+        };
+        let value = serde_json::to_value(&query).unwrap();
+        assert!(value.get("freshness").is_none());
+        let with = SearchQuery { freshness: Some(Freshness::Recent), ..query };
+        assert_eq!(serde_json::to_value(&with).unwrap().get("freshness"), Some(&json!("recent")));
+        assert_eq!(Freshness::parse("balanced"), Some(Freshness::Balanced));
+        assert_eq!(Freshness::parse("latest"), None);
     }
 
     #[test]

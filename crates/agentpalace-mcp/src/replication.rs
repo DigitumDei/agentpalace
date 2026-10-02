@@ -347,6 +347,7 @@ mod tests {
             embedding_profile: EmbeddingProfile::Balanced,
             low_cpu: LowCpuRuntimeConfig::defaults_for_profile(EmbeddingProfile::Balanced),
             maintenance: MaintenanceRuntimeConfig::defaults(),
+            search: agentpalace_config::SearchRuntimeConfig::defaults(),
             federation: FederationRuntimeConfig::default(),
             server: ServerRuntimeConfig {
                 bind: "127.0.0.1:0".parse().unwrap(),
