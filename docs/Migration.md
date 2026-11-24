@@ -26,6 +26,10 @@ Migration:
    When the old home exists, migration conservatively blocks on any matching
    process name, including a server owned by another user or running in a
    container. Stop it for the migration, then restart it after installation.
+   Processes are listed with `ps` (`tasklist` on Windows). On Linux systems
+   without `ps`, such as slim containers without procps, the same names are
+   read from `/proc`. If processes cannot be listed at all, migration stops
+   before changing anything and names the missing tool.
 2. Validates existing supported client configuration before copying data.
 3. Copies `~/.mempalace` into a staging directory beside `~/.agentpalace`, then
    publishes the complete copy by renaming the directory. The old `bin` directory

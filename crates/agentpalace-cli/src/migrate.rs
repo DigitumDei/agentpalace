@@ -20,27 +20,9 @@ pub fn check_stopped(from: &Path) -> io::Result<()> {
     if !from.exists() {
         return Ok(());
     }
-    #[cfg(windows)]
-    let output = Command::new("tasklist").args(["/FO", "CSV", "/NH"]).output()?;
-    #[cfg(not(windows))]
-    let output = Command::new("ps").args(["-A", "-o", "pid=,comm="]).output()?;
-    if !output.status.success() {
-        return Err(invalid("Cannot inspect running processes; migration aborted"));
-    }
     let own_pid = std::process::id().to_string();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        #[cfg(windows)]
-        let (name, pid) = {
-            let columns: Vec<_> = line.trim_matches('"').split("\",\"").collect();
-            (columns.first().copied().unwrap_or(""), columns.get(1).copied().unwrap_or(""))
-        };
-        #[cfg(not(windows))]
-        let (name, pid) = {
-            let mut columns = line.split_whitespace();
-            let pid = columns.next().unwrap_or("");
-            (columns.next().unwrap_or(""), pid)
-        };
-        let name = name.rsplit(['/', '\\']).next().unwrap_or(name).to_ascii_lowercase();
+    for (pid, name) in running_processes()? {
+        let name = name.rsplit(['/', '\\']).next().unwrap_or(&name).to_ascii_lowercase();
         if pid != own_pid
             && matches!(
                 name.as_str(),
@@ -60,6 +42,87 @@ pub fn check_stopped(from: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// List running processes as `(pid, name)` pairs.
+///
+/// Uses `tasklist` on Windows and `ps` elsewhere. Slim Linux containers often
+/// ship without `ps` (procps); there the same names are read from `/proc`.
+fn running_processes() -> io::Result<Vec<(String, String)>> {
+    #[cfg(windows)]
+    let (program, args) = ("tasklist", ["/FO", "CSV", "/NH"]);
+    #[cfg(not(windows))]
+    let (program, args) = ("ps", ["-A", "-o", "pid=,comm="]);
+
+    let output = match Command::new(program).args(args).output() {
+        Ok(output) => output,
+        #[cfg(target_os = "linux")]
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return proc_processes(Path::new("/proc"))
+                .map_err(|proc_err| invalid(process_listing_unavailable(program, &proc_err)));
+        }
+        Err(err) => return Err(invalid(process_listing_unavailable(program, &err))),
+    };
+    if !output.status.success() {
+        return Err(invalid(format!(
+            "Cannot check for running palace servers: `{program}` exited with {}; migration aborted before changing anything",
+            output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().map(parse_process_line).collect())
+}
+
+/// Parse one line of `tasklist /FO CSV /NH` (Windows) or `ps -o pid=,comm=` output.
+fn parse_process_line(line: &str) -> (String, String) {
+    #[cfg(windows)]
+    {
+        let columns: Vec<_> = line.trim_matches('"').split("\",\"").collect();
+        (
+            columns.get(1).copied().unwrap_or("").to_owned(),
+            columns.first().copied().unwrap_or("").to_owned(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let mut columns = line.split_whitespace();
+        let pid = columns.next().unwrap_or("").to_owned();
+        (pid, columns.next().unwrap_or("").to_owned())
+    }
+}
+
+/// Read `(pid, name)` pairs from a procfs root. `comm` holds the same
+/// executable name `ps -o comm=` prints.
+#[cfg(target_os = "linux")]
+fn proc_processes(root: &Path) -> io::Result<Vec<(String, String)>> {
+    let mut processes = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let pid = entry.file_name().to_string_lossy().into_owned();
+        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // A process can exit between listing and reading; skip it.
+        if let Ok(comm) = fs::read_to_string(entry.path().join("comm")) {
+            processes.push((pid, comm.trim_end().to_owned()));
+        }
+    }
+    Ok(processes)
+}
+
+/// Explain why running processes could not be listed, and what to install.
+fn process_listing_unavailable(program: &str, err: &io::Error) -> String {
+    let hint = match (program, err.kind()) {
+        ("ps", io::ErrorKind::NotFound) => {
+            " `ps` is not installed: install procps (Debian/Ubuntu) or procps-ng (Fedora/RHEL), then rerun."
+        }
+        ("tasklist", io::ErrorKind::NotFound) => {
+            " `tasklist` was not found on PATH; check that C:\\Windows\\System32 is on PATH, then rerun."
+        }
+        _ => "",
+    };
+    format!(
+        "Cannot check for running palace servers: could not run `{program}` ({err}).{hint} Migration aborted before changing anything"
+    )
 }
 
 /// Migrate the default home and existing supported MCP registrations.
@@ -716,6 +779,63 @@ mod tests {
         server.wait().unwrap();
         assert!(missing_result.is_ok(), "an unrelated server cannot block a fresh install");
         assert!(existing_result.unwrap_err().to_string().contains("Stop agentpalace"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_listing_reads_names_and_skips_non_process_entries() {
+        let root = tempfile::tempdir().unwrap();
+        for (pid, comm) in [("1", "init\n"), ("4242", "agentpalace\n"), ("77", "mempalace-mcp\n")] {
+            fs::create_dir(root.path().join(pid)).unwrap();
+            fs::write(root.path().join(pid).join("comm"), comm).unwrap();
+        }
+        // Non-numeric entries and a process that vanished before its comm was read.
+        fs::create_dir(root.path().join("self")).unwrap();
+        fs::write(root.path().join("self").join("comm"), "bash\n").unwrap();
+        fs::create_dir(root.path().join("9999")).unwrap();
+        fs::write(root.path().join("uptime"), "1.0 2.0\n").unwrap();
+
+        let mut found = proc_processes(root.path()).unwrap();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("1".to_owned(), "init".to_owned()),
+                ("4242".to_owned(), "agentpalace".to_owned()),
+                ("77".to_owned(), "mempalace-mcp".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_listing_sees_a_live_server() {
+        // The fallback must find the same server `ps` would: this process's own comm
+        // is read from the real procfs.
+        let own = std::process::id().to_string();
+        let found = proc_processes(Path::new("/proc")).unwrap();
+        assert!(found.iter().any(|(pid, name)| *pid == own && !name.is_empty()));
+    }
+
+    #[test]
+    fn missing_process_tool_names_the_package_and_says_nothing_changed() {
+        let missing = io::Error::from(io::ErrorKind::NotFound);
+        let ps = process_listing_unavailable("ps", &missing);
+        assert!(ps.contains("`ps` is not installed"), "{ps}");
+        assert!(ps.contains("procps"), "{ps}");
+        assert!(ps.contains("before changing anything"), "{ps}");
+        let tasklist = process_listing_unavailable("tasklist", &missing);
+        assert!(tasklist.contains("System32"), "{tasklist}");
+        let denied = process_listing_unavailable("ps", &io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(!denied.contains("not installed"), "{denied}");
+        assert!(denied.contains("could not run `ps`"), "{denied}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ps_line_parses_pid_then_name() {
+        assert_eq!(parse_process_line("  4242 agentpalace"), ("4242".to_owned(), "agentpalace".to_owned()));
+        assert_eq!(parse_process_line(""), (String::new(), String::new()));
     }
 
     #[cfg(unix)]
