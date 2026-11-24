@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
 
 /**
@@ -39,30 +40,78 @@ export function killProcessTree(child) {
 }
 
 /**
- * Resolve Windows npm shims (`codex` -> `codex.cmd`) when spawning directly
- * without `shell: true`, avoiding cmd.exe argument-quoting bugs.
+ * Resolve a bare command name on Windows by scanning `PATH` for `.exe`, `.com`,
+ * `.ps1`, `.cmd`, `.bat` (preferring direct executables and `.ps1` over `.cmd`
+ * so we avoid `shell: true`, Node DEP0190 warnings, and `cmd.exe` space splitting).
  */
-function resolveSpawnSpec(command, args) {
+function findWindowsExecutable(command, env = process.env) {
+  if (command.includes('\\') || command.includes('/')) {
+    return command;
+  }
+
+  const pathEntries = (env.PATH || env.Path || '').split(';').filter(Boolean);
+  const hasExt = /\.[a-z0-9]+$/i.test(command);
+  const exts = hasExt ? [''] : ['.exe', '.com', '.ps1', '.cmd', '.bat'];
+
+  for (const dir of pathEntries) {
+    for (const ext of exts) {
+      const candidate = path.join(dir, command + ext);
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return command;
+}
+
+/**
+ * Resolve PowerShell binary on Windows: prefer `pwsh.exe` if on PATH, otherwise
+ * fall back to built-in `powershell.exe` (available on stock Windows).
+ */
+function resolveWindowsPowerShell(env = process.env) {
+  const pwsh = findWindowsExecutable('pwsh.exe', env);
+  if (pwsh !== 'pwsh.exe') {
+    return pwsh;
+  }
+  return 'powershell.exe';
+}
+
+/**
+ * Resolve spawn specification across Windows and POSIX without `shell: true`
+ * whenever a direct `.exe` or `.ps1` binary is available.
+ */
+export function resolveSpawnSpec(command, args, env = process.env) {
   if (process.platform !== 'win32') {
     return { cmd: command, args, useShell: false };
   }
 
-  const lower = command.toLowerCase();
+  const resolved = findWindowsExecutable(command, env);
+  const lower = resolved.toLowerCase();
+
   if (lower.endsWith('.ps1')) {
     return {
-      cmd: 'pwsh',
-      args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', command, ...args],
+      cmd: resolveWindowsPowerShell(env),
+      args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', resolved, ...args],
       useShell: false,
     };
   }
   if (lower.endsWith('.exe') || lower.endsWith('.com')) {
-    return { cmd: command, args, useShell: false };
+    return { cmd: resolved, args, useShell: false };
+  }
+  if (lower.endsWith('.cmd') || lower.endsWith('.bat')) {
+    // Prefer a sibling .ps1 shim (npm installs both .cmd and .ps1) to avoid cmd.exe quoting.
+    const ps1Sibling = resolved.replace(/\.(cmd|bat)$/i, '.ps1');
+    if (fs.existsSync(ps1Sibling)) {
+      return {
+        cmd: resolveWindowsPowerShell(env),
+        args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1Sibling, ...args],
+        useShell: false,
+      };
+    }
+    return { cmd: resolved, args, useShell: true };
   }
 
-  // On Windows, bare command names like `codex` or `opencode` are often `.cmd`
-  // shims in %APPDATA%\npm. Using `shell: true` only when the prompt is NOT
-  // passed as a raw CLI string keeps stdin/file delivery completely safe.
-  return { cmd: command, args, useShell: true };
+  return { cmd: resolved, args, useShell: false };
 }
 
 /**
@@ -83,7 +132,7 @@ export async function runHarnessProcess({
   const finalArgs = [...args];
 
   if (promptDelivery === 'file') {
-    tempPromptFile = path.join(os.tmpdir(), `agentpalace-prompt-${process.pid}-${Date.now()}.txt`);
+    tempPromptFile = path.join(os.tmpdir(), `agentpalace-prompt-${process.pid}-${crypto.randomUUID()}.txt`);
     await fsp.writeFile(tempPromptFile, prompt, 'utf8');
     for (let i = 0; i < finalArgs.length; i++) {
       finalArgs[i] = finalArgs[i].replaceAll('{promptFile}', tempPromptFile);
@@ -99,7 +148,8 @@ export async function runHarnessProcess({
   }
 
   const startedAt = Date.now();
-  const spec = resolveSpawnSpec(command, finalArgs);
+  const mergedEnv = { ...process.env, ...env };
+  const spec = resolveSpawnSpec(command, finalArgs, mergedEnv);
 
   try {
     return await new Promise((resolve) => {
@@ -116,7 +166,7 @@ export async function runHarnessProcess({
 
       const child = spawn(spec.cmd, spec.args, {
         cwd,
-        env: { ...process.env, ...env },
+        env: mergedEnv,
         shell: spec.useShell,
         detached: process.platform !== 'win32',
         windowsHide: true,
@@ -181,10 +231,12 @@ export async function runHarnessProcess({
         });
       });
 
-      if (promptDelivery === 'stdin' && child.stdin) {
-        child.stdin.write(prompt);
-        child.stdin.end();
-      } else if (child.stdin) {
+      if (child.stdin) {
+        // Guard against EPIPE / ENOENT if the child exits before reading stdin.
+        child.stdin.on('error', () => {});
+        if (promptDelivery === 'stdin') {
+          child.stdin.write(prompt);
+        }
         child.stdin.end();
       }
     });

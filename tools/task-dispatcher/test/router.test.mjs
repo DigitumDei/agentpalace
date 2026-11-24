@@ -128,8 +128,8 @@ test('evaluatePendingTask enforces executor, dependencies, repo mapping, and rou
   assert.equal(ok.repoPath, '/repos/agentpalace');
 });
 
-test('buildBootstrapPrompt keeps task authoritative and includes guardrails', () => {
-  const prompt = buildBootstrapPrompt({
+test('buildBootstrapPrompt keeps task authoritative, uses agentpalace_message_acknowledge, and numbers steps sequentially', () => {
+  const withMsg = buildBootstrapPrompt({
     task: { task_id: 'task_abc', wing: 'wing_shotquill', title: 'Review PR' },
     contract: { mode: 'read_only' },
     harnessName: 'codex',
@@ -137,9 +137,35 @@ test('buildBootstrapPrompt keeps task authoritative and includes guardrails', ()
     messageIds: ['msg_1', 'msg_2'],
     claimMode: 'agent',
   });
-  assert.match(prompt, /task_abc/);
-  assert.match(prompt, /msg_1, msg_2/);
-  assert.match(prompt, /READ-ONLY/);
+  assert.match(withMsg, /task_abc/);
+  assert.match(withMsg, /msg_1, msg_2/);
+  assert.match(withMsg, /agentpalace_message_acknowledge/);
+  assert.doesNotMatch(withMsg, /agentpalace_message_ack\b/);
+  assert.match(withMsg, /READ-ONLY/);
+
+  const noMsg = buildBootstrapPrompt({
+    task: { task_id: 'task_xyz', wing: 'wing_shotquill', title: 'Review PR' },
+    contract: { mode: 'read_only' },
+    harnessName: 'claude',
+    trigger: 'pending',
+    messageIds: [],
+    claimMode: 'agent',
+  });
+  assert.match(noMsg, /\n1\. /);
+  assert.match(noMsg, /\n2\. Claim task/);
+  assert.match(noMsg, /\n3\. Execute only/);
+  assert.match(noMsg, /\n4\. When finished/);
+});
+
+test('parseDispatchContract ignores null numeric fields and rejects unsafe branch names', () => {
+  const desc = '```dispatcher\n{"target":"claude","maxRounds":null,"timeoutMs":null,"branch":"../bad"}\n```';
+  const contract = parseDispatchContract(desc);
+  assert.equal(contract.maxRounds, undefined);
+  assert.equal(contract.timeoutMs, undefined);
+  assert.equal(contract.branch, undefined);
+
+  const safe = parseDispatchContract('```dispatcher\n{"branch":"feat/my-branch_1"}\n```');
+  assert.equal(safe.branch, 'feat/my-branch_1');
 });
 
 test('buildHarnessInvocation formats claude, codex, opencode, and custom adapters', () => {

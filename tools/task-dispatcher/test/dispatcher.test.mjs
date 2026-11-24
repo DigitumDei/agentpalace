@@ -186,23 +186,122 @@ test('TaskDispatcher wakes harness on unread inbox messages and enforces ping-po
     assert.equal(r2.length, 1);
     assert.equal(r2[0].harnessName, 'codex');
 
-    // Round 3: cap (2) is reached -> must NOT wake claude again.
+    // Round 3 & 4: cap (2) is reached -> must NOT wake claude again, and notify at most once.
     inboxMessages = [{ message_id: 'msg_3', task_id: 'task_discuss', recipient: 'claude' }];
+    let notifyCount = 0;
+    dispatcher._notify = async () => {
+      notifyCount += 1;
+    };
     const r3 = await dispatcher.pollOnce();
+    const r4 = await dispatcher.pollOnce();
     await dispatcher.waitForInflight();
     assert.equal(r3.length, 0);
+    assert.equal(r4.length, 0);
+    assert.equal(notifyCount, 1);
     assert.equal(runs.length, 2);
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 });
 
-test('runHarnessProcess delivers prompt via stdin and kills process on timeout', async () => {
+test('TaskDispatcher paginates listTasks via next_cursor and retries inbox messages after crash', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ap-disp-page-'));
+  try {
+    const taskPage2 = {
+      task_id: 'task_p2',
+      title: 'Page 2 task',
+      description: '```dispatcher\n{"target":"claude"}\n```',
+      state: 'pending',
+      revision: 1,
+      wing: 'wing_agents',
+      dependencies: [],
+    };
+    const inboxTask = {
+      task_id: 'task_retry',
+      title: 'Retry inbox task',
+      description: '```dispatcher\n{"maxRounds": 3}\n```',
+      state: 'input_required',
+      revision: 1,
+      wing: 'wing_agents',
+      dependencies: [],
+    };
+
+    let attempt = 0;
+    const client = {
+      async listTasks({ cursor }) {
+        if (!cursor) return { tasks: [], next_cursor: 'page2' };
+        return { tasks: [taskPage2], next_cursor: null };
+      },
+      async getTask(id) {
+        return id === 'task_p2' ? taskPage2 : inboxTask;
+      },
+      async readInbox({ recipient }) {
+        if (recipient !== 'codex') return { messages: [] };
+        return { messages: [{ message_id: 'msg_crash', task_id: 'task_retry', recipient: 'codex' }] };
+      },
+    };
+
+    const dispatcher = new TaskDispatcher({
+      config: makeBaseConfig(tmpDir),
+      client,
+      runner: async (opts) => {
+        attempt += 1;
+        // First inbox attempt crashes (exit 1), second succeeds (exit 0).
+        if (opts.prompt.includes('msg_crash') && attempt <= 2) {
+          return { exitCode: 1, timedOut: false, durationMs: 5, logPath: opts.logPath };
+        }
+        return { exitCode: 0, timedOut: false, durationMs: 5, logPath: opts.logPath };
+      },
+      logger: { log() {}, warn() {}, error() {} },
+    });
+
+    await dispatcher.loadState();
+    const first = await dispatcher.pollOnce();
+    await dispatcher.waitForInflight();
+    // Found page-2 pending task + inbox task!
+    assert.equal(first.length, 2);
+    // Crashed inbox message was NOT marked seen, so next poll retries it.
+    assert.equal(dispatcher.state.seenMessageIds.msg_crash, undefined);
+
+    taskPage2.state = 'completed';
+    const second = await dispatcher.pollOnce();
+    await dispatcher.waitForInflight();
+    assert.equal(second.length, 1);
+    assert.equal(second[0].taskId, 'task_retry');
+    assert.ok(dispatcher.state.seenMessageIds.msg_crash);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('runHarnessProcess handles immediate exit / broken stdin pipe without crashing', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ap-epipe-'));
+  try {
+    const res = await runHarnessProcess({
+      command: process.execPath,
+      args: ['-e', 'process.exit(0)'],
+      cwd: tmpDir,
+      prompt: 'x'.repeat(256 * 1024),
+      promptDelivery: 'stdin',
+      timeoutMs: 5000,
+      logPath: path.join(tmpDir, 'epipe.log'),
+    });
+    assert.equal(res.exitCode, 0);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('runHarnessProcess delivers prompt via stdin, preserves spaces in args, and kills process on timeout', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ap-proc-'));
   try {
     const ok = await runHarnessProcess({
       command: process.execPath,
-      args: ['-e', 'let d=""; process.stdin.on("data",c=>d+=c); process.stdin.on("end",()=>process.stdout.write("ECHO:"+d.trim()));'],
+      args: [
+        '-e',
+        'let d=""; process.stdin.on("data",c=>d+=c); process.stdin.on("end",()=>process.stdout.write("ARG:" + process.argv[1] + "|STDIN:" + d.trim()));',
+        'Bash(git *),Bash(node *)',
+      ],
       cwd: tmpDir,
       prompt: 'hello-palace\n',
       promptDelivery: 'stdin',
@@ -211,7 +310,7 @@ test('runHarnessProcess delivers prompt via stdin and kills process on timeout',
     });
     assert.equal(ok.exitCode, 0);
     assert.equal(ok.timedOut, false);
-    assert.equal(ok.stdoutTail, 'ECHO:hello-palace');
+    assert.equal(ok.stdoutTail, 'ARG:Bash(git *),Bash(node *)|STDIN:hello-palace');
 
     const timedOut = await runHarnessProcess({
       command: process.execPath,

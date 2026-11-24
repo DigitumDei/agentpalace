@@ -37,9 +37,16 @@ export async function ensureWorktree({ repoPath, worktreeRoot, taskId, branch, b
   try {
     const stat = await fs.stat(worktreePath);
     if (stat.isDirectory()) {
+      // Verify the existing directory is actually a git worktree (has a .git marker).
+      try {
+        await fs.access(path.join(worktreePath, '.git'));
+      } catch {
+        throw new Error(`Directory "${worktreePath}" already exists but is not a git worktree.`);
+      }
       return { worktreePath, branchName, reused: true };
     }
-  } catch {
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
     // Does not exist yet; create it below.
   }
 

@@ -84,9 +84,12 @@ async function main() {
 
   let shuttingDown = false;
   const shutdown = async (signal) => {
-    if (shuttingDown) return;
+    if (shuttingDown) {
+      console.error(`\n[dispatcher] Second ${signal} received; forcing immediate exit.`);
+      process.exit(130);
+    }
     shuttingDown = true;
-    console.log(`\n[dispatcher] Received ${signal}; waiting for active runs to finish...`);
+    console.log(`\n[dispatcher] Received ${signal}; waiting for active runs to finish (press Ctrl-C again to force exit)...`);
     await dispatcher.stop();
     await palaceHandle.stop();
     process.exit(0);

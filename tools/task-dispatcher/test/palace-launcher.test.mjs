@@ -63,6 +63,31 @@ test('ensurePalaceServer refuses to auto-start non-loopback URLs', async () => {
   );
 });
 
+test('ensurePalaceServer refuses keepAlive=true without a persistent token or tokenFile', async () => {
+  const client = {
+    token: '',
+    async health() {
+      throw new Error('ECONNREFUSED');
+    },
+  };
+  await assert.rejects(
+    () =>
+      ensurePalaceServer({
+        config: {
+          palace: {
+            baseUrl: 'http://127.0.0.1:8775',
+            token: '',
+            autoStart: { enabled: true, keepAlive: true, tokenFile: '' },
+          },
+          paths: { logDir: os.tmpdir() },
+        },
+        client,
+        logger: { log() {}, warn() {}, error() {} },
+      }),
+    /keepAlive=true requires a persistent/,
+  );
+});
+
 test('ensurePalaceServer spawns local server, creates ephemeral token file, waits for health, and stops cleanly', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ap-launcher-'));
   try {

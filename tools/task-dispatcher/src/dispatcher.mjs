@@ -32,8 +32,8 @@ export class TaskDispatcher {
     this.harnessActiveCount = new Map();
     /** @type {Map<string, { revision: number, task: any }>} */
     this.taskCache = new Map();
-    /** @type {{ roundsByTask: Record<string, number>, seenMessageIds: Record<string, string> }} */
-    this.state = { roundsByTask: {}, seenMessageIds: {} };
+    /** @type {{ roundsByTask: Record<string, number>, seenMessageIds: Record<string, string>, notifiedRoundCapByTask: Record<string, string> }} */
+    this.state = { roundsByTask: {}, seenMessageIds: {}, notifiedRoundCapByTask: {} };
 
     this._stopRequested = false;
     this._timer = null;
@@ -47,9 +47,13 @@ export class TaskDispatcher {
       this.state = {
         roundsByTask: parsed.roundsByTask && typeof parsed.roundsByTask === 'object' ? parsed.roundsByTask : {},
         seenMessageIds: parsed.seenMessageIds && typeof parsed.seenMessageIds === 'object' ? parsed.seenMessageIds : {},
+        notifiedRoundCapByTask:
+          parsed.notifiedRoundCapByTask && typeof parsed.notifiedRoundCapByTask === 'object'
+            ? parsed.notifiedRoundCapByTask
+            : {},
       };
     } catch {
-      this.state = { roundsByTask: {}, seenMessageIds: {} };
+      this.state = { roundsByTask: {}, seenMessageIds: {}, notifiedRoundCapByTask: {} };
     }
   }
 
@@ -108,6 +112,37 @@ export class TaskDispatcher {
     }
   }
 
+  async _listAllPendingTasks(wing, maxPages = 20) {
+    const all = [];
+    let cursor = undefined;
+    for (let pageIdx = 0; pageIdx < maxPages; pageIdx++) {
+      const page = await this.client.listTasks({ state: 'pending', wing, limit: 50, cursor });
+      const rows = page.tasks ?? [];
+      all.push(...rows);
+      if (!page.next_cursor || page.next_cursor === cursor) break;
+      cursor = page.next_cursor;
+    }
+    return all;
+  }
+
+  async _readAllUnreadInbox(recipient, maxPages = 20) {
+    const all = [];
+    let cursor = undefined;
+    for (let pageIdx = 0; pageIdx < maxPages; pageIdx++) {
+      const page = await this.client.readInbox({
+        recipient,
+        unacknowledgedOnly: true,
+        limit: 50,
+        cursor,
+      });
+      const rows = page.messages ?? [];
+      all.push(...rows);
+      if (!page.next_cursor || page.next_cursor === cursor) break;
+      cursor = page.next_cursor;
+    }
+    return all;
+  }
+
   /**
    * Perform a single poll cycle across pending tasks and enabled harness inboxes.
    * Returns a summary of dispatches launched or planned (in dry-run mode).
@@ -118,8 +153,8 @@ export class TaskDispatcher {
     if (this.config.polling.watchPendingTasks) {
       const wings = this.config.polling.wings.length > 0 ? this.config.polling.wings : [undefined];
       for (const wing of wings) {
-        const page = await this.client.listTasks({ state: 'pending', wing, limit: 50 });
-        for (const summary of page.tasks ?? []) {
+        const summaries = await this._listAllPendingTasks(wing);
+        for (const summary of summaries) {
           if (this.activeRuns.size >= this.config.limits.maxConcurrent) break;
           if (this.activeRuns.has(summary.task_id)) continue;
 
@@ -138,8 +173,13 @@ export class TaskDispatcher {
           });
 
           if (!decision.eligible) {
-            if (decision.capReached) {
+            if (decision.capReached && !this.state.notifiedRoundCapByTask[task.task_id]) {
               this.logger.warn(`[dispatcher] Skipping ${task.task_id}: ${decision.reason}`);
+              this.state.notifiedRoundCapByTask[task.task_id] = new Date().toISOString();
+              await this.saveState();
+              await this._notify(
+                `[AgentPalace Dispatcher] Task \`${task.task_id}\` reached max rounds (${decision.reason}). Human review needed.`,
+              );
             }
             continue;
           }
@@ -167,15 +207,11 @@ export class TaskDispatcher {
       for (const harness of enabledHarnesses) {
         if (!this._canRunHarness(harness.name)) continue;
 
-        const inbox = await this.client.readInbox({
-          recipient: harness.name,
-          unacknowledgedOnly: true,
-          limit: 50,
-        });
+        const inboxMessages = await this._readAllUnreadInbox(harness.name);
 
         // Group unread, unseen messages by task_id.
         const byTask = new Map();
-        for (const msg of inbox.messages ?? []) {
+        for (const msg of inboxMessages) {
           if (this.state.seenMessageIds[msg.message_id]) continue;
           const list = byTask.get(msg.task_id) ?? [];
           list.push(msg);
@@ -205,12 +241,16 @@ export class TaskDispatcher {
           const maxRounds = contract.maxRounds ?? this.config.limits.defaultMaxRounds;
           const roundsUsed = this.state.roundsByTask[taskId] ?? 0;
           if (roundsUsed >= maxRounds) {
-            this.logger.warn(
-              `[dispatcher] Ping-pong cap reached for ${taskId} (${roundsUsed}/${maxRounds}); leaving unread messages for human review.`,
-            );
-            await this._notify(
-              `[AgentPalace Dispatcher] Task \`${taskId}\` reached max rounds (${maxRounds}) with unread messages for \`${harness.name}\`. Human input needed.`,
-            );
+            if (!this.state.notifiedRoundCapByTask[taskId]) {
+              this.logger.warn(
+                `[dispatcher] Ping-pong cap reached for ${taskId} (${roundsUsed}/${maxRounds}); leaving unread messages for human review.`,
+              );
+              this.state.notifiedRoundCapByTask[taskId] = new Date().toISOString();
+              await this.saveState();
+              await this._notify(
+                `[AgentPalace Dispatcher] Task \`${taskId}\` reached max rounds (${maxRounds}) with unread messages for \`${harness.name}\`. Human input needed.`,
+              );
+            }
             continue;
           }
 
@@ -271,32 +311,15 @@ export class TaskDispatcher {
   async _executeRun({ task, contract, harnessName, repoPath, trigger, messageIds }) {
     const harness = this.config.harnesses[harnessName];
     let claimedTask = task;
+    let dispatcherClaimed = false;
     let leaseTimer = null;
 
     try {
-      // Optional dispatcher-owned claim + lease renewal heartbeat.
-      if (this.config.limits.claimMode === 'dispatcher' && task.state === 'pending') {
-        claimedTask = await this.client.claimTask(task.task_id, {
-          expectedRevision: task.revision,
-          leaseSeconds: this.config.limits.leaseSeconds,
-          worker: harnessName,
-        });
-        const renewEveryMs = Math.max(15000, Math.floor((this.config.limits.leaseSeconds * 1000) / 2));
-        leaseTimer = setInterval(async () => {
-          try {
-            claimedTask = await this.client.renewTask(claimedTask.task_id, {
-              expectedRevision: claimedTask.revision,
-              leaseSeconds: this.config.limits.leaseSeconds,
-              worker: harnessName,
-            });
-          } catch (err) {
-            this.logger.warn(`[dispatcher] Lease renewal failed for ${task.task_id}: ${err.message}`);
-          }
-        }, renewEveryMs);
-        leaseTimer.unref?.();
-      }
+      // Increment round count up front so repeated worktree/setup errors also hit maxRounds.
+      this.state.roundsByTask[task.task_id] = (this.state.roundsByTask[task.task_id] ?? 0) + 1;
+      await this.saveState();
 
-      // Prepare working directory (isolated git worktree for mutating modes).
+      // Prepare working directory BEFORE claiming so worktree failures never leak a lease.
       let cwd = repoPath || process.cwd();
       let worktreePath = null;
       if (contract.mode === 'worktree_branch' || contract.mode === 'draft_pr') {
@@ -311,12 +334,28 @@ export class TaskDispatcher {
         worktreePath = wt.worktreePath;
       }
 
-      // Record round and mark triggering messages as dispatched so they don't re-fire concurrently.
-      this.state.roundsByTask[task.task_id] = (this.state.roundsByTask[task.task_id] ?? 0) + 1;
-      for (const id of messageIds) {
-        this.state.seenMessageIds[id] = new Date().toISOString();
+      // Optional dispatcher-owned claim + lease renewal heartbeat.
+      if (this.config.limits.claimMode === 'dispatcher' && task.state === 'pending') {
+        claimedTask = await this.client.claimTask(task.task_id, {
+          expectedRevision: task.revision,
+          leaseSeconds: this.config.limits.leaseSeconds,
+          worker: harnessName,
+        });
+        dispatcherClaimed = true;
+        const renewEveryMs = Math.max(15000, Math.floor((this.config.limits.leaseSeconds * 1000) / 2));
+        leaseTimer = setInterval(async () => {
+          try {
+            claimedTask = await this.client.renewTask(claimedTask.task_id, {
+              expectedRevision: claimedTask.revision,
+              leaseSeconds: this.config.limits.leaseSeconds,
+              worker: harnessName,
+            });
+          } catch (err) {
+            this.logger.warn(`[dispatcher] Lease renewal failed for ${task.task_id}: ${err.message}`);
+          }
+        }, renewEveryMs);
+        leaseTimer.unref?.();
       }
-      await this.saveState();
 
       const prompt = buildBootstrapPrompt({
         task: claimedTask,
@@ -355,6 +394,15 @@ export class TaskDispatcher {
         logPath,
       });
 
+      // Only suppress re-wake for triggering inbox messages when the harness exited cleanly.
+      // If it crashed or timed out, keep them eligible for retry (bounded by maxRounds).
+      if (runResult.exitCode === 0 && !runResult.timedOut && messageIds.length > 0) {
+        for (const id of messageIds) {
+          this.state.seenMessageIds[id] = new Date().toISOString();
+        }
+        await this.saveState();
+      }
+
       // Authoritative post-exit verification (per docs/Agent-Task-Handoffs.md):
       // Process exit 0 alone is NOT proof of task completion.
       let afterTask = null;
@@ -363,6 +411,25 @@ export class TaskDispatcher {
         this.taskCache.set(task.task_id, { revision: afterTask.revision, task: afterTask });
       } catch (err) {
         this.logger.warn(`[dispatcher] Post-exit task fetch failed for ${task.task_id}: ${err.message}`);
+      }
+
+      // If dispatcher owns the lease and the harness crashed/timed out while still running,
+      // yield back to pending so the lease isn't stranded until expiry.
+      if (
+        dispatcherClaimed &&
+        afterTask?.state === 'running' &&
+        (runResult.exitCode !== 0 || runResult.timedOut)
+      ) {
+        try {
+          afterTask = await this.client.transitionTask(afterTask.task_id, {
+            expectedRevision: afterTask.revision,
+            state: 'pending',
+            actor: harnessName,
+            details: { reason: runResult.timedOut ? 'dispatcher_timeout' : 'harness_nonzero_exit', exitCode: runResult.exitCode },
+          });
+        } catch (err) {
+          this.logger.warn(`[dispatcher] Failed to release lease for ${task.task_id}: ${err.message}`);
+        }
       }
 
       const finalState = afterTask?.state ?? 'unknown';

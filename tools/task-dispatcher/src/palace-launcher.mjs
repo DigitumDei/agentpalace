@@ -3,7 +3,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import { killProcessTree } from './process-runner.mjs';
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
@@ -43,6 +43,47 @@ export async function resolvePalaceBinary(configuredCommand) {
   }
 }
 
+function gracefulStopChild(child, alreadyExited, graceMs = 3000) {
+  if (alreadyExited() || !child?.pid) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve();
+    };
+
+    child.once('exit', finish);
+
+    if (process.platform === 'win32') {
+      // Request graceful termination first, then force-kill tree if still alive.
+      execFile('taskkill', ['/PID', String(child.pid), '/T'], { windowsHide: true }, () => {});
+    } else {
+      try {
+        process.kill(-child.pid, 'SIGTERM');
+      } catch {
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          finish();
+          return;
+        }
+      }
+    }
+
+    const timer = setTimeout(() => {
+      if (!alreadyExited()) {
+        killProcessTree(child);
+      }
+      finish();
+    }, graceMs);
+    timer.unref?.();
+  });
+}
+
 /**
  * Ensure an AgentPalace HTTP server is reachable at `config.palace.baseUrl`.
  *
@@ -50,9 +91,9 @@ export async function resolvePalaceBinary(configuredCommand) {
  * - If unreachable and `config.palace.autoStart.enabled` is true (and `baseUrl` is
  *   loopback), spawns `agentpalace serve`, waits for `/v1/health` readiness, and
  *   returns a `stop()` handle that cleanly tears down the child process on exit.
- * - If neither `palace.token` nor `autoStart.tokenFile` is configured, generates an
- *   ephemeral `0600` bearer token file for the spawned local server and sets
- *   `client.token` automatically.
+ * - If neither `palace.token` nor `autoStart.tokenFile` is configured (and
+ *   `keepAlive` is false), generates an ephemeral `0600` bearer token file for
+ *   the spawned local server and sets `client.token` automatically.
  */
 export async function ensurePalaceServer({
   config,
@@ -82,14 +123,20 @@ export async function ensurePalaceServer({
     );
   }
 
+  let ephemeralTokenFile = null;
+  let activeToken = client.token;
+
+  if (auto.keepAlive && !auto.tokenFile && !activeToken) {
+    throw new Error(
+      'Config error: palace.autoStart.keepAlive=true requires a persistent palace.token (and optional tokenFile). An ephemeral generated token cannot be reused by the next dispatcher startup.',
+    );
+  }
+
   const command = await resolvePalaceBinary(auto.command);
   const args = ['serve', '--bind', bindAddr];
   if (auto.palacePath) {
     args.push('--palace', auto.palacePath);
   }
-
-  let ephemeralTokenFile = null;
-  let activeToken = client.token;
 
   if (auto.tokenFile) {
     args.push('--token-file', auto.tokenFile);
@@ -97,7 +144,7 @@ export async function ensurePalaceServer({
     activeToken = crypto.randomBytes(32).toString('hex');
     ephemeralTokenFile = path.join(
       os.tmpdir(),
-      `agentpalace-dispatcher-tokens-${process.pid}-${Date.now()}.json`,
+      `agentpalace-dispatcher-tokens-${process.pid}-${crypto.randomUUID()}.json`,
     );
     const payload = JSON.stringify(
       [{ name: 'dispatcher', token: activeToken, enabled: true }],
@@ -118,18 +165,41 @@ export async function ensurePalaceServer({
 
   const logPath = path.join(config.paths.logDir, 'agentpalace-serve.log');
   await fsp.mkdir(path.dirname(logPath), { recursive: true });
-  const logStream = fs.createWriteStream(logPath, { flags: 'a' });
-  logStream.write(`\n=== Auto-starting AgentPalace at ${new Date().toISOString()} ===\n`);
-  logStream.write(`Command: ${command} ${args.join(' ')}\n\n`);
+  await fsp.appendFile(
+    logPath,
+    `\n=== Auto-starting AgentPalace at ${new Date().toISOString()} ===\nCommand: ${command} ${args.join(' ')}\n\n`,
+    'utf8',
+  );
 
-  logger.log(`[dispatcher] AgentPalace not reachable at ${config.palace.baseUrl}; starting "${command} ${args.join(' ')}"...`);
+  logger.log(
+    `[dispatcher] AgentPalace not reachable at ${config.palace.baseUrl}; starting "${command} ${args.join(' ')}"...`,
+  );
+
+  let logStream = null;
+  let detachedLogFd = null;
+  let stdio;
+
+  if (auto.keepAlive) {
+    // Redirect directly to a file descriptor so the child survives dispatcher exit
+    // without EPIPE or keeping the parent event loop alive.
+    detachedLogFd = fs.openSync(logPath, 'a');
+    stdio = ['ignore', detachedLogFd, detachedLogFd];
+  } else {
+    logStream = fs.createWriteStream(logPath, { flags: 'a' });
+    stdio = ['ignore', 'pipe', 'pipe'];
+  }
 
   const child = spawnImpl(command, args, {
     env: { ...process.env, ...(auto.env ?? {}) },
-    detached: process.platform !== 'win32',
+    detached: auto.keepAlive || process.platform !== 'win32',
     windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio,
   });
+
+  if (detachedLogFd !== null) {
+    fs.closeSync(detachedLogFd);
+    detachedLogFd = null;
+  }
 
   let exited = false;
   let exitCode = null;
@@ -137,12 +207,12 @@ export async function ensurePalaceServer({
   let stderrTail = '';
 
   child.stdout?.on('data', (chunk) => {
-    logStream.write(chunk);
+    logStream?.write(chunk);
   });
   child.stderr?.on('data', (chunk) => {
     const text = chunk.toString('utf8');
     stderrTail = (stderrTail + text).slice(-2048);
-    logStream.write(text);
+    logStream?.write(text);
   });
   child.on('error', (err) => {
     spawnErr = err;
@@ -154,10 +224,8 @@ export async function ensurePalaceServer({
   });
 
   const cleanup = async () => {
-    if (!exited) {
-      killProcessTree(child);
-    }
-    logStream.end();
+    await gracefulStopChild(child, () => exited);
+    logStream?.end();
     if (ephemeralTokenFile) {
       await fsp.rm(ephemeralTokenFile, { force: true }).catch(() => {});
       ephemeralTokenFile = null;
@@ -179,6 +247,9 @@ export async function ensurePalaceServer({
     try {
       await client.health();
       logger.log(`[dispatcher] AgentPalace is ready at ${config.palace.baseUrl} (pid=${child.pid}, log=${logPath}).`);
+      if (auto.keepAlive) {
+        child.unref?.();
+      }
       return {
         started: true,
         pid: child.pid ?? null,
@@ -187,7 +258,6 @@ export async function ensurePalaceServer({
         stop: async () => {
           if (auto.keepAlive) {
             logger.log(`[dispatcher] Leaving auto-started AgentPalace running (pid=${child.pid}, keepAlive=true).`);
-            logStream.end();
             return;
           }
           logger.log(`[dispatcher] Stopping auto-started AgentPalace (pid=${child.pid})...`);

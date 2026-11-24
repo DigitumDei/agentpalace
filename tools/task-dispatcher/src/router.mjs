@@ -41,17 +41,35 @@ export function parseDispatchContract(description = '') {
   return {};
 }
 
+function isSafeBranchName(branch) {
+  if (typeof branch !== 'string') return false;
+  const trimmed = branch.trim();
+  if (!trimmed || trimmed.startsWith('-') || trimmed.startsWith('/') || trimmed.endsWith('/')) return false;
+  if (trimmed.includes('..') || trimmed.includes('@{') || trimmed.endsWith('.lock')) return false;
+  return /^[A-Za-z0-9._/-]+$/.test(trimmed);
+}
+
 function normalizeContract(obj) {
   const mode = obj.mode ?? 'read_only';
+  const maxRounds =
+    typeof obj.maxRounds === 'number' && Number.isFinite(obj.maxRounds)
+      ? Math.max(1, Math.floor(obj.maxRounds))
+      : undefined;
+  const timeoutMs =
+    typeof obj.timeoutMs === 'number' && Number.isFinite(obj.timeoutMs)
+      ? Math.max(10000, Math.floor(obj.timeoutMs))
+      : undefined;
+  const branch = isSafeBranchName(obj.branch) ? obj.branch.trim() : undefined;
+
   return {
     target: typeof obj.target === 'string' ? obj.target.trim().toLowerCase() : undefined,
     executor: typeof obj.executor === 'string' ? obj.executor.trim() : undefined,
     mode: ['read_only', 'worktree_branch', 'draft_pr'].includes(mode) ? mode : 'read_only',
     repo: typeof obj.repo === 'string' ? obj.repo.trim().toLowerCase() : undefined,
-    baseRef: typeof obj.baseRef === 'string' ? obj.baseRef.trim() : undefined,
-    branch: typeof obj.branch === 'string' ? obj.branch.trim() : undefined,
-    maxRounds: Number.isFinite(Number(obj.maxRounds)) ? Math.max(1, Number(obj.maxRounds)) : undefined,
-    timeoutMs: Number.isFinite(Number(obj.timeoutMs)) ? Math.max(10000, Number(obj.timeoutMs)) : undefined,
+    baseRef: typeof obj.baseRef === 'string' && obj.baseRef.trim() ? obj.baseRef.trim() : undefined,
+    branch,
+    maxRounds,
+    timeoutMs,
     allowCommit: Boolean(obj.allowCommit),
     allowPush: Boolean(obj.allowPush),
   };
@@ -154,16 +172,30 @@ export function buildBootstrapPrompt({ task, contract, harnessName, worktreePath
     lines.push(`Working directory (isolated worktree): ${worktreePath}`);
   }
 
-  lines.push('', 'Workflow protocol:');
-  lines.push(`1. Retrieve task "${task.task_id}" via agentpalace_task_get — the task description is the authoritative specification.`);
+  const steps = [
+    `Retrieve task "${task.task_id}" via agentpalace_task_get — the task description is the authoritative specification.`,
+  ];
   if (messageIds.length > 0) {
-    lines.push(`2. Read the triggering message(s) (${messageIds.join(', ')}) via agentpalace_message_get and acknowledge them with agentpalace_message_ack once handled.`);
+    steps.push(
+      `Read the triggering message(s) (${messageIds.join(', ')}) via agentpalace_message_get and acknowledge them with agentpalace_message_acknowledge once handled.`,
+    );
   }
   if (claimMode === 'agent' && trigger === 'pending') {
-    lines.push(`3. Claim task "${task.task_id}" as "${harnessName}" via agentpalace_task_claim before making changes.`);
+    steps.push(
+      `Claim task "${task.task_id}" as "${harnessName}" via agentpalace_task_claim before making changes.`,
+    );
   }
-  lines.push('4. Execute only the bounded scope described in the task. Preserve any unrelated dirty files.');
-  lines.push('5. When finished (or if blocked/awaiting review), publish results via agentpalace_result_put / agentpalace_message_send and transition the task state (`input_required` for review/handoff, or `completed` if final).');
+  steps.push('Execute only the bounded scope described in the task. Preserve any unrelated dirty files.');
+  steps.push(
+    claimMode === 'dispatcher'
+      ? 'When finished (or if blocked/awaiting review), publish results via agentpalace_result_put / agentpalace_message_send. The dispatcher owns the task lease and will inspect/reconcile state on exit.'
+      : 'When finished (or if blocked/awaiting review), publish results via agentpalace_result_put / agentpalace_message_send and transition the task state (`input_required` for review/handoff, or `completed` if final).',
+  );
+
+  lines.push('', 'Workflow protocol:');
+  steps.forEach((step, idx) => {
+    lines.push(`${idx + 1}. ${step}`);
+  });
 
   lines.push('', 'Repository guardrails:');
   if (contract.mode === 'read_only') {
