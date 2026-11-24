@@ -407,7 +407,25 @@ jobs:
 
       - name: Install protobuf compiler (Windows)
         if: runner.os == 'Windows'
-        run: choco install protoc --no-progress -y
+        shell: pwsh
+        run: |
+          # Chocolatey can exit 0 without installing anything when its feed
+          # times out, so retry and verify protoc rather than trust the exit code.
+          $attempts = 4
+          for ($i = 1; $i -le $attempts; $i++) {
+            choco install protoc --no-progress -y
+            if (Get-Command protoc -ErrorAction SilentlyContinue) { break }
+            if ($i -lt $attempts) {
+              $delay = 20 * $i
+              Write-Host "::warning::protoc install attempt $i of $attempts did not produce protoc; retrying in ${delay}s"
+              Start-Sleep -Seconds $delay
+            }
+          }
+          if (-not (Get-Command protoc -ErrorAction SilentlyContinue)) {
+            Write-Host "::error::protoc is not available after $attempts Chocolatey install attempts"
+            exit 1
+          }
+          protoc --version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
