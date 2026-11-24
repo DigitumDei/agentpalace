@@ -249,6 +249,23 @@ fi
 
 # --- Install ----------------------------------------------------------------
 chmod +x "${TMP_DIR}/${CLI_ASSET}"
+# Migration runs the downloaded executable, so a missing shared library or a
+# too-old glibc would otherwise surface as a raw loader error. Check first and
+# say what is missing; nothing has been changed at this point.
+if [ "${PLATFORM}" = "linux-x86_64" ] && command -v ldd >/dev/null 2>&1; then
+    MISSING_LIBS="$(ldd "${TMP_DIR}/${CLI_ASSET}" 2>&1 | grep 'not found' || true)"
+    if [ -n "${MISSING_LIBS}" ]; then
+        echo "error: this system cannot run the AgentPalace executable. Missing:" >&2
+        printf '%s\n' "${MISSING_LIBS}" | sed 's/^[[:space:]]*/  /' >&2
+        case "${MISSING_LIBS}" in
+            *libdbus-1.so.3*) echo "  libdbus-1.so.3 is the D-Bus client library: install libdbus-1-3 (Debian/Ubuntu) or dbus-libs (Fedora/RHEL)." >&2 ;;
+        esac
+        case "${MISSING_LIBS}" in
+            *GLIBC_*) echo "  A GLIBC version line means this distribution's glibc is older than the release supports (2.38+)." >&2 ;;
+        esac
+        err "nothing was installed or migrated; fix the items above and rerun this installer"
+    fi
+fi
 if [ "${SKIP_CACHE_MIGRATION}" -eq 1 ]; then set -- --skip-cache; fi
 "${TMP_DIR}/${CLI_ASSET}" migrate --from "$MIGRATION_FROM" --to "$MIGRATION_TO" \
     --mcp-path "${INSTALL_DIR}/agentpalace" "$@" \

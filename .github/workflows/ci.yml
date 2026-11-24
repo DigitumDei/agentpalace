@@ -371,9 +371,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Pinned, not ubuntu-latest: the runner's glibc sets the oldest glibc the
+          # executable can load. When ubuntu-latest moved to 26.04 the candidate needed
+          # glibc 2.43 and would not start on Ubuntu 24.04 or Debian 13.
           - asset: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            glibc_floor: "2.38"
           - asset: macos-arm64
             os: macos-15
             target: aarch64-apple-darwin
@@ -458,6 +462,28 @@ jobs:
           "dist/agentpalace-${{ matrix.asset }}${ext}" serve --help
           version="$("dist/agentpalace-${{ matrix.asset }}${ext}" --version)"
           [ "$version" = "agentpalace $AGENTPALACE_BUILD_VERSION" ]
+
+      # The documented Linux floor is a promise to installers. Weak references
+      # (Rust's std probes newer symbols that way) do not raise the floor, so only
+      # strong ones are counted.
+      - name: Check glibc floor and shared-library needs (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          GLIBC_FLOOR: ${{ matrix.glibc_floor }}
+        run: |
+          binary="dist/agentpalace-${{ matrix.asset }}"
+          echo "Shared libraries required at run time:"
+          readelf -d "$binary" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/  \1/p'
+          required="$(objdump -T "$binary" | awk '$2 != "w"' \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -uV | tail -n1)"
+          [ -n "$required" ] || { echo "::error::could not read glibc symbol versions from $binary"; exit 1; }
+          echo "Highest required glibc: $required (documented floor: $GLIBC_FLOOR)"
+          highest="$(printf '%s\n%s\n' "$required" "$GLIBC_FLOOR" | sort -V | tail -n1)"
+          if [ "$highest" != "$GLIBC_FLOOR" ]; then
+            echo "::error::$binary requires glibc $required, above the documented floor $GLIBC_FLOOR"
+            exit 1
+          fi
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v7
@@ -572,7 +598,7 @@ jobs:
             - CI run: [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
 
             Assets: one `agentpalace-*` executable with built-in ONNX Runtime per platform:
-            - `linux-x86_64` — glibc, built on ubuntu-latest
+            - `linux-x86_64` — glibc 2.38+, built on ubuntu-24.04; needs `libdbus-1.so.3` at run time
             - `macos-arm64` (Apple Silicon)
             - `windows-x86_64.exe`
 

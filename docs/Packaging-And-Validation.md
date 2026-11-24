@@ -16,8 +16,11 @@ into it, plus its license notices, per supported platform:
 The build downloads the prebuilt runtime via `ort-sys`; no runtime DLL, shared
 library, or runtime-path environment setting is required after deployment.
 Executable and notices assets are covered by the signed release manifest and checksums.
-Model weights remain separate cached assets. Linux uses glibc and is built on
-`ubuntu-latest`; older Linux distributions, musl, and Intel macOS are outside the
+Model weights remain separate cached assets. Linux uses glibc and is built on a
+pinned `ubuntu-24.04` runner, so the executable needs glibc 2.38 or newer; the
+release job fails if a build requires anything newer. The Linux executable also
+loads the system `libdbus-1.so.3` (the D-Bus client library used by the keyring
+backend). Older Linux distributions, musl, and Intel macOS are outside the
 current tested release matrix.
 
 Reference build command (host platforms):
@@ -44,7 +47,7 @@ Rust v1 release signoff is split across two required rows:
 
 Host:
 
-- GitHub Actions `ubuntu-latest`, `macos-15`, and `windows-latest` runners (the
+- GitHub Actions `ubuntu-24.04`, `macos-15`, and `windows-latest` runners (the
   `release-host` matrix in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml))
 
 Required outcomes:

@@ -39,7 +39,7 @@ The installer never falls back to the legacy mutable `nightly` tag. Before the f
 
 The Windows installer verifies release signatures with cryptography APIs introduced in PowerShell 7.1. Install PowerShell 7.1 or later before using the Windows command above.
 
-Supported platforms: Linux x86_64 (glibc 2.38+), macOS Apple Silicon, Windows x86_64. Anything else (Intel macOS, ARM Linux, musl) has no prebuilt ONNX Runtime — build from source instead.
+Supported platforms: Linux x86_64 (glibc 2.38+), macOS Apple Silicon, Windows x86_64. On Linux the executable also needs the D-Bus client library `libdbus-1.so.3` (`libdbus-1-3` on Debian/Ubuntu, `dbus-libs` on Fedora/RHEL): desktop systems have it, minimal servers and containers may not, and the installer stops with a clear message before changing anything if it is missing. Anything else (Intel macOS, ARM Linux, musl) has no prebuilt ONNX Runtime — build from source instead.
 
 ### 1b. Build from source (alternative)
 
