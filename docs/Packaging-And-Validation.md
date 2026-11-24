@@ -179,8 +179,11 @@ marker for this workflow run, attempt, and PR head SHA is the primary signal.
 When the comment tool drops that hidden HTML token, the validator accepts the
 action-generated `Claude finished` wrapper only when the sanitized diagnostics
 show that the comment-update tool ran, the wrapper links the exact Actions run,
-the summary names the full head SHA, contains a final review heading, and has no
-unfinished checklist items. A progress checklist, an earlier run or head, or
+the summary names the head commit, contains a final review heading, and has no
+unfinished checklist items. The prompt asks for the full 40-character head SHA;
+the validator also accepts an abbreviation of at least seven lower-case hex
+characters that stands as a whole token and is a prefix of the head SHA, because
+the reviewer often writes the short form. A progress checklist, an earlier run or head, or
 another author's comment cannot satisfy the check. Recovered tool denials remain
 diagnostic warnings when a final review was completed.
 
