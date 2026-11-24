@@ -48,6 +48,46 @@ class ReviewCompletionTests(unittest.TestCase):
         )
         self.assertIsNone(completion_error(SUCCESS, [comment(body, "claude[bot]")], MARKER))
 
+    def test_action_finished_summary_with_abbreviated_head_passes_without_marker(self):
+        # The shape published on PR 196: no marker, and only the short SHA.
+        head = "6dcf40c20150636f90adddb70696512e809df6d6"
+        marker = f"<!-- agentpalace-claude-review:45333520029:1:{head}:completed -->"
+        body = (
+            "**Claude finished @DigitumDei's task in 13s** —— "
+            "[View job](https://github.com/DigitumDei/agentpalace/actions/runs/45333520029)\n\n"
+            "---\n### Review of PR #196 at 6dcf40c\n\n**No issues found.**\n\n"
+            "- **Retry loop:** It makes up to 4 attempts and waits between them.\n"
+            "- **Scope:** Only the Windows step changes.\n\n"
+            "**Validation limits:** I reviewed the diff only and ran no builds or tests."
+        )
+        self.assertIsNone(completion_error(SUCCESS, [comment(body, "claude[bot]")], marker))
+
+    def test_abbreviated_commit_must_be_a_whole_token_prefixing_the_head(self):
+        head = "6dcf40c20150636f90adddb70696512e809df6d6"
+        marker = f"<!-- agentpalace-claude-review:123:1:{head}:completed -->"
+        template = (
+            "**Claude finished @bot's task** —— "
+            "[View job](https://github.com/org/repo/actions/runs/123)\n\n"
+            "---\n### Review at {cited}\n\n"
+            + "No findings. The review is complete with sufficient detail." * 3
+        )
+        for cited, passes in [
+            ("6dcf40c", True),
+            ("6dcf40c20150", True),
+            (head, True),
+            ("6dcf40", False),            # shorter than git's default abbreviation
+            ("6dcf40d", False),           # another commit
+            ("dcf40c2", False),           # inside the head, but not a prefix
+            ("6dcf40cffff", False),       # shares seven characters, then diverges
+            ("a6dcf40c", False),          # the prefix buried in a longer token
+            (head + "0", False),          # longer than a SHA
+            ("6DCF40C", False),           # git prints lower case
+        ]:
+            with self.subTest(cited=cited):
+                error = completion_error(
+                    SUCCESS, [comment(template.format(cited=cited))], marker)
+                self.assertEqual(error is None, passes)
+
     def test_generated_fallback_is_scoped_and_rejects_progress(self):
         template = (
             "**Claude finished @bot's task** —— "
