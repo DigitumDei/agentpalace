@@ -22,6 +22,14 @@ FINAL_HEADING_PATTERN = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 UNCHECKED_ITEM_PATTERN = re.compile(r"^\s*[-*]\s+\[\s\]", re.MULTILINE)
+# A whole hex token, never a slice of a longer one. Seven characters is git's
+# default abbreviation and the shortest form the reviewer writes.
+COMMIT_TOKEN_PATTERN = re.compile(r"(?<![a-f0-9])[a-f0-9]{7,40}(?![a-f0-9])")
+
+
+def names_head_commit(summary, head):
+    """Return whether the summary cites the head commit, in full or abbreviated."""
+    return any(head.startswith(token) for token in COMMIT_TOKEN_PATTERN.findall(summary))
 
 
 def generated_final_summary(report, body, marker_match):
@@ -39,8 +47,7 @@ def generated_final_summary(report, body, marker_match):
     summary = body[finished.end():].strip()
     if len(summary) < 120 or UNCHECKED_ITEM_PATTERN.search(summary):
         return False
-    head = marker_match.group("head")
-    if re.search(rf"(?<![a-f0-9]){re.escape(head)}(?![a-f0-9])", summary) is None:
+    if not names_head_commit(summary, marker_match.group("head")):
         return False
     return FINAL_HEADING_PATTERN.search(summary) is not None
 

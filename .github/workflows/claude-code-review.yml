@@ -79,7 +79,10 @@ jobs:
             Always finish by updating the tracking comment through
             mcp__github_comment__update_claude_comment with a final review summary:
             findings, or an explicit statement that no issues were found.
-            Include the reviewed commit and any validation limitations.
+            Include any validation limitations, and name the reviewed commit in
+            the visible text of that summary by its full 40-character SHA, on a
+            line of its own:
+            Reviewed commit: `${{ github.event.pull_request.head.sha }}`
             Only after completing the review and publishing all findings, include
             this exact completion marker in that final summary. The trusted
             validator also recognizes the action-generated finished wrapper when
@@ -147,7 +150,10 @@ jobs:
       # is the primary completion signal. Because the comment tool can drop hidden
       # HTML, validation also accepts the action-generated "Claude finished" wrapper
       # when diagnostics prove the comment tool ran and the body names this exact
-      # Actions run and full head SHA with no unfinished checklist items.
+      # Actions run and the head commit with no unfinished checklist items. The
+      # prompt asks for the full SHA; an abbreviation of at least seven characters
+      # that is a prefix of the head is accepted too, because the reviewer often
+      # writes the short form.
       # This trusted step reads comments; gh api remains unavailable to the agent.
       - name: Require a completed published review
         if: ${{ always() && !cancelled() }}
