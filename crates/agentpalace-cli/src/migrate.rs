@@ -59,7 +59,7 @@ fn running_processes() -> io::Result<Vec<(String, String)>> {
         #[cfg(target_os = "linux")]
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return proc_processes(Path::new("/proc"))
-                .map_err(|proc_err| invalid(process_listing_unavailable(program, &proc_err)));
+                .map_err(|proc_err| invalid(no_ps_and_no_proc(&proc_err)));
         }
         Err(err) => return Err(invalid(process_listing_unavailable(program, &err))),
     };
@@ -122,6 +122,14 @@ fn process_listing_unavailable(program: &str, err: &io::Error) -> String {
     };
     format!(
         "Cannot check for running palace servers: could not run `{program}` ({err}).{hint} Migration aborted before changing anything"
+    )
+}
+
+/// Explain that neither `ps` nor the `/proc` fallback could list processes.
+#[cfg(target_os = "linux")]
+fn no_ps_and_no_proc(proc_err: &io::Error) -> String {
+    format!(
+        "Cannot check for running palace servers: `ps` is not installed and /proc could not be read ({proc_err}). Install procps (Debian/Ubuntu) or procps-ng (Fedora/RHEL), or make /proc available, then rerun. Migration aborted before changing anything"
     )
 }
 
@@ -829,6 +837,18 @@ mod tests {
         let denied = process_listing_unavailable("ps", &io::Error::from(io::ErrorKind::PermissionDenied));
         assert!(!denied.contains("not installed"), "{denied}");
         assert!(denied.contains("could not run `ps`"), "{denied}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_ps_and_unreadable_proc_names_both() {
+        let message = no_ps_and_no_proc(&io::Error::from(io::ErrorKind::NotFound));
+        assert!(message.contains("`ps` is not installed"), "{message}");
+        assert!(message.contains("/proc could not be read"), "{message}");
+        assert!(message.contains("before changing anything"), "{message}");
+        // The fake root has no readable directory, so the real reader fails the same way.
+        let missing = tempfile::tempdir().unwrap().path().join("no-proc");
+        assert!(proc_processes(&missing).is_err());
     }
 
     #[cfg(not(windows))]
