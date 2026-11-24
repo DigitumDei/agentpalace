@@ -51,7 +51,9 @@ Offline MemPalace upgrade, also invoked by both installers. Requires
 `--to <new-home>` default to `~/.mempalace` and `~/.agentpalace`; `--dry-run`
 previews without writing. `--skip-cache` leaves the legacy model cache untouched
 while migrating the home and supported MCP registrations. The applying command
-checks for running servers only when the old home exists. A missing old home also
+checks for running servers only when the old home exists, using `ps` (`tasklist` on
+Windows) or, on Linux without `ps`, `/proc`; if neither works it exits 1 before
+changing anything and names the missing tool. A missing old home also
 leaves any legacy cache untouched. Internal file symlinks are materialized;
 directory, external, broken, and cyclic links are rejected when copied. Failures exit 1.
 See [Migration](Migration.md) for conflicts, custom paths, and rollback.
