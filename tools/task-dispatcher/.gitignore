@@ -1,0 +1,4 @@
+dispatcher.config.json
+.dispatcher-worktrees/
+.dispatcher-logs/
+.dispatcher-state.json

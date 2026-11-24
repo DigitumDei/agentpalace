@@ -1,0 +1,75 @@
+{
+  "executorId": "home-pc",
+  "palace": {
+    "baseUrl": "http://127.0.0.1:8765",
+    "token": "${AGENTPALACE_TOKEN}",
+    "requestTimeoutMs": 15000,
+    "autoStart": {
+      "enabled": true,
+      "command": "",
+      "palacePath": "",
+      "tokenFile": "",
+      "startupTimeoutMs": 120000,
+      "keepAlive": false
+    }
+  },
+  "polling": {
+    "intervalMs": 15000,
+    "wings": [],
+    "watchInbox": true,
+    "watchPendingTasks": true
+  },
+  "limits": {
+    "maxConcurrent": 2,
+    "defaultMaxRounds": 5,
+    "defaultTimeoutMs": 1800000,
+    "claimMode": "agent",
+    "leaseSeconds": 600
+  },
+  "paths": {
+    "worktreeRoot": "./.dispatcher-worktrees",
+    "logDir": "./.dispatcher-logs",
+    "stateFile": "./.dispatcher-state.json"
+  },
+  "repos": {
+    "agentpalace": "D:/SourceCode/agentpalace",
+    "actuarius": "D:/SourceCode/Actuarius",
+    "shotquill": "D:/SourceCode/ShotQuill",
+    "wellnesswingman": "D:/SourceCode/WellnessWingman"
+  },
+  "harnesses": {
+    "claude": {
+      "enabled": true,
+      "type": "claude",
+      "command": "claude",
+      "maxConcurrent": 1,
+      "extraArgs": []
+    },
+    "codex": {
+      "enabled": true,
+      "type": "codex",
+      "command": "codex",
+      "maxConcurrent": 1,
+      "extraArgs": []
+    },
+    "opencode": {
+      "enabled": false,
+      "type": "opencode",
+      "command": "opencode",
+      "maxConcurrent": 1,
+      "attachUrl": "",
+      "extraArgs": ["--agent", "build"]
+    },
+    "antigravity": {
+      "enabled": false,
+      "type": "custom",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-File", "D:/SourceCode/AntiGravityContainer/run-task.ps1", "-PromptFile", "{promptFile}"],
+      "promptDelivery": "file",
+      "maxConcurrent": 1
+    }
+  },
+  "notifications": {
+    "webhookUrl": "${DISPATCHER_WEBHOOK_URL}"
+  }
+}
