@@ -189,6 +189,38 @@ test('evaluatePendingTask enforces policy ceiling, branch prefix, git refs, crea
   assert.equal(ok.effectiveContract.allowPush, false);
   assert.equal(ok.effectiveContract.maxRounds, 4);
   assert.equal(ok.effectiveContract.timeoutMs, 120000);
+
+  // Per-harness timeoutMs applies when task sets none, clamped to limits.maxTimeoutMs.
+  const harnessTimeoutConfig = {
+    ...config,
+    harnesses: {
+      ...config.harnesses,
+      claude: { enabled: true, maxConcurrent: 1, timeoutMs: 60000, actorAliases: [] },
+      codex: { enabled: true, maxConcurrent: 1, timeoutMs: 300000, actorAliases: [] },
+    },
+  };
+  const pendingHarnessTimeout = evaluatePendingTask({
+    task: baseTask,
+    contract: parseDispatchContract(''),
+    config: harnessTimeoutConfig,
+    activeRuns: new Map(),
+    roundsUsed: 0,
+    depsCompleted: true,
+  });
+  assert.equal(pendingHarnessTimeout.eligible, true);
+  assert.equal(pendingHarnessTimeout.effectiveContract.timeoutMs, 60000);
+
+  const inboxHarnessClamped = evaluateInboxTask({
+    task: { ...baseTask, state: 'input_required' },
+    contract: parseDispatchContract(''),
+    config: harnessTimeoutConfig,
+    activeRuns: new Map(),
+    roundsUsed: 0,
+    messages: [{ message_id: 'm1', sender: 'claude' }],
+    harness: harnessTimeoutConfig.harnesses.codex,
+  });
+  assert.equal(inboxHarnessClamped.eligible, true);
+  assert.equal(inboxHarnessClamped.effectiveContract.timeoutMs, 120000);
 });
 
 test('evaluateInboxTask enforces repo, mode, sender allowlist, and round caps on inbox wakeups', () => {
@@ -236,7 +268,7 @@ test('evaluateInboxTask enforces repo, mode, sender allowlist, and round caps on
   assert.match(badSender.reason, /allowedSenders/);
 });
 
-test('buildBootstrapPrompt defaults missing contract mode to read_only and uses agentpalace_message_acknowledge', () => {
+test('buildBootstrapPrompt defaults missing contract mode to read_only and emits absolute local-policy guardrails', () => {
   const missingContractPrompt = buildBootstrapPrompt({
     task: { task_id: 'task_plain', wing: 'wing_agents', title: 'Plain task' },
     contract: {},
@@ -246,6 +278,19 @@ test('buildBootstrapPrompt defaults missing contract mode to read_only and uses 
     claimMode: 'agent',
   });
   assert.match(missingContractPrompt, /READ-ONLY/);
+  assert.doesNotMatch(missingContractPrompt, /unless the task/i);
+
+  const noCommitPrompt = buildBootstrapPrompt({
+    task: { task_id: 'task_mut', wing: 'wing_agents', title: 'Mutating without commit' },
+    contract: { mode: 'worktree_branch', allowCommit: false, allowPush: false },
+    harnessName: 'claude',
+    trigger: 'pending',
+    messageIds: [],
+    claimMode: 'agent',
+  });
+  assert.doesNotMatch(noCommitPrompt, /unless the task/i);
+  assert.match(noCommitPrompt, /commits are FORBIDDEN/i);
+  assert.match(noCommitPrompt, /pushing is FORBIDDEN/i);
 
   const withMsg = buildBootstrapPrompt({
     task: { task_id: 'task_abc', wing: 'wing_example', title: 'Review PR' },

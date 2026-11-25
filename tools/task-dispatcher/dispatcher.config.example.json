@@ -69,7 +69,7 @@
         "--permission-mode",
         "dontAsk",
         "--allowedTools",
-        "Read,Glob,Grep,Bash(git *),Bash(node *),mcp__agentpalace__*"
+        "Read,Glob,Grep,Bash(git status*),Bash(git diff*),Bash(git log*),mcp__agentpalace__*"
       ]
     },
     "codex": {

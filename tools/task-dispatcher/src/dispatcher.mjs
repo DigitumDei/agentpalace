@@ -18,7 +18,15 @@ function emptyState() {
     seenMessageIds: {},
     notifiedRoundCapByTask: {},
     managedBranches: {},
+    resetAtByTask: {},
   };
+}
+
+function parseTokenTimestamp(token) {
+  if (typeof token !== 'string') return 0;
+  const colon = token.indexOf(':');
+  const num = Number(colon >= 0 ? token.slice(0, colon) : token);
+  return Number.isFinite(num) ? num : 0;
 }
 
 export class TaskDispatcher {
@@ -43,9 +51,10 @@ export class TaskDispatcher {
     this.harnessActiveCount = new Map();
     /** @type {Map<string, { revision: number, task: any }>} */
     this.taskCache = new Map();
-    /** @type {{ roundsByTask: Record<string, number>, seenMessageIds: Record<string, string>, notifiedRoundCapByTask: Record<string, string>, managedBranches: Record<string, string> }} */
+    /** @type {{ roundsByTask: Record<string, number>, seenMessageIds: Record<string, string>, notifiedRoundCapByTask: Record<string, string>, managedBranches: Record<string, string>, resetAtByTask: Record<string, string> }} */
     this.state = emptyState();
 
+    this._knownResetAtByTask = {};
     this._stopRequested = false;
     this._timer = null;
     this._inflightPromises = new Set();
@@ -55,13 +64,14 @@ export class TaskDispatcher {
     this._loggedSkips = new Map();
   }
 
-  async loadState() {
+  async _loadStateFileOnly() {
     let raw;
     try {
       raw = await fs.readFile(this.config.paths.stateFile, 'utf8');
     } catch (err) {
       if (err.code === 'ENOENT') {
         this.state = emptyState();
+        this._knownResetAtByTask = {};
         return;
       }
       this.logger.error(`[dispatcher] Failed to read state file "${this.config.paths.stateFile}": ${err.message}`);
@@ -93,35 +103,126 @@ export class TaskDispatcher {
           : {},
       managedBranches:
         parsed.managedBranches && typeof parsed.managedBranches === 'object' ? parsed.managedBranches : {},
+      resetAtByTask: parsed.resetAtByTask && typeof parsed.resetAtByTask === 'object' ? parsed.resetAtByTask : {},
     };
+    this._knownResetAtByTask = { ...this.state.resetAtByTask };
+  }
+
+  async loadState() {
+    await this._loadStateFileOnly();
+    await this._reconcileDiskResets({ skipStateFile: true });
+  }
+
+  _applyResetToken(taskId, token) {
+    if (typeof taskId !== 'string' || !taskId || typeof token !== 'string' || !token) {
+      return false;
+    }
+    const prev = this._knownResetAtByTask[taskId];
+    if (prev === token) {
+      return false;
+    }
+    if (prev && parseTokenTimestamp(token) < parseTokenTimestamp(prev)) {
+      return false;
+    }
+    delete this.state.roundsByTask[taskId];
+    delete this.state.notifiedRoundCapByTask[taskId];
+    this._loggedSkips.delete(taskId);
+    this.state.resetAtByTask[taskId] = token;
+    this._knownResetAtByTask[taskId] = token;
+    return true;
+  }
+
+  /**
+   * Reconcile external `--reset-task` actions (from `stateFile.resetAtByTask` or
+   * drop-in `${stateFile}.reset.*.json` markers) into this instance's memory so
+   * a running dispatcher picks up resets and never overwrites them on its next save.
+   */
+  async _reconcileDiskResets({ skipStateFile = false } = {}) {
+    let changed = false;
+    const stateFile = this.config.paths.stateFile;
+
+    if (!skipStateFile) {
+      try {
+        const raw = await fs.readFile(stateFile, 'utf8');
+        const disk = JSON.parse(raw);
+        if (disk?.resetAtByTask && typeof disk.resetAtByTask === 'object') {
+          for (const [taskId, token] of Object.entries(disk.resetAtByTask)) {
+            if (this._applyResetToken(taskId, token)) {
+              changed = true;
+            }
+          }
+        }
+      } catch {
+        // Ignore ENOENT or transient read/parse while another process renames the file.
+      }
+    }
+
+    const dir = path.dirname(stateFile);
+    const markerPrefix = `${path.basename(stateFile)}.reset.`;
+    let entries = [];
+    try {
+      entries = await fs.readdir(dir);
+    } catch {
+      return changed;
+    }
+
+    for (const name of entries) {
+      if (!name.startsWith(markerPrefix) || !name.endsWith('.json')) continue;
+      const markerPath = path.join(dir, name);
+      try {
+        const raw = await fs.readFile(markerPath, 'utf8');
+        const marker = JSON.parse(raw);
+        if (marker && typeof marker.taskId === 'string' && typeof marker.token === 'string') {
+          if (this._applyResetToken(marker.taskId, marker.token)) {
+            changed = true;
+          }
+          await fs.rm(markerPath, { force: true }).catch(() => {});
+        }
+      } catch {
+        // Ignore transient partial marker writes; next poll/save will pick it up.
+      }
+    }
+
+    return changed;
   }
 
   _pruneSeenMessageIds() {
     const maxSeen = this.config.limits?.maxSeenMessages ?? 5000;
     const entries = Object.entries(this.state.seenMessageIds);
-    if (entries.length <= maxSeen) return;
-    entries.sort((a, b) => String(a[1]).localeCompare(String(b[1])));
-    const keep = entries.slice(entries.length - maxSeen);
-    this.state.seenMessageIds = Object.fromEntries(keep);
+    if (entries.length > maxSeen) {
+      entries.sort((a, b) => String(a[1]).localeCompare(String(b[1])));
+      this.state.seenMessageIds = Object.fromEntries(entries.slice(entries.length - maxSeen));
+    }
+
+    const resetEntries = Object.entries(this.state.resetAtByTask);
+    if (resetEntries.length > 1000) {
+      resetEntries.sort((a, b) => parseTokenTimestamp(a[1]) - parseTokenTimestamp(b[1]));
+      this.state.resetAtByTask = Object.fromEntries(resetEntries.slice(resetEntries.length - 1000));
+    }
+  }
+
+  async _writeStateAtomic() {
+    this._pruneSeenMessageIds();
+    const stateFile = this.config.paths.stateFile;
+    const dir = path.dirname(stateFile);
+    await fs.mkdir(dir, { recursive: true });
+    const snapshot = JSON.stringify(this.state, null, 2) + '\n';
+    const tmpPath = `${stateFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(tmpPath, snapshot, 'utf8');
+      await fs.rename(tmpPath, stateFile);
+    } catch (err) {
+      await fs.rm(tmpPath, { force: true }).catch(() => {});
+      throw err;
+    }
   }
 
   async saveState() {
     if (this.dryRun) return;
-    this._pruneSeenMessageIds();
-    const stateFile = this.config.paths.stateFile;
-    const snapshot = JSON.stringify(this.state, null, 2) + '\n';
 
     const writeOp = async () => {
-      const dir = path.dirname(stateFile);
-      await fs.mkdir(dir, { recursive: true });
-      const tmpPath = `${stateFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
-      try {
-        await fs.writeFile(tmpPath, snapshot, 'utf8');
-        await fs.rename(tmpPath, stateFile);
-      } catch (err) {
-        await fs.rm(tmpPath, { force: true }).catch(() => {});
-        throw err;
-      }
+      await this._reconcileDiskResets();
+      await this._writeStateAtomic();
     };
 
     const next = this._saveQueue.then(writeOp, writeOp);
@@ -130,11 +231,29 @@ export class TaskDispatcher {
   }
 
   async resetTask(taskId) {
-    await this.loadState();
-    delete this.state.roundsByTask[taskId];
-    delete this.state.notifiedRoundCapByTask[taskId];
-    this._loggedSkips.delete(taskId);
-    await this.saveState();
+    const stateFile = this.config.paths.stateFile;
+    const dir = path.dirname(stateFile);
+    await fs.mkdir(dir, { recursive: true });
+
+    const token = `${Date.now()}:${crypto.randomUUID()}`;
+    const markerPath = `${stateFile}.reset.${crypto.randomUUID()}.json`;
+    const markerTmp = `${markerPath}.tmp`;
+    await fs.writeFile(markerTmp, JSON.stringify({ taskId, token }), 'utf8');
+    await fs.rename(markerTmp, markerPath);
+
+    const updateOp = async () => {
+      await this._loadStateFileOnly();
+      delete this.state.roundsByTask[taskId];
+      delete this.state.notifiedRoundCapByTask[taskId];
+      this._loggedSkips.delete(taskId);
+      this.state.resetAtByTask[taskId] = token;
+      this._knownResetAtByTask[taskId] = token;
+      await this._writeStateAtomic();
+    };
+
+    const next = this._saveQueue.then(updateOp, updateOp);
+    this._saveQueue = next.catch(() => {});
+    return next;
   }
 
   _logSkipOnce(taskId, revision, reason) {
@@ -266,6 +385,10 @@ export class TaskDispatcher {
 
   async _runPollOnce() {
     const dispatched = [];
+    const hadExternalReset = await this._reconcileDiskResets();
+    if (hadExternalReset && !this.dryRun) {
+      await this.saveState();
+    }
 
     if (this.config.polling.watchPendingTasks && !this._stopRequested) {
       const wings = this.config.polling.wings.length > 0 ? this.config.polling.wings : [undefined];
@@ -365,6 +488,7 @@ export class TaskDispatcher {
             activeRuns: this.activeRuns,
             roundsUsed,
             messages,
+            harness,
           });
 
           if (!decision.eligible) {
@@ -447,6 +571,23 @@ export class TaskDispatcher {
     let leaseTimer = null;
 
     try {
+      // Snapshot pre-run result events BEFORE mutating rounds, worktrees, or claiming a lease,
+      // so a transient snapshot failure skips this poll cleanly without counting old results as new.
+      let beforeResultIds = new Set();
+      let baselineSnapshotOk = false;
+      const shouldDispatcherClaim = this.config.limits.claimMode === 'dispatcher' && task.state === 'pending';
+      if (shouldDispatcherClaim && typeof this.client.listEvents === 'function') {
+        try {
+          beforeResultIds = await this._listResultEventIds(task.task_id);
+          baselineSnapshotOk = true;
+        } catch (err) {
+          this.logger.warn(
+            `[dispatcher] Could not snapshot pre-run result events for ${task.task_id} (${err.message}); skipping claim this poll.`,
+          );
+          return;
+        }
+      }
+
       // Increment round count up front so repeated worktree/setup errors also hit maxRounds.
       this.state.roundsByTask[task.task_id] = (this.state.roundsByTask[task.task_id] ?? 0) + 1;
       await this.saveState();
@@ -475,15 +616,8 @@ export class TaskDispatcher {
         }
       }
 
-      // Snapshot existing result events before claiming so clean exits can be reconciled authoritatively.
-      let beforeResultIds = new Set();
-      if (this.config.limits.claimMode === 'dispatcher' && task.state === 'pending') {
-        try {
-          beforeResultIds = await this._listResultEventIds(task.task_id);
-        } catch (err) {
-          this.logger.warn(`[dispatcher] Could not snapshot pre-run result events for ${task.task_id}: ${err.message}`);
-        }
-
+      // Optional dispatcher-owned claim + lease renewal heartbeat.
+      if (shouldDispatcherClaim) {
         claimedTask = await this.client.claimTask(task.task_id, {
           expectedRevision: task.revision,
           leaseSeconds: this.config.limits.leaseSeconds,
@@ -584,23 +718,32 @@ export class TaskDispatcher {
           }
         } else {
           let newResultIds = [];
-          try {
-            const afterResultIds = await this._listResultEventIds(task.task_id);
-            newResultIds = [...afterResultIds].filter((id) => !beforeResultIds.has(id));
-          } catch (err) {
-            this.logger.warn(`[dispatcher] Result event check failed for ${task.task_id}: ${err.message}`);
+          let verifyOk = false;
+          if (baselineSnapshotOk) {
+            try {
+              const afterResultIds = await this._listResultEventIds(task.task_id);
+              newResultIds = [...afterResultIds].filter((id) => !beforeResultIds.has(id));
+              verifyOk = true;
+            } catch (err) {
+              this.logger.warn(`[dispatcher] Result event check failed for ${task.task_id}: ${err.message}`);
+            }
           }
 
-          const targetState =
-            newResultIds.length > 0
-              ? (this.config.limits.dispatcherSuccessState ?? 'input_required')
-              : 'pending';
-          const reason =
-            newResultIds.length > 0 ? 'dispatcher_reconciled_result' : 'harness_exited_without_result';
+          const delivered = baselineSnapshotOk && verifyOk && newResultIds.length > 0;
+          const targetState = delivered
+            ? (this.config.limits.dispatcherSuccessState ?? 'input_required')
+            : 'pending';
+          const reason = delivered
+            ? 'dispatcher_reconciled_result'
+            : !baselineSnapshotOk
+              ? 'result_baseline_unavailable'
+              : !verifyOk
+                ? 'result_verification_failed'
+                : 'harness_exited_without_result';
 
-          if (newResultIds.length === 0) {
+          if (!delivered) {
             this.logger.warn(
-              `[dispatcher] ${harnessName} exited 0 on ${task.task_id} without publishing a result; yielding task back to pending.`,
+              `[dispatcher] Yielding ${task.task_id} back to pending after clean exit (${reason}).`,
             );
           }
 

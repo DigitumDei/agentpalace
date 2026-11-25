@@ -436,6 +436,230 @@ test('TaskDispatcher fails closed on corrupt state file and serializes atomic sa
   }
 });
 
+test('TaskDispatcher honors per-harness timeoutMs when task sets none and clamps to limits.maxTimeoutMs', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ap-disp-htimeout-'));
+  try {
+    const cfg = makeBaseConfig(tmpDir, {
+      limits: { defaultTimeoutMs: 1800000, maxTimeoutMs: 1800000 },
+    });
+    cfg.harnesses.claude.timeoutMs = 60000;
+
+    const task = {
+      task_id: 'task_ht',
+      title: 'Harness timeout',
+      description: '```dispatcher\n{"target":"claude"}\n```',
+      state: 'pending',
+      revision: 1,
+      wing: 'wing_agentpalace',
+      dependencies: [],
+    };
+    const seenTimeouts = [];
+
+    const dispatcher = new TaskDispatcher({
+      config: cfg,
+      client: {
+        async listTasks() {
+          return { tasks: [task] };
+        },
+        async getTask() {
+          return task;
+        },
+        async readInbox() {
+          return { messages: [] };
+        },
+      },
+      runner: async (opts) => {
+        seenTimeouts.push(opts.timeoutMs);
+        task.state = 'completed';
+        return { exitCode: 0, timedOut: false, durationMs: 5, logPath: opts.logPath };
+      },
+      logger: { log() {}, warn() {}, error() {} },
+    });
+
+    await dispatcher.loadState();
+    await dispatcher.pollOnce();
+    await dispatcher.waitForInflight();
+    assert.deepEqual(seenTimeouts, [60000]);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('TaskDispatcher --reset-task survives a running daemon save and wakes capped task on next poll', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ap-disp-reset-live-'));
+  try {
+    const cfg = makeBaseConfig(tmpDir, { limits: { defaultMaxRounds: 5, maxRoundsCap: 5 } });
+    const taskCap = {
+      task_id: 'task_cap',
+      title: 'Capped task',
+      description: '```dispatcher\n{"target":"claude"}\n```',
+      state: 'pending',
+      revision: 1,
+      wing: 'wing_agentpalace',
+      dependencies: [],
+    };
+    let runs = 0;
+
+    const client = {
+      async listTasks() {
+        return { tasks: [taskCap] };
+      },
+      async getTask() {
+        return taskCap;
+      },
+      async readInbox() {
+        return { messages: [] };
+      },
+    };
+
+    const daemon = new TaskDispatcher({
+      config: cfg,
+      client,
+      runner: async (opts) => {
+        runs += 1;
+        taskCap.state = 'completed';
+        return { exitCode: 0, timedOut: false, durationMs: 5, logPath: opts.logPath };
+      },
+      logger: { log() {}, warn() {}, error() {} },
+    });
+
+    // Running daemon holds roundsByTask.task_cap = 5 in memory and on disk.
+    await daemon.loadState();
+    daemon.state.roundsByTask.task_cap = 5;
+    daemon.state.notifiedRoundCapByTask.task_cap = '2026-11-25T00:00:00Z';
+    await daemon.saveState();
+
+    // A second process invokes resetTask('task_cap').
+    const cliResetter = new TaskDispatcher({
+      config: cfg,
+      client: {},
+      logger: { log() {}, warn() {}, error() {} },
+    });
+    await cliResetter.resetTask('task_cap');
+
+    // Daemon saves unrelated state — it must NOT overwrite the reset back to 5!
+    daemon.state.roundsByTask.task_other = 1;
+    await daemon.saveState();
+
+    const diskAfterDaemonSave = JSON.parse(await fs.readFile(cfg.paths.stateFile, 'utf8'));
+    assert.equal(diskAfterDaemonSave.roundsByTask.task_cap, undefined);
+    assert.equal(diskAfterDaemonSave.roundsByTask.task_other, 1);
+    assert.equal(daemon.state.roundsByTask.task_cap, undefined);
+
+    // Daemon's next poll dispatches task_cap cleanly.
+    const launched = await daemon.pollOnce();
+    await daemon.waitForInflight();
+    assert.equal(launched.length, 1);
+    assert.equal(runs, 1);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('TaskDispatcher skips claim when pre-run listEvents fails and yields when post-exit verification fails', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ap-disp-evfail-'));
+  try {
+    const taskPreFail = {
+      task_id: 'task_prefail',
+      title: 'Pre fail',
+      description: '```dispatcher\n{"target":"claude"}\n```',
+      state: 'pending',
+      revision: 1,
+      wing: 'wing_agentpalace',
+      dependencies: [],
+    };
+    let claimedPreFail = false;
+    let runnerPreFail = false;
+
+    const dPre = new TaskDispatcher({
+      config: makeBaseConfig(tmpDir, { limits: { claimMode: 'dispatcher' } }),
+      client: {
+        async listTasks() {
+          return { tasks: [taskPreFail] };
+        },
+        async getTask() {
+          return taskPreFail;
+        },
+        async readInbox() {
+          return { messages: [] };
+        },
+        async listEvents() {
+          throw new Error('events endpoint timeout');
+        },
+        async claimTask() {
+          claimedPreFail = true;
+          return taskPreFail;
+        },
+      },
+      runner: async () => {
+        runnerPreFail = true;
+        return { exitCode: 0, timedOut: false };
+      },
+      logger: { log() {}, warn() {}, error() {} },
+    });
+
+    await dPre.loadState();
+    await dPre.pollOnce();
+    await dPre.waitForInflight();
+    assert.equal(claimedPreFail, false);
+    assert.equal(runnerPreFail, false);
+    assert.equal(taskPreFail.state, 'pending');
+    assert.equal(dPre.state.roundsByTask.task_prefail, undefined);
+
+    // Post-exit listEvents failure must yield back to pending rather than marking delivered.
+    const taskPostFail = {
+      task_id: 'task_postfail',
+      title: 'Post fail',
+      description: '```dispatcher\n{"target":"claude"}\n```',
+      state: 'pending',
+      revision: 1,
+      wing: 'wing_agentpalace',
+      dependencies: [],
+    };
+    let listCall = 0;
+    const dPost = new TaskDispatcher({
+      config: makeBaseConfig(tmpDir, { limits: { claimMode: 'dispatcher', dispatcherSuccessState: 'input_required' } }),
+      client: {
+        async listTasks() {
+          return { tasks: taskPostFail.state === 'pending' ? [taskPostFail] : [] };
+        },
+        async getTask() {
+          return { ...taskPostFail };
+        },
+        async readInbox() {
+          return { messages: [] };
+        },
+        async listEvents() {
+          listCall += 1;
+          if (listCall === 1) {
+            return { events: [{ event_id: 'ev_old', entity_id: 'result_old', event_type: 'result_created' }], next_cursor: null };
+          }
+          throw new Error('post-exit events error');
+        },
+        async claimTask() {
+          taskPostFail.state = 'running';
+          taskPostFail.revision += 1;
+          return { ...taskPostFail };
+        },
+        async transitionTask(_id, { state }) {
+          taskPostFail.state = state;
+          taskPostFail.revision += 1;
+          return { ...taskPostFail };
+        },
+      },
+      runner: async (opts) => ({ exitCode: 0, timedOut: false, durationMs: 5, logPath: opts.logPath }),
+      logger: { log() {}, warn() {}, error() {} },
+    });
+
+    await dPost.loadState();
+    await dPost.pollOnce();
+    await dPost.waitForInflight();
+    assert.equal(taskPostFail.state, 'pending');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('TaskDispatcher paginates listTasks via next_cursor and retries inbox messages after crash', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ap-disp-page-'));
   try {

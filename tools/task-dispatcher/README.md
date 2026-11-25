@@ -13,7 +13,7 @@ AgentPalace coordination is a durable control plane, not a process scheduler (se
 
 - **Zero LLM tokens while idle:** polls `/v1/coordination/tasks` and `/v1/coordination/inbox` over local HTTP.
 - **Automatic back-and-forth wakeups:** when Agent A posts a reply to Agent B's inbox (e.g., code review → fix → re-review, or two-agent discussions), the dispatcher wakes Agent B automatically — bounded by a configurable `maxRounds` / `maxRoundsCap` ping-pong cap.
-- **Local trust ceiling:** task descriptions cannot escalate permissions (`mode`, `allowCommit`, `allowPush`, `maxRounds`, `timeoutMs`) above what `policy`, `limits`, and per-repo rules allow in your local config.
+- **Local trust ceiling:** dispatcher-enforced limits (`policy`, `limits`, per-repo `allowedModes` / `branchPrefix`, `maxRoundsCap`, `maxTimeoutMs`) cap what a task can trigger; see [Enforced vs. advisory guardrails](#enforced-vs-advisory-guardrails) below for prompt-level rules on unsandboxed CLIs.
 - **Worktree isolation:** mutating tasks (`worktree_branch` / `draft_pr`) automatically get their own `git worktree` and prefixed branch (`agent/<slug>`) so multiple agents can work in parallel without colliding or touching `main`.
 - **Authoritative verification:** after a child process exits, the dispatcher re-fetches the task from AgentPalace rather than trusting exit code `0` alone.
 - **OS-safe execution:** prompts are passed via `stdin` (or a temp file), avoiding Windows `cmd.exe` quoting limits, and timed-out runs clean up the full process tree (`taskkill /T /F` on Windows, negative-PID process groups on Linux).
@@ -50,7 +50,7 @@ task-dispatcher (Node 22+, zero npm deps)
    ```
    > **Warning — do not enable `autoStart` on an SSH/federation tunnel port (e.g. `127.0.0.1:8765`):** `palace.autoStart.enabled` defaults to `false` so a temporarily closed tunnel will never cause the dispatcher to spin up a local shadow palace on the tunnel's port. Only set `autoStart.enabled: true` (or pass `--auto-start`) on a dedicated local port such as `127.0.0.1:8775`.
 3. **One or more agent CLIs** installed on `PATH` (`claude`, `codex`, `opencode`, or a custom command).
-   - **Headless Claude (`claude -p`):** non-interactive runs require explicit tool permissions in `harnesses.claude.extraArgs` (for example `["--permission-mode", "dontAsk", "--allowedTools", "Read,Glob,Grep,Bash(git *),Bash(node *),mcp__agentpalace__*"]`), otherwise Claude will exit without permission to call MCP tools.
+   - **Headless Claude (`claude -p`):** non-interactive runs require explicit tool permissions in `harnesses.claude.extraArgs`. The example config starts safely with read-only git/file inspection plus AgentPalace MCP tools (`["--permission-mode", "dontAsk", "--allowedTools", "Read,Glob,Grep,Bash(git status*),Bash(git diff*),Bash(git log*),mcp__agentpalace__*"]`); widen `--allowedTools` only for trusted mutating workflows, otherwise Claude will lack permission to edit files or run tests.
 
 ---
 
@@ -91,7 +91,7 @@ node ./src/cli.mjs --config ./dispatcher.config.json --once --auto-start
 # Continuous polling daemon
 node ./src/cli.mjs --config ./dispatcher.config.json
 
-# Resume a task that hit maxRounds after human review
+# Resume a task that hit maxRounds after human review (works offline or while daemon is running)
 node ./src/cli.mjs --config ./dispatcher.config.json --reset-task task_abc123
 ```
 
@@ -161,7 +161,13 @@ If a task has **no** `dispatcher` block, the dispatcher falls back to `task.owne
 - **`limits.claimMode`**:
   - `"agent"` *(default)*: The dispatcher tracks an in-memory lock while the child runs and instructs the agent to call `agentpalace_task_claim` and transition state as its own identity. Matches `docs/Agent-Task-Handoffs.md`.
   - `"dispatcher"`: The dispatcher calls `POST /v1/coordination/tasks/{id}/claim` before spawning, renews the lease every `leaseSeconds / 2`, and reconciles the task after exit — transitioning to `limits.dispatcherSuccessState` (`"input_required"` by default, or `"completed"`) when a new `result_created` event was published, or yielding back to `"pending"` if the run crashed, timed out, or exited without publishing a result.
+- **`--reset-task <id>` behavior:** works both offline and against a running dispatcher daemon. It clears `roundsByTask.<id>` and `notifiedRoundCapByTask.<id>` in `paths.stateFile` and writes a reset marker so a running daemon reconciles the reset into memory before its next poll or state save without overwriting it.
 - **`notifications.webhookUrl`**: Optional Discord/Slack-compatible webhook URL. Posts a notice when a task reaches `completed`, `input_required`, `failed`, times out, or hits `maxRounds` (once per capped task).
+
+### Enforced vs. advisory guardrails
+
+- **Mechanically enforced by the dispatcher:** `polling.wings`, `policy.allowedCreators`, `policy.allowedSenders`, `repos` path mapping, `allowedModes` gating, isolated `git worktree` creation on `branchPrefix`-enforced branches (refusing unmanaged pre-existing branches), `baseRef` option-injection checks, `limits.maxRoundsCap`, and `limits.maxTimeoutMs` (process-tree termination).
+- **Advisory for unsandboxed CLIs:** `read_only`, `allowCommit: false`, and `allowPush: false` are passed as absolute local-policy rules in the bootstrap prompt (never overridable by task text), and are only mechanically enforced to the extent the underlying harness sandbox or `--allowedTools` restricts tool use. By default, `dispatcher.config.example.json` restricts Claude's `--allowedTools` to read-only file/git inspection and AgentPalace MCP tools.
 
 ---
 
