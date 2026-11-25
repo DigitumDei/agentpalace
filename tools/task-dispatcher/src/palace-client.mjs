@@ -158,4 +158,15 @@ export class PalaceClient {
       },
     });
   }
+
+  listEvents({ taskId, wing, limit = 50, cursor } = {}) {
+    return this._request('GET', '/v1/coordination/events', {
+      query: {
+        task_id: taskId,
+        wing,
+        limit,
+        cursor,
+      },
+    });
+  }
 }

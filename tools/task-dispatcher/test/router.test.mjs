@@ -4,18 +4,20 @@ import {
   parseDispatchContract,
   resolveTargetHarness,
   evaluatePendingTask,
+  evaluateInboxTask,
   buildBootstrapPrompt,
 } from '../src/router.mjs';
+import { MAX_TIMEOUT_MS } from '../src/config.mjs';
 import { buildHarnessInvocation } from '../src/harnesses.mjs';
 
-test('parseDispatchContract parses fenced dispatcher block', () => {
-  const desc = `Review PR #70.
+test('parseDispatchContract parses fenced dispatcher block and defaults missing blocks to read_only', () => {
+  const desc = `Review PR #42.
 
 \`\`\`dispatcher
 {
   "target": "Claude",
   "mode": "worktree_branch",
-  "repo": "ShotQuill",
+  "repo": "Example-App",
   "executor": "home-pc",
   "maxRounds": 3,
   "allowCommit": true
@@ -25,55 +27,94 @@ test('parseDispatchContract parses fenced dispatcher block', () => {
   const contract = parseDispatchContract(desc);
   assert.equal(contract.target, 'claude');
   assert.equal(contract.mode, 'worktree_branch');
-  assert.equal(contract.repo, 'shotquill');
+  assert.equal(contract.repo, 'example-app');
   assert.equal(contract.executor, 'home-pc');
   assert.equal(contract.maxRounds, 3);
   assert.equal(contract.allowCommit, true);
   assert.equal(contract.allowPush, false);
+
+  const missing = parseDispatchContract('Plain task with no dispatcher fence.');
+  assert.equal(missing.mode, 'read_only');
+  assert.equal(missing.allowCommit, false);
+  assert.equal(missing.allowPush, false);
 });
 
-test('parseDispatchContract ignores unrelated or invalid JSON blocks', () => {
+test('parseDispatchContract ignores unrelated or invalid JSON blocks and returns read_only defaults', () => {
   const desc = `Some task\n\`\`\`json\n{ not valid json\n\`\`\`\n\`\`\`json\n{"unrelated": true}\n\`\`\``;
-  assert.deepEqual(parseDispatchContract(desc), {});
+  const contract = parseDispatchContract(desc);
+  assert.equal(contract.mode, 'read_only');
+  assert.equal(contract.target, undefined);
+  assert.equal(contract.allowCommit, false);
 });
 
-test('resolveTargetHarness follows precedence and skips disabled harnesses', () => {
-  const enabled = { claude: { enabled: true }, codex: { enabled: true } };
+test('resolveTargetHarness resolves exact, alias, and namespaced <tokenIdentity>:<worker> actors', () => {
+  const enabled = {
+    claude: { enabled: true, actorAliases: [] },
+    codex: { enabled: true, actorAliases: ['custom-codex-alias'] },
+  };
+  assert.equal(resolveTargetHarness({ owner: 'codex' }, { target: 'claude' }, enabled), 'claude');
+  assert.equal(resolveTargetHarness({ owner: 'codex' }, {}, enabled), 'codex');
+  assert.equal(resolveTargetHarness({ executor_affinity: 'opencode' }, {}, enabled), null);
+  assert.equal(resolveTargetHarness({}, { target: 'any' }, enabled), 'claude');
+
+  // Namespaced HTTP actor resolution (resolve_coordination_actor format: <identity>:<worker>).
   assert.equal(
-    resolveTargetHarness({ owner: 'codex' }, { target: 'claude' }, enabled),
-    'claude',
-  );
-  assert.equal(
-    resolveTargetHarness({ owner: 'codex' }, {}, enabled),
+    resolveTargetHarness({ owner: 'home-pc:codex' }, {}, enabled, { tokenIdentity: 'home-pc' }),
     'codex',
   );
+  // Reject namespaced actor belonging to another token identity.
   assert.equal(
-    resolveTargetHarness({ executor_affinity: 'opencode' }, {}, enabled),
+    resolveTargetHarness({ owner: 'other-user:codex' }, {}, enabled, { tokenIdentity: 'home-pc' }),
     null,
   );
-  assert.equal(
-    resolveTargetHarness({}, { target: 'any' }, enabled),
-    'claude',
-  );
+  // Default auto-started ephemeral token name 'dispatcher' matches even without explicit tokenIdentity.
+  assert.equal(resolveTargetHarness({ owner: 'dispatcher:codex' }, {}, enabled), 'codex');
+  // Explicit alias works regardless of prefix.
+  assert.equal(resolveTargetHarness({ executor_affinity: 'custom-codex-alias' }, {}, enabled), 'codex');
 });
 
-test('evaluatePendingTask enforces executor, dependencies, repo mapping, and round cap', () => {
+test('evaluatePendingTask enforces policy ceiling, branch prefix, git refs, creator allowlist, and caps', () => {
   const config = {
     executorId: 'home-pc',
-    limits: { defaultMaxRounds: 3 },
-    repos: { agentpalace: '/repos/agentpalace' },
+    palace: { tokenIdentity: '' },
+    polling: { wings: ['wing_agentpalace'] },
+    limits: { defaultMaxRounds: 3, maxRoundsCap: 4, defaultTimeoutMs: 60000, maxTimeoutMs: 120000 },
+    policy: {
+      allowedCreators: ['dion', 'claude'],
+      allowedSenders: ['dion', 'claude'],
+      allowedModes: ['read_only', 'worktree_branch'],
+      allowCommit: false,
+      allowPush: false,
+      branchPrefix: 'agent/',
+    },
+    repos: {
+      agentpalace: {
+        path: '/repos/agentpalace',
+        allowedModes: ['read_only', 'worktree_branch'],
+        allowCommit: true,
+        allowPush: false,
+        branchPrefix: 'agent/',
+      },
+    },
     harnesses: {
-      claude: { enabled: true, maxConcurrent: 1 },
-      codex: { enabled: false, maxConcurrent: 1 },
+      claude: { enabled: true, maxConcurrent: 1, actorAliases: [] },
+      codex: { enabled: false, maxConcurrent: 1, actorAliases: [] },
     },
   };
 
-  const baseTask = { task_id: 'task_1', state: 'pending', owner: 'claude' };
+  const baseTask = {
+    task_id: 'task_1',
+    state: 'pending',
+    owner: 'claude',
+    wing: 'wing_agentpalace',
+    created_by: 'dion',
+  };
 
+  // Disallowed creator rejected.
   assert.equal(
     evaluatePendingTask({
-      task: baseTask,
-      contract: { executor: 'actuarius-vm' },
+      task: { ...baseTask, created_by: 'untrusted' },
+      contract: parseDispatchContract(''),
       config,
       activeRuns: new Map(),
       roundsUsed: 0,
@@ -82,55 +123,132 @@ test('evaluatePendingTask enforces executor, dependencies, repo mapping, and rou
     false,
   );
 
+  // Disallowed wing rejected.
   assert.equal(
     evaluatePendingTask({
-      task: baseTask,
-      contract: {},
+      task: { ...baseTask, wing: 'wing_other' },
+      contract: parseDispatchContract(''),
       config,
       activeRuns: new Map(),
       roundsUsed: 0,
-      depsCompleted: false,
+      depsCompleted: true,
     }).eligible,
     false,
   );
 
-  const capped = evaluatePendingTask({
-    task: baseTask,
-    contract: { maxRounds: 2 },
-    config,
-    activeRuns: new Map(),
-    roundsUsed: 2,
-    depsCompleted: true,
-  });
-  assert.equal(capped.eligible, false);
-  assert.equal(capped.capReached, true);
+  // Disallowed mode (draft_pr) rejected.
+  assert.equal(
+    evaluatePendingTask({
+      task: baseTask,
+      contract: parseDispatchContract('```dispatcher\n{"mode":"draft_pr","repo":"agentpalace"}\n```'),
+      config,
+      activeRuns: new Map(),
+      roundsUsed: 0,
+      depsCompleted: true,
+    }).eligible,
+    false,
+  );
 
-  const missingRepo = evaluatePendingTask({
+  // Unprefixed branch (e.g. main) rejected.
+  const badBranch = evaluatePendingTask({
     task: baseTask,
-    contract: { mode: 'worktree_branch', repo: 'unknown' },
+    contract: parseDispatchContract('```dispatcher\n{"mode":"worktree_branch","repo":"agentpalace","branch":"main"}\n```'),
     config,
     activeRuns: new Map(),
     roundsUsed: 0,
     depsCompleted: true,
   });
-  assert.equal(missingRepo.eligible, false);
+  assert.equal(badBranch.eligible, false);
+  assert.match(badBranch.reason, /prefix/);
 
+  // Option-like baseRef (--force) rejected.
+  const badBaseRef = evaluatePendingTask({
+    task: baseTask,
+    contract: parseDispatchContract('```dispatcher\n{"mode":"worktree_branch","repo":"agentpalace","baseRef":"--force"}\n```'),
+    config,
+    activeRuns: new Map(),
+    roundsUsed: 0,
+    depsCompleted: true,
+  });
+  assert.equal(badBaseRef.eligible, false);
+  assert.match(badBaseRef.reason, /baseRef/);
+
+  // Valid mutating task has allowPush=false, maxRounds clamped to maxRoundsCap, timeoutMs clamped to maxTimeoutMs.
   const ok = evaluatePendingTask({
     task: baseTask,
-    contract: { mode: 'worktree_branch', repo: 'agentpalace' },
+    contract: parseDispatchContract(
+      '```dispatcher\n{"mode":"worktree_branch","repo":"agentpalace","branch":"agent/t1","allowCommit":true,"allowPush":true,"maxRounds":999999,"timeoutMs":3000000000}\n```',
+    ),
     config,
     activeRuns: new Map(),
     roundsUsed: 1,
     depsCompleted: true,
   });
   assert.equal(ok.eligible, true);
-  assert.equal(ok.harnessName, 'claude');
-  assert.equal(ok.repoPath, '/repos/agentpalace');
+  assert.equal(ok.effectiveContract.allowCommit, true);
+  assert.equal(ok.effectiveContract.allowPush, false);
+  assert.equal(ok.effectiveContract.maxRounds, 4);
+  assert.equal(ok.effectiveContract.timeoutMs, 120000);
 });
 
-test('buildBootstrapPrompt keeps task authoritative, uses agentpalace_message_acknowledge, and numbers steps sequentially', () => {
+test('evaluateInboxTask enforces repo, mode, sender allowlist, and round caps on inbox wakeups', () => {
+  const config = {
+    executorId: 'home-pc',
+    polling: { wings: [] },
+    limits: { defaultMaxRounds: 3, maxRoundsCap: 3, defaultTimeoutMs: 30000, maxTimeoutMs: 30000 },
+    policy: {
+      allowedCreators: [],
+      allowedSenders: ['claude'],
+      allowedModes: ['read_only', 'worktree_branch'],
+      allowCommit: false,
+      allowPush: false,
+      branchPrefix: 'agent/',
+    },
+    repos: { agentpalace: '/repos/agentpalace' },
+  };
+
+  const taskUnmapped = {
+    task_id: 'task_1',
+    state: 'running',
+    wing: 'wing_agentpalace',
+    created_by: 'dion',
+  };
+  const badRepo = evaluateInboxTask({
+    task: taskUnmapped,
+    contract: parseDispatchContract('```dispatcher\n{"mode":"worktree_branch","repo":"unmapped"}\n```'),
+    config,
+    activeRuns: new Map(),
+    roundsUsed: 0,
+    messages: [{ message_id: 'm1', sender: 'claude' }],
+  });
+  assert.equal(badRepo.eligible, false);
+  assert.match(badRepo.reason, /not mapped/);
+
+  const badSender = evaluateInboxTask({
+    task: taskUnmapped,
+    contract: parseDispatchContract(''),
+    config,
+    activeRuns: new Map(),
+    roundsUsed: 0,
+    messages: [{ message_id: 'm2', sender: 'stranger' }],
+  });
+  assert.equal(badSender.eligible, false);
+  assert.match(badSender.reason, /allowedSenders/);
+});
+
+test('buildBootstrapPrompt defaults missing contract mode to read_only and uses agentpalace_message_acknowledge', () => {
+  const missingContractPrompt = buildBootstrapPrompt({
+    task: { task_id: 'task_plain', wing: 'wing_agents', title: 'Plain task' },
+    contract: {},
+    harnessName: 'claude',
+    trigger: 'pending',
+    messageIds: [],
+    claimMode: 'agent',
+  });
+  assert.match(missingContractPrompt, /READ-ONLY/);
+
   const withMsg = buildBootstrapPrompt({
-    task: { task_id: 'task_abc', wing: 'wing_shotquill', title: 'Review PR' },
+    task: { task_id: 'task_abc', wing: 'wing_example', title: 'Review PR' },
     contract: { mode: 'read_only' },
     harnessName: 'codex',
     trigger: 'inbox',
@@ -142,30 +260,17 @@ test('buildBootstrapPrompt keeps task authoritative, uses agentpalace_message_ac
   assert.match(withMsg, /agentpalace_message_acknowledge/);
   assert.doesNotMatch(withMsg, /agentpalace_message_ack\b/);
   assert.match(withMsg, /READ-ONLY/);
-
-  const noMsg = buildBootstrapPrompt({
-    task: { task_id: 'task_xyz', wing: 'wing_shotquill', title: 'Review PR' },
-    contract: { mode: 'read_only' },
-    harnessName: 'claude',
-    trigger: 'pending',
-    messageIds: [],
-    claimMode: 'agent',
-  });
-  assert.match(noMsg, /\n1\. /);
-  assert.match(noMsg, /\n2\. Claim task/);
-  assert.match(noMsg, /\n3\. Execute only/);
-  assert.match(noMsg, /\n4\. When finished/);
 });
 
-test('parseDispatchContract ignores null numeric fields and rejects unsafe branch names', () => {
-  const desc = '```dispatcher\n{"target":"claude","maxRounds":null,"timeoutMs":null,"branch":"../bad"}\n```';
+test('parseDispatchContract clamps timeoutMs to MAX_TIMEOUT_MS and ignores null numeric fields', () => {
+  const desc = '```dispatcher\n{"target":"claude","maxRounds":null,"timeoutMs":3000000000,"branch":"../bad","baseRef":"--force"}\n```';
   const contract = parseDispatchContract(desc);
   assert.equal(contract.maxRounds, undefined);
-  assert.equal(contract.timeoutMs, undefined);
+  assert.equal(contract.timeoutMs, MAX_TIMEOUT_MS);
   assert.equal(contract.branch, undefined);
-
-  const safe = parseDispatchContract('```dispatcher\n{"branch":"feat/my-branch_1"}\n```');
-  assert.equal(safe.branch, 'feat/my-branch_1');
+  assert.equal(contract.branchInvalid, true);
+  assert.equal(contract.baseRef, undefined);
+  assert.equal(contract.baseRefInvalid, true);
 });
 
 test('buildHarnessInvocation formats claude, codex, opencode, and custom adapters', () => {

@@ -49,10 +49,11 @@ function gracefulStopChild(child, alreadyExited, graceMs = 3000) {
   }
   return new Promise((resolve) => {
     let done = false;
+    let timer = null;
     const finish = () => {
       if (done) return;
       done = true;
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       resolve();
     };
 
@@ -74,11 +75,13 @@ function gracefulStopChild(child, alreadyExited, graceMs = 3000) {
       }
     }
 
-    const timer = setTimeout(() => {
-      if (!alreadyExited()) {
-        killProcessTree(child);
-      }
-      finish();
+    timer = setTimeout(() => {
+      void (async () => {
+        if (!alreadyExited()) {
+          await killProcessTree(child, { graceMs: 1500 });
+        }
+        finish();
+      })();
     }, graceMs);
     timer.unref?.();
   });
@@ -157,6 +160,9 @@ export async function ensurePalaceServer({
     }
     args.push('--token-file', ephemeralTokenFile);
     client.token = activeToken;
+    if (!config.palace.tokenIdentity) {
+      config.palace.tokenIdentity = 'dispatcher';
+    }
   }
 
   if (Array.isArray(auto.extraArgs) && auto.extraArgs.length > 0) {

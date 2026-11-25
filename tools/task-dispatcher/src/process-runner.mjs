@@ -4,39 +4,81 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
+import { MAX_TIMEOUT_MS } from './config.mjs';
 
 /**
  * Kill a process and its entire child process tree on both Windows and POSIX.
+ * Returns a Promise that resolves once the process tree has exited or been
+ * forcibly terminated, keeping POSIX escalation referenced so `--once` runs
+ * cannot exit with live descendants still running.
  */
-export function killProcessTree(child) {
-  if (!child || !child.pid) return;
+export function killProcessTree(child, { graceMs = 5000 } = {}) {
+  if (!child || !child.pid) return Promise.resolve();
   const pid = child.pid;
 
   if (process.platform === 'win32') {
-    execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => {
-      // Best-effort cleanup; process may already have exited.
+    return new Promise((resolve) => {
+      execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => {
+        resolve();
+      });
     });
-    return;
   }
 
+  let useGroup = true;
   try {
     // Detached POSIX children lead their own process group (-pid).
     process.kill(-pid, 'SIGTERM');
-  } catch {
+  } catch (err) {
+    if (err.code === 'ESRCH') {
+      return Promise.resolve();
+    }
+    useGroup = false;
     try {
       child.kill('SIGTERM');
     } catch {
-      // Already exited.
+      return Promise.resolve();
     }
   }
 
-  setTimeout(() => {
+  const targetPid = useGroup ? -pid : pid;
+  const isAlive = () => {
     try {
-      process.kill(-pid, 'SIGKILL');
-    } catch {
-      // Already exited.
+      process.kill(targetPid, 0);
+      return true;
+    } catch (err) {
+      return err.code === 'EPERM';
     }
-  }, 5000).unref();
+  };
+
+  return new Promise((resolve) => {
+    const deadline = Date.now() + Math.max(0, graceMs);
+    let escalated = false;
+
+    const poll = setInterval(() => {
+      if (!isAlive()) {
+        clearInterval(poll);
+        resolve();
+        return;
+      }
+      if (!escalated && Date.now() >= deadline) {
+        escalated = true;
+        try {
+          process.kill(targetPid, 'SIGKILL');
+        } catch {
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            clearInterval(poll);
+            resolve();
+            return;
+          }
+        }
+      } else if (escalated && Date.now() >= deadline + 1000) {
+        clearInterval(poll);
+        resolve();
+      }
+    }, 50);
+  });
 }
 
 /**
@@ -127,9 +169,14 @@ export async function runHarnessProcess({
   promptDelivery = 'stdin',
   timeoutMs = 1800000,
   logPath,
+  onSpawn,
 }) {
   let tempPromptFile = null;
   const finalArgs = [...args];
+  const effectiveTimeoutMs = Math.min(
+    MAX_TIMEOUT_MS,
+    Math.max(1, typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) ? Math.floor(timeoutMs) : 1800000),
+  );
 
   if (promptDelivery === 'file') {
     tempPromptFile = path.join(os.tmpdir(), `agentpalace-prompt-${process.pid}-${crypto.randomUUID()}.txt`);
@@ -155,6 +202,7 @@ export async function runHarnessProcess({
     return await new Promise((resolve) => {
       let timedOut = false;
       let settled = false;
+      let killPromise = null;
       let stdoutTail = '';
       let stderrTail = '';
       const MAX_TAIL = 4096;
@@ -173,15 +221,20 @@ export async function runHarnessProcess({
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 
+      onSpawn?.(child);
+
       const timer = setTimeout(() => {
         timedOut = true;
-        killProcessTree(child);
-      }, timeoutMs);
+        killPromise = killProcessTree(child);
+      }, effectiveTimeoutMs);
 
-      const finish = (result) => {
+      const finish = async (result) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (killPromise) {
+          await killPromise.catch(() => {});
+        }
         if (logStream) {
           logStream.write(
             `\n=== Dispatch ended at ${new Date().toISOString()} (exit=${result.exitCode}, timedOut=${result.timedOut}, durationMs=${result.durationMs}) ===\n`,
@@ -204,7 +257,7 @@ export async function runHarnessProcess({
       });
 
       child.on('error', (err) => {
-        finish({
+        void finish({
           pid: child.pid ?? null,
           exitCode: -1,
           signal: null,
@@ -218,13 +271,13 @@ export async function runHarnessProcess({
       });
 
       child.on('close', (code, signal) => {
-        finish({
+        void finish({
           pid: child.pid ?? null,
           exitCode: code ?? (timedOut ? 124 : 1),
           signal,
           timedOut,
           durationMs: Date.now() - startedAt,
-          error: timedOut ? `Process timed out after ${timeoutMs}ms` : null,
+          error: timedOut ? `Process timed out after ${effectiveTimeoutMs}ms` : null,
           stdoutTail,
           stderrTail,
           logPath: logPath ?? null,

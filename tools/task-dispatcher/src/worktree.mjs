@@ -16,6 +16,54 @@ export function sanitizeSlug(value) {
     .slice(0, 64) || 'task';
 }
 
+/**
+ * Validate that a worktree branch name starts with the configured prefix
+ * (e.g. `"agent/"`) and cannot target `main`/`master` or pass git flags.
+ */
+export function validateBranchName(branchName, branchPrefix = 'agent/') {
+  if (typeof branchName !== 'string' || !branchName.trim()) {
+    throw new Error('Branch name must be a non-empty string.');
+  }
+  const trimmed = branchName.trim();
+  if (
+    trimmed.startsWith('-') ||
+    trimmed.startsWith('/') ||
+    trimmed.endsWith('/') ||
+    trimmed.includes('..') ||
+    trimmed.includes('@{') ||
+    trimmed.endsWith('.lock') ||
+    !/^[A-Za-z0-9._/-]+$/.test(trimmed)
+  ) {
+    throw new Error(`Invalid git branch name "${branchName}".`);
+  }
+  if (branchPrefix && !trimmed.startsWith(branchPrefix)) {
+    throw new Error(`Branch "${trimmed}" must start with required prefix "${branchPrefix}".`);
+  }
+  return trimmed;
+}
+
+/**
+ * Validate a git start-point ref so option-like strings (`--force`) are rejected.
+ */
+export function validateBaseRef(baseRef) {
+  if (typeof baseRef !== 'string' || !baseRef.trim()) {
+    throw new Error('baseRef must be a non-empty string.');
+  }
+  const trimmed = baseRef.trim();
+  if (
+    trimmed.startsWith('-') ||
+    trimmed.startsWith('/') ||
+    trimmed.endsWith('/') ||
+    trimmed.includes('..') ||
+    trimmed.includes('@{') ||
+    trimmed.endsWith('.lock') ||
+    !/^[A-Za-z0-9._/-]+$/.test(trimmed)
+  ) {
+    throw new Error(`Invalid git baseRef "${baseRef}".`);
+  }
+  return trimmed;
+}
+
 async function runGit(repoPath, args) {
   const { stdout, stderr } = await execFileAsync('git', args, {
     cwd: repoPath,
@@ -28,16 +76,30 @@ async function runGit(repoPath, args) {
  * Ensure an isolated git worktree exists for `(repoPath, taskId)`.
  * Reuses an existing worktree directory if already present; otherwise creates
  * a new worktree and branch based on `baseRef` (defaulting to current `HEAD`).
+ * Refuses to check out pre-existing unmanaged branches unless
+ * `allowReuseExistingBranch` is explicitly set (i.e. tracked in dispatcher state).
  */
-export async function ensureWorktree({ repoPath, worktreeRoot, taskId, branch, baseRef = 'HEAD' }) {
+export async function ensureWorktree({
+  repoPath,
+  worktreeRoot,
+  taskId,
+  branch,
+  baseRef = 'HEAD',
+  branchPrefix = 'agent/',
+  allowReuseExistingBranch = false,
+}) {
+  if (!repoPath || typeof repoPath !== 'string') {
+    throw new Error('ensureWorktree requires a mapped repoPath.');
+  }
+
   const slug = sanitizeSlug(taskId);
   const worktreePath = path.resolve(worktreeRoot, slug);
-  const branchName = branch || `agent/${slug}`;
+  const branchName = validateBranchName(branch || `${branchPrefix}${slug}`, branchPrefix);
+  const safeBaseRef = validateBaseRef(baseRef);
 
   try {
     const stat = await fs.stat(worktreePath);
     if (stat.isDirectory()) {
-      // Verify the existing directory is actually a git worktree (has a .git marker).
       try {
         await fs.access(path.join(worktreePath, '.git'));
       } catch {
@@ -47,12 +109,18 @@ export async function ensureWorktree({ repoPath, worktreeRoot, taskId, branch, b
     }
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
-    // Does not exist yet; create it below.
   }
 
   await fs.mkdir(worktreeRoot, { recursive: true });
 
-  // Check if the target branch already exists locally.
+  // Resolve baseRef unambiguously to a commit SHA before worktree creation.
+  const { stdout: resolvedCommit } = await runGit(repoPath, [
+    'rev-parse',
+    '--verify',
+    '--end-of-options',
+    `${safeBaseRef}^{commit}`,
+  ]);
+
   let branchExists = false;
   try {
     await runGit(repoPath, ['show-ref', '--verify', '--quiet', `refs/heads/${branchName}`]);
@@ -62,9 +130,14 @@ export async function ensureWorktree({ repoPath, worktreeRoot, taskId, branch, b
   }
 
   if (branchExists) {
-    await runGit(repoPath, ['worktree', 'add', worktreePath, branchName]);
+    if (!allowReuseExistingBranch) {
+      throw new Error(
+        `Refusing to check out pre-existing unmanaged branch "${branchName}". Only dispatcher-created branches may be reused.`,
+      );
+    }
+    await runGit(repoPath, ['worktree', 'add', '--', worktreePath, branchName]);
   } else {
-    await runGit(repoPath, ['worktree', 'add', '-b', branchName, worktreePath, baseRef]);
+    await runGit(repoPath, ['worktree', 'add', '-b', branchName, worktreePath, resolvedCommit]);
   }
 
   return { worktreePath, branchName, reused: false };
@@ -74,8 +147,11 @@ export async function ensureWorktree({ repoPath, worktreeRoot, taskId, branch, b
  * Remove a worktree cleanly (optional maintenance helper).
  */
 export async function removeWorktree({ repoPath, worktreePath, force = false }) {
+  if (!repoPath || typeof repoPath !== 'string') {
+    throw new Error('removeWorktree requires a mapped repoPath.');
+  }
   const args = ['worktree', 'remove'];
   if (force) args.push('--force');
-  args.push(worktreePath);
+  args.push('--', worktreePath);
   await runGit(repoPath, args);
 }

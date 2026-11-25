@@ -44,6 +44,15 @@ test('PalaceClient sends exact /v1/coordination/* paths, queries, headers, and b
     if (req.url.startsWith('/v1/coordination/inbox?')) {
       return { status: 200, json: { messages: [{ message_id: 'msg_1', task_id: 'task_1' }], next_cursor: null } };
     }
+    if (req.url.startsWith('/v1/coordination/events?')) {
+      return {
+        status: 200,
+        json: {
+          events: [{ event_id: 'ev_1', entity_id: 'result_1', event_type: 'result_created', task_id: 'task_1' }],
+          next_cursor: null,
+        },
+      };
+    }
     if (req.url === '/v1/coordination/tasks/task_conflict/claim') {
       return { status: 409, json: { code: 'revision_conflict', message: 'revision mismatch' } };
     }
@@ -79,6 +88,11 @@ test('PalaceClient sends exact /v1/coordination/* paths, queries, headers, and b
     assert.equal(inbox.messages.length, 1);
     assert.match(seen[3].url, /recipient=claude/);
     assert.match(seen[3].url, /unacknowledged_only=true/);
+
+    const events = await client.listEvents({ taskId: 'task_1', limit: 20 });
+    assert.equal(events.events.length, 1);
+    assert.match(seen[4].url, /task_id=task_1/);
+    assert.match(seen[4].url, /limit=20/);
 
     await assert.rejects(
       () => client.claimTask('task_conflict', { expectedRevision: 1, leaseSeconds: 300, worker: 'claude' }),

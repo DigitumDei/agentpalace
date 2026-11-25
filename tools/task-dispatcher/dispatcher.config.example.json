@@ -1,11 +1,12 @@
 {
   "executorId": "home-pc",
   "palace": {
-    "baseUrl": "http://127.0.0.1:8765",
+    "baseUrl": "http://127.0.0.1:8775",
     "token": "${AGENTPALACE_TOKEN}",
+    "tokenIdentity": "",
     "requestTimeoutMs": 15000,
     "autoStart": {
-      "enabled": true,
+      "enabled": false,
       "command": "",
       "palacePath": "",
       "tokenFile": "",
@@ -22,9 +23,21 @@
   "limits": {
     "maxConcurrent": 2,
     "defaultMaxRounds": 5,
+    "maxRoundsCap": 5,
     "defaultTimeoutMs": 1800000,
+    "maxTimeoutMs": 1800000,
     "claimMode": "agent",
-    "leaseSeconds": 600
+    "dispatcherSuccessState": "input_required",
+    "leaseSeconds": 600,
+    "maxSeenMessages": 5000
+  },
+  "policy": {
+    "allowedCreators": [],
+    "allowedSenders": [],
+    "allowedModes": ["read_only", "worktree_branch"],
+    "allowCommit": false,
+    "allowPush": false,
+    "branchPrefix": "agent/"
   },
   "paths": {
     "worktreeRoot": "./.dispatcher-worktrees",
@@ -32,10 +45,18 @@
     "stateFile": "./.dispatcher-state.json"
   },
   "repos": {
-    "agentpalace": "D:/SourceCode/agentpalace",
-    "actuarius": "D:/SourceCode/Actuarius",
-    "shotquill": "D:/SourceCode/ShotQuill",
-    "wellnesswingman": "D:/SourceCode/WellnessWingman"
+    "agentpalace": {
+      "path": "../..",
+      "allowedModes": ["read_only", "worktree_branch"],
+      "allowCommit": false,
+      "allowPush": false
+    },
+    "example-app": {
+      "path": "/path/to/your/example-app",
+      "allowedModes": ["read_only", "worktree_branch", "draft_pr"],
+      "allowCommit": true,
+      "allowPush": false
+    }
   },
   "harnesses": {
     "claude": {
@@ -43,13 +64,20 @@
       "type": "claude",
       "command": "claude",
       "maxConcurrent": 1,
-      "extraArgs": []
+      "actorAliases": [],
+      "extraArgs": [
+        "--permission-mode",
+        "dontAsk",
+        "--allowedTools",
+        "Read,Glob,Grep,Bash(git *),Bash(node *),mcp__agentpalace__*"
+      ]
     },
     "codex": {
       "enabled": true,
       "type": "codex",
       "command": "codex",
       "maxConcurrent": 1,
+      "actorAliases": [],
       "extraArgs": []
     },
     "opencode": {
@@ -58,15 +86,17 @@
       "command": "opencode",
       "maxConcurrent": 1,
       "attachUrl": "",
+      "actorAliases": [],
       "extraArgs": ["--agent", "build"]
     },
-    "antigravity": {
+    "custom-agent": {
       "enabled": false,
       "type": "custom",
-      "command": "pwsh",
-      "args": ["-NoProfile", "-File", "D:/SourceCode/AntiGravityContainer/run-task.ps1", "-PromptFile", "{promptFile}"],
+      "command": "my-agent-runner",
+      "args": ["--task-id", "{taskId}", "--prompt-file", "{promptFile}"],
       "promptDelivery": "file",
-      "maxConcurrent": 1
+      "maxConcurrent": 1,
+      "actorAliases": []
     }
   },
   "notifications": {
