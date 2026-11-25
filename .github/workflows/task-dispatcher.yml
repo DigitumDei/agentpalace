@@ -1,0 +1,37 @@
+name: Task Dispatcher
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/task-dispatcher.yml"
+      - "tools/task-dispatcher/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/task-dispatcher.yml"
+      - "tools/task-dispatcher/**"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Task Dispatcher (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    defaults:
+      run:
+        working-directory: tools/task-dispatcher
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Run unit tests
+        run: node --test ./test/*.test.mjs
+      - name: Smoke test CLI help
+        run: node ./src/cli.mjs --help

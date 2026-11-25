@@ -1,0 +1,105 @@
+{
+  "executorId": "home-pc",
+  "palace": {
+    "baseUrl": "http://127.0.0.1:8775",
+    "token": "${AGENTPALACE_TOKEN}",
+    "tokenIdentity": "",
+    "requestTimeoutMs": 15000,
+    "autoStart": {
+      "enabled": false,
+      "command": "",
+      "palacePath": "",
+      "tokenFile": "",
+      "startupTimeoutMs": 120000,
+      "keepAlive": false
+    }
+  },
+  "polling": {
+    "intervalMs": 15000,
+    "wings": [],
+    "watchInbox": true,
+    "watchPendingTasks": true
+  },
+  "limits": {
+    "maxConcurrent": 2,
+    "defaultMaxRounds": 5,
+    "maxRoundsCap": 5,
+    "defaultTimeoutMs": 1800000,
+    "maxTimeoutMs": 1800000,
+    "claimMode": "agent",
+    "dispatcherSuccessState": "input_required",
+    "leaseSeconds": 600,
+    "maxSeenMessages": 5000
+  },
+  "policy": {
+    "allowedCreators": [],
+    "allowedSenders": [],
+    "allowedModes": ["read_only", "worktree_branch"],
+    "allowCommit": false,
+    "allowPush": false,
+    "branchPrefix": "agent/"
+  },
+  "paths": {
+    "worktreeRoot": "./.dispatcher-worktrees",
+    "logDir": "./.dispatcher-logs",
+    "stateFile": "./.dispatcher-state.json"
+  },
+  "repos": {
+    "agentpalace": {
+      "path": "../..",
+      "allowedModes": ["read_only", "worktree_branch"],
+      "allowCommit": false,
+      "allowPush": false
+    },
+    "example-app": {
+      "path": "/path/to/your/example-app",
+      "allowedModes": ["read_only", "worktree_branch", "draft_pr"],
+      "allowCommit": true,
+      "allowPush": false
+    }
+  },
+  "harnesses": {
+    "claude": {
+      "enabled": true,
+      "type": "claude",
+      "command": "claude",
+      "maxConcurrent": 1,
+      "actorAliases": [],
+      "extraArgs": [
+        "--permission-mode",
+        "dontAsk",
+        "--allowedTools",
+        "Read,Glob,Grep,Bash(git status*),Bash(git diff*),Bash(git log*),mcp__agentpalace__*"
+      ]
+    },
+    "codex": {
+      "enabled": true,
+      "type": "codex",
+      "command": "codex",
+      "maxConcurrent": 1,
+      "actorAliases": [],
+      "extraArgs": []
+    },
+    "opencode": {
+      "enabled": false,
+      "type": "opencode",
+      "command": "opencode",
+      "maxConcurrent": 1,
+      "attachUrl": "",
+      "actorAliases": [],
+      "extraArgs": ["--agent", "build"]
+    },
+    "custom-agent": {
+      "enabled": false,
+      "type": "custom",
+      "command": "my-agent-runner",
+      "args": ["--task-id", "{taskId}", "--prompt-file", "{promptFile}"],
+      "promptDelivery": "file",
+      "maxConcurrent": 1,
+      "actorAliases": []
+    }
+  },
+  "notifications": {
+    "webhookUrl": "${DISPATCHER_WEBHOOK_URL}"
+  }
+}

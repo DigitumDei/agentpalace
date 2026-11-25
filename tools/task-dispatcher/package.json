@@ -1,0 +1,19 @@
+{
+  "name": "@agentpalace/task-dispatcher",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cross-platform (Windows & Linux) zero-token AgentPalace task and inbox dispatcher for Claude, Codex, OpenCode, and Antigravity.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "bin": {
+    "agentpalace-dispatcher": "./src/cli.mjs"
+  },
+  "scripts": {
+    "start": "node ./src/cli.mjs",
+    "once": "node ./src/cli.mjs --once",
+    "dry-run": "node ./src/cli.mjs --once --dry-run",
+    "test": "node --test ./test/*.test.mjs"
+  }
+}
