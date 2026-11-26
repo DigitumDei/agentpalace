@@ -44,6 +44,11 @@ fi
 
 # 1. System packages.
 #    protobuf-compiler: required by agentpalace-storage via lancedb/lance.
+#    libprotobuf-dev:   ships the well-known .proto files
+#                       (google/protobuf/empty.proto and friends) that
+#                       lance-encoding's build script imports. It is only a
+#                       Recommends of protobuf-compiler, so
+#                       --no-install-recommends drops it unless it is named.
 #    build-essential:   rusqlite uses the `bundled` feature, so SQLite is
 #                       compiled from source.
 #    libssl-dev:        openssl-sys is not vendored (no openssl-src in
@@ -61,6 +66,7 @@ $SUDO apt-get install -y --no-install-recommends \
 	curl \
 	git \
 	libdbus-1-dev \
+	libprotobuf-dev \
 	libssl-dev \
 	pkg-config \
 	protobuf-compiler

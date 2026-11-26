@@ -3,7 +3,8 @@
 Everything needed to stand up a cloud sandbox — Claude Code on the web, a CI runner, or any
 fresh Linux box — that can build and test this workspace.
 
-The short version — on Ubuntu 24.04, with the domains below reachable:
+The short version — on Ubuntu 24.04, with the domains below reachable, from the repository
+root:
 
 ```bash
 bash scripts/cloud-setup.sh
@@ -39,13 +40,19 @@ extra target triples, so give the box headroom rather than the minimum.
 ## System packages
 
 ```
-build-essential ca-certificates curl git libdbus-1-dev libssl-dev pkg-config protobuf-compiler
+build-essential ca-certificates curl git libdbus-1-dev libprotobuf-dev libssl-dev pkg-config
+protobuf-compiler
 ```
 
-Four of these are load-bearing in ways the crate names don't advertise:
+Five of these are load-bearing in ways the crate names don't advertise:
 
 - **`protobuf-compiler`** (`protoc`) — required by `agentpalace-storage` through
   `lancedb` → `lance`. Without it `cargo check --workspace` fails outright.
+- **`libprotobuf-dev`** — ships the well-known `.proto` files under
+  `/usr/include/google/protobuf/`. `lance-encoding`'s build script imports
+  `google/protobuf/empty.proto`, and `protoc` alone does not carry it: the package is only a
+  *Recommends* of `protobuf-compiler`, so an install with `--no-install-recommends` (which is
+  what `scripts/cloud-setup.sh` does) leaves it out unless it is named.
 - **`build-essential`** — `rusqlite` uses the `bundled` feature, so SQLite is compiled from
   C source on every fresh machine.
 - **`libssl-dev`** — `openssl-sys` is *not* vendored (there is no `openssl-src` in
@@ -156,13 +163,19 @@ gives no Rust version and does not mention `protoc`, so the setup script is stil
 1. **Setup script.** Set it to:
 
    ```bash
-   bash scripts/cloud-setup.sh
+   if [ -d agentpalace ]; then bash agentpalace/scripts/cloud-setup.sh; fi
    ```
 
    It runs as root before Claude Code starts, and it must exit zero. The environment's
-   variables are not set yet when it runs; the script does not depend on any of them. The page
-   does not say what the working directory is, so the script changes to the repository root
-   itself.
+   variables are not set yet when it runs; the script does not depend on any of them.
+
+   **Name the script through the checkout directory.** The setup script starts in the
+   directory that holds the repository checkouts (`/home/user` when this was observed on
+   2026-11-26), not inside the repository, so a bare `bash scripts/cloud-setup.sh` exits 127
+   with "No such file or directory" and the session starts without the toolchain. The `-d`
+   guard lets a session that does not include this repository still start.
+   `cloud-setup.sh` changes to the repository root itself, so nothing else depends on the
+   working directory.
 2. **Network access.** Leave it at **Limited** with **Allow package managers** checked, and
    add to **Allowed domains**:
 
@@ -191,7 +204,7 @@ not been timed on this VM. The script prints its elapsed time and says so when i
 it does, switch the setup script to:
 
 ```bash
-bash scripts/cloud-setup.sh --no-warm-build
+if [ -d agentpalace ]; then bash agentpalace/scripts/cloud-setup.sh --no-warm-build; fi
 ```
 
 That keeps the system packages, the toolchain and the fetched crates in the snapshot and leaves
