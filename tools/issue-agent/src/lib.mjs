@@ -191,3 +191,33 @@ export function isTerminal(event) {
   }
   return false;
 }
+
+/**
+ * IDs of the paused tool calls that already have an answer on record.
+ * @param {Array<{type:string,tool_use_id?:string}>} events session history
+ * @returns {Set<string>}
+ */
+export function confirmedToolUseIds(events) {
+  const ids = new Set();
+  for (const event of events) {
+    if (event.type === 'user.tool_confirmation' && typeof event.tool_use_id === 'string') {
+      ids.add(event.tool_use_id);
+    }
+  }
+  return ids;
+}
+
+/**
+ * Run `step` until it returns true or the attempts run out, waiting between tries.
+ * @param {() => Promise<boolean>} step
+ * @param {{attempts:number,delayMs:number,sleep?:(ms:number)=>Promise<void>}} options
+ * @returns {Promise<boolean>} whether a step succeeded
+ */
+export async function pollUntil(step, { attempts, delayMs, sleep }) {
+  const wait = sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (attempt > 0) await wait(delayMs);
+    if (await step()) return true;
+  }
+  return false;
+}

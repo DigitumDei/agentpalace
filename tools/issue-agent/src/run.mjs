@@ -25,10 +25,12 @@ import {
   branchForIssue,
   budgetFromUsd,
   buildIssueMessage,
+  confirmedToolUseIds,
   idFromLock,
   isTerminal,
   outcomeDescription,
   parseArgs,
+  pollUntil,
   splitPrFile,
 } from './lib.mjs';
 
@@ -111,6 +113,8 @@ async function handle(client, sessionId, event, state) {
       if (event.evaluated_permission === 'deny') {
         console.log(`[denied by policy] ${event.name}`);
       } else if (event.evaluated_permission === 'ask') {
+        // Already answered, in this process or before a reconnect.
+        if (state.confirmed.has(event.id)) break;
         const allowed = await approve(event);
         await client.beta.sessions.events.send(sessionId, {
           events: [
@@ -124,12 +128,16 @@ async function handle(client, sessionId, event, state) {
                 },
           ],
         });
+        state.confirmed.add(event.id);
       } else {
         const detail = event.input?.command ?? event.input?.file_path ?? event.input?.pattern ?? '';
         console.log(`[${event.name}] ${String(detail).split('\n')[0].slice(0, 120)}`);
       }
       break;
     }
+    case 'user.tool_confirmation':
+      state.confirmed.add(event.tool_use_id);
+      break;
     case 'span.outcome_evaluation_end':
       console.log(`\n[grader] iteration ${event.iteration}: ${event.result}`);
       if (event.explanation) console.log(`[grader] ${event.explanation}`);
@@ -156,15 +164,27 @@ async function handle(client, sessionId, event, state) {
  */
 async function follow(client, sessionId, state) {
   const seen = new Set();
+  // An event counts as handled only once handle() returns. If answering a
+  // paused call fails mid-send, the event is handled again after the reconnect.
+  const handleOnce = async (event) => {
+    if (seen.has(event.id)) return;
+    await handle(client, sessionId, event, state);
+    seen.add(event.id);
+  };
   for (let attempt = 0; attempt <= MAX_RECONNECTS; attempt += 1) {
+    let stream;
     try {
-      const stream = await client.beta.sessions.events.stream(sessionId);
-      let finished = false;
+      stream = await client.beta.sessions.events.stream(sessionId);
+      const history = [];
       for await (const event of client.beta.sessions.events.list(sessionId)) {
-        if (!seen.has(event.id)) {
-          seen.add(event.id);
-          await handle(client, sessionId, event, state);
-        }
+        history.push(event);
+      }
+      // A confirmation that reached the server before a dropped connection is
+      // in the history; record it first so the call is not answered twice.
+      for (const id of confirmedToolUseIds(history)) state.confirmed.add(id);
+      let finished = false;
+      for (const event of history) {
+        await handleOnce(event);
         // History can hold trailing events after the final idle, so track the
         // last status change instead of the last event.
         if (isTerminal(event)) finished = true;
@@ -172,10 +192,7 @@ async function follow(client, sessionId, state) {
       }
       if (finished) return;
       for await (const event of stream) {
-        if (!seen.has(event.id)) {
-          seen.add(event.id);
-          await handle(client, sessionId, event, state);
-        }
+        await handleOnce(event);
         if (isTerminal(event)) return;
       }
       console.error('[stream] closed before the session finished, reconnecting');
@@ -185,29 +202,39 @@ async function follow(client, sessionId, state) {
       } else {
         throw error;
       }
+    } finally {
+      // Release the connection on every exit, including the early return when
+      // the history already shows the session finished. An open stream would
+      // otherwise keep the process alive.
+      stream?.controller.abort();
     }
   }
   throw new Error(`Lost the event stream ${MAX_RECONNECTS + 1} times; the session may still be running.`);
 }
 
 /** Download what the agent wrote to /mnt/session/outputs/. */
-async function fetchOutputs(client, sessionId, outDir) {
+async function fetchOutputs(client, sessionId, outDir, required) {
   await mkdir(outDir, { recursive: true });
   const saved = new Map();
-  // Outputs are indexed a moment after the session goes idle.
-  for (let attempt = 0; attempt < 5 && saved.size === 0; attempt += 1) {
-    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 2000));
-    for await (const file of client.beta.files.list({
-      scope_id: sessionId,
-      betas: [MANAGED_AGENTS_BETA],
-    })) {
-      const name = path.basename(file.filename);
-      const response = await client.beta.files.download(file.id);
-      const target = path.join(outDir, name);
-      await writeFile(target, Buffer.from(await response.arrayBuffer()));
-      saved.set(name, target);
-    }
-  }
+  // Outputs are indexed a few seconds after the session goes idle, and not
+  // necessarily all at once, so keep listing until the required file shows up.
+  await pollUntil(
+    async () => {
+      for await (const file of client.beta.files.list({
+        scope_id: sessionId,
+        betas: [MANAGED_AGENTS_BETA],
+      })) {
+        const name = path.basename(file.filename);
+        if (saved.has(name)) continue;
+        const response = await client.beta.files.download(file.id);
+        const target = path.join(outDir, name);
+        await writeFile(target, Buffer.from(await response.arrayBuffer()));
+        saved.set(name, target);
+      }
+      return saved.has(required);
+    },
+    { attempts: 8, delayMs: 2000 },
+  );
   return saved;
 }
 
@@ -292,7 +319,7 @@ async function main() {
   console.log(`Session ${session.id} started with a $${options.budgetUsd} cap.`);
   console.log(`Watch: https://platform.claude.com/workspaces/${workspace}/sessions/${session.id}\n`);
 
-  const state = { stopReason: undefined, lastOutcome: undefined };
+  const state = { stopReason: undefined, lastOutcome: undefined, confirmed: new Set() };
   await follow(client, session.id, state);
 
   const finished = await client.beta.sessions.retrieve(session.id);
@@ -310,7 +337,7 @@ async function main() {
   if (options.probe) return 0;
 
   const outDir = path.join(toolDir, 'out', `issue-${options.issue}`);
-  const outputs = await fetchOutputs(client, session.id, outDir);
+  const outputs = await fetchOutputs(client, session.id, outDir, 'pr.md');
   const prFile = outputs.get('pr.md');
   if (!prFile) {
     console.error(`The agent wrote no pr.md. Files fetched: ${[...outputs.keys()].join(', ') || 'none'}.`);

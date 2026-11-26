@@ -7,9 +7,11 @@ import {
   branchForIssue,
   budgetFromUsd,
   buildIssueMessage,
+  confirmedToolUseIds,
   idFromLock,
   isTerminal,
   parseArgs,
+  pollUntil,
   splitPrFile,
 } from '../src/lib.mjs';
 
@@ -123,4 +125,44 @@ test('isTerminal keeps waiting only while the session needs this client', () => 
     false,
   );
   assert.equal(isTerminal({ type: 'agent.message' }), false);
+});
+
+test('confirmedToolUseIds collects answered calls and ignores everything else', () => {
+  const ids = confirmedToolUseIds([
+    { type: 'agent.tool_use', id: 'sevt_1' },
+    { type: 'user.tool_confirmation', tool_use_id: 'sevt_1' },
+    { type: 'user.tool_confirmation', tool_use_id: 'sevt_1' },
+    { type: 'user.tool_confirmation' },
+    { type: 'user.message', tool_use_id: 'sevt_2' },
+  ]);
+  assert.deepEqual([...ids], ['sevt_1']);
+  assert.equal(confirmedToolUseIds([]).size, 0);
+});
+
+test('pollUntil keeps trying until the step succeeds', async () => {
+  const waits = [];
+  let calls = 0;
+  const found = await pollUntil(
+    async () => {
+      calls += 1;
+      return calls === 3;
+    },
+    { attempts: 8, delayMs: 2000, sleep: async (ms) => waits.push(ms) },
+  );
+  assert.equal(found, true);
+  assert.equal(calls, 3);
+  assert.deepEqual(waits, [2000, 2000]);
+});
+
+test('pollUntil gives up after the last attempt', async () => {
+  let calls = 0;
+  const found = await pollUntil(
+    async () => {
+      calls += 1;
+      return false;
+    },
+    { attempts: 3, delayMs: 1, sleep: async () => {} },
+  );
+  assert.equal(found, false);
+  assert.equal(calls, 3);
 });
