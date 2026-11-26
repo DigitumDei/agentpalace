@@ -29,6 +29,11 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 1
+          # Do not leave the read-only GITHUB_TOKEN in git's config. checkout
+          # v6+ keeps it in a separate credentials file that the Claude action
+          # does not clear, so `git push` went out as github-actions[bot] and
+          # was refused, instead of using the action's own app token.
+          persist-credentials: false
 
       - name: Run Claude Code
         id: claude
