@@ -23,7 +23,7 @@ links against, the same constraint that limits our Linux release target.
 
 ## Sizing
 
-675 crates in [`Cargo.lock`](../Cargo.lock), dominated by `lancedb`, `arrow`, and `ort`.
+687 crates in [`Cargo.lock`](../Cargo.lock), dominated by `lancedb`, `arrow`, and `ort`.
 
 | Resource | Recommended |
 |---|---|
@@ -42,7 +42,7 @@ extra target triples, so give the box headroom rather than the minimum.
 build-essential ca-certificates curl git libdbus-1-dev libssl-dev pkg-config protobuf-compiler
 ```
 
-Three of these are load-bearing in ways the crate names don't advertise:
+Four of these are load-bearing in ways the crate names don't advertise:
 
 - **`protobuf-compiler`** (`protoc`) — required by `agentpalace-storage` through
   `lancedb` → `lance`. Without it `cargo check --workspace` fails outright.
@@ -110,7 +110,7 @@ Add them only if you intend to run the embedding benchmarks.
 | Variable | Value | Why |
 |---|---|---|
 | `CARGO_TERM_COLOR` | `always` | Matches CI |
-| `CARGO_NET_RETRY` | `5` | A cold 675-crate fetch is unforgiving of flaky sandbox networking |
+| `CARGO_NET_RETRY` | `5` | A cold 687-crate fetch is unforgiving of flaky sandbox networking |
 | `RUST_BACKTRACE` | `1` | Useful default when a test fails |
 | `AGENTPALACE_EMBED_CACHE` | `$HOME/.cache/agentpalace/embeddings` | Matches the CI layout |
 | `AGENTPALACE_STUB_EMBEDDINGS` | `1` | Deterministic stub vectors, so the MCP/CLI/server **test suites** run fully offline |
@@ -139,26 +139,70 @@ it for that command and add the HuggingFace domains for that environment.
 
 - `AGENTPALACE_RELEASE_SIGNING_KEY` is CI-only, used for signing release manifests. It must never
   be placed in a development or cloud sandbox environment.
-- `GH_TOKEN` is only needed if the session should open pull requests or read CI logs via `gh`.
+- `GH_TOKEN` is only needed if the session should open pull requests or read CI logs via `gh`
+  on a box you run yourself. Claude Code on the web needs no token: see below.
 
 ## Setting up Claude Code on the web
 
-1. Set the environment's setup command to `bash scripts/cloud-setup.sh`.
-2. Add these to the environment's firewall configuration:
+This section follows the Claude Code
+[cloud environments](https://code.claude.com/docs/en/cloud-environments) page as it read on
+2026-11-26. Check that page if a setting here has moved.
+
+Environments are created and edited at claude.ai/code, from the environment selector under the
+message box. The VM is Ubuntu 24.04 on x86_64 with about 4 vCPUs, 16 GB of RAM and 30 GB of
+disk, which meets the sizing above. It ships `rustc`, `cargo`, GCC, `git` and `gh`; the page
+gives no Rust version and does not mention `protoc`, so the setup script is still needed.
+
+1. **Setup script.** Set it to:
+
+   ```bash
+   bash scripts/cloud-setup.sh
+   ```
+
+   It runs as root before Claude Code starts, and it must exit zero. The environment's
+   variables are not set yet when it runs; the script does not depend on any of them. The page
+   does not say what the working directory is, so the script changes to the repository root
+   itself.
+2. **Network access.** Leave it at **Limited** with **Allow package managers** checked, and
+   add to **Allowed domains**:
 
    ```
-   crates.io  index.crates.io  static.crates.io
    cdn.pyke.io
-   static.rust-lang.org  sh.rustup.rs
    ```
 
-   …plus your image's APT mirror hosts, and `github.com`/`api.github.com`/
-   `objects.githubusercontent.com` if the session should use `gh`. See the allowlist above for
-   what each one is for and when it can be dropped.
-3. Set the environment variables above.
-4. Take the snapshot **after** the setup script completes, so `~/.cargo/registry`,
-   `~/.cache/ort.pyke.io`, and `target/` are baked in. Without this, every session pays the
-   cold-build cost.
+   The default list already covers `crates.io`, `index.crates.io`, `static.crates.io`,
+   `static.rust-lang.org`, the GitHub hosts and the Ubuntu mirrors. It does not cover
+   `cdn.pyke.io`, and it lists `rustup.rs` but not `sh.rustup.rs`: add `sh.rustup.rs` too if
+   the setup log shows the script installing rustup. See the allowlist above for what each
+   host is for.
+3. **Environment variables.** Set the ones above, one `KEY=value` per line. Anyone who can use
+   the environment can read them; none of them is a secret.
+
+### Caching and the five-minute limit
+
+Claude Code snapshots the filesystem after the setup script and starts later sessions from that
+snapshot, so `~/.cargo/registry`, `~/.cache/ort.pyke.io` and `target/` are baked in. There is
+no snapshot to take by hand. The snapshot is rebuilt when the setup script or the allowed
+domains change, and about every seven days.
+
+**The setup is cached only when the script finishes within roughly five minutes.** The script
+ends with a cold `cargo check --workspace --all-targets`, which is the long pole, and it has
+not been timed on this VM. The script prints its elapsed time and says so when it ran over. If
+it does, switch the setup script to:
+
+```bash
+bash scripts/cloud-setup.sh --no-warm-build
+```
+
+That keeps the system packages, the toolchain and the fetched crates in the snapshot and leaves
+the cold check to the first build in each session. `cdn.pyke.io` must stay in the allowed
+domains either way, because that first build is what downloads ONNX Runtime.
+
+### GitHub in a cloud session
+
+GitHub access goes through a proxy, and credentials never enter the VM, so no `GH_TOKEN` is
+needed. `gh` is preinstalled, but the proxy blocks GraphQL: `gh pr` and `gh issue` commands
+fail, while `gh api` calls to REST endpoints work.
 
 [`CLAUDE.md`](../CLAUDE.md) at the repo root is picked up automatically and gives the session
 the per-package test split, the lint policy, and the offline-embeddings rule.

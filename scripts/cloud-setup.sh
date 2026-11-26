@@ -5,10 +5,37 @@
 # Idempotent: safe to re-run, and safe to use as a snapshot/setup script.
 # See docs/Cloud-Environment.md for the firewall allowlist and env vars this
 # script assumes are in place.
+#
+# Usage: bash scripts/cloud-setup.sh [--no-warm-build]
+#
+#   --no-warm-build   Fetch the dependencies but skip the cold `cargo check`.
+#                     Use it where the setup step has a time limit: Claude Code
+#                     on the web caches an environment only when its setup
+#                     script finishes within roughly five minutes.
 
 set -euo pipefail
 
 log() { printf '==> %s\n' "$*"; }
+
+WARM_BUILD=1
+for arg in "$@"; do
+	case "$arg" in
+		--no-warm-build) WARM_BUILD=0 ;;
+		-h | --help)
+			sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+			exit 0
+			;;
+		*)
+			echo "error: unknown argument: $arg" >&2
+			echo "usage: bash scripts/cloud-setup.sh [--no-warm-build]" >&2
+			exit 2
+			;;
+	esac
+done
+
+# Run from the repository root whatever the caller's working directory is, so
+# `cargo fetch --locked` finds Cargo.lock.
+cd "$(dirname "$0")/.."
 
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
@@ -23,6 +50,9 @@ fi
 #                       Cargo.lock), so it links the system OpenSSL via
 #                       pkg-config and needs the headers, which a minimal
 #                       image carrying only the runtime does not have.
+#    libdbus-1-dev:     the Linux keyring backend links dbus-1 through
+#                       pkg-config (libdbus-sys in Cargo.lock); without the
+#                       headers and dbus-1.pc the workspace check fails.
 log "Installing system packages"
 $SUDO apt-get update
 $SUDO apt-get install -y --no-install-recommends \
@@ -30,6 +60,7 @@ $SUDO apt-get install -y --no-install-recommends \
 	ca-certificates \
 	curl \
 	git \
+	libdbus-1-dev \
 	libssl-dev \
 	pkg-config \
 	protobuf-compiler
@@ -66,7 +97,20 @@ log "rustc $ACTUAL_RUST"
 log "Fetching dependencies"
 cargo fetch --locked
 
-log "Warming the build (this is the long pole on a cold box)"
-cargo check --workspace --all-targets --locked
+if [ "$WARM_BUILD" -eq 1 ]; then
+	log "Warming the build (this is the long pole on a cold box)"
+	cargo check --workspace --all-targets --locked
+else
+	log "Skipping the warm build (--no-warm-build); the first cargo check in a session is cold"
+fi
 
-log "Cloud environment ready"
+# Claude Code on the web keeps the result of a setup script only when it
+# finishes within roughly five minutes. Report the time so that is visible.
+ELAPSED="$SECONDS"
+log "Cloud environment ready in ${ELAPSED}s"
+if [ "$ELAPSED" -gt 300 ]; then
+	log "Over five minutes: Claude Code on the web will not cache this setup."
+	if [ "$WARM_BUILD" -eq 1 ]; then
+		log "Pass --no-warm-build to leave the cold check to the session."
+	fi
+fi
