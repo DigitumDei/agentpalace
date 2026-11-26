@@ -429,6 +429,23 @@ Operational guidance:
 - Back up `storage.sqlite3` and `lancedb/` together.
 - Do not back up only one side of the storage layout and assume point-in-time consistency.
 
+Opening a palace reconciles interrupted ingest runs in `storage.sqlite3`'s `ingest_runs`
+table. Runs untouched for more than one hour are handled as follows:
+
+- A `pending` run is marked `failed` (`WARN marking stale pending ingest run as failed`).
+  Its uncommitted drawers and diary summaries are removed.
+- A `failed` diary run has its uncommitted drawers and diary summaries removed, then moves
+  to the terminal `finalized` status (`WARN finalizing stale failed diary ingest run`).
+  Each run logs this warning once; later opens skip it. The row and its `failed_reason`
+  stay for diagnosis.
+
+A stale `pending` diary run goes through both steps on two separate opens. The first open
+removes its leftovers, marks it `failed` and logs the first warning. An open at least an
+hour later selects it again as a stale failed diary run, removes any leftovers again,
+finalizes it and logs the second warning. Both warnings for the same `run_id` are expected.
+
+Older binaries ignore `finalized` rows, so downgrading does not require any cleanup.
+
 ## Durable Replication Recovery
 
 `write: both` federation routes are asynchronous and durable (issue #127): the

@@ -1269,6 +1269,30 @@ impl IngestManifestStore for SqliteOperationalStore {
 }
 
 impl SqliteOperationalStore {
+    /// Move a failed run to the terminal `finalized` status once reconcile
+    /// has cleaned up after it, so `stale_failed_diary_runs` stops selecting
+    /// it. Only a run that is still `failed` changes; returns whether this
+    /// call changed it, so a concurrent caller that lost the race knows.
+    ///
+    /// `failed_reason` is kept, and the run's `ingest_manifests` rows are
+    /// intentionally left at `failed`: they record how the run's chunks ended,
+    /// which finalizing does not change. Unlike `mark_run_failed` and
+    /// `mark_run_committed`, the run and manifest statuses therefore differ
+    /// for finalized runs, so do not match runs to manifests on equal status.
+    pub fn mark_run_finalized(&self, run_id: i64, finalized_at: OffsetDateTime) -> Result<bool> {
+        let connection = self.open_connection()?;
+        let changed = connection.execute(
+            "UPDATE ingest_runs SET status = ?2, updated_at = ?3 WHERE id = ?1 AND status = ?4",
+            params![
+                run_id,
+                IngestRunStatus::Finalized.as_str(),
+                encode_time(finalized_at),
+                IngestRunStatus::Failed.as_str()
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Return stale (older than `older_than`) failed diary runs with their
     /// manifest drawer IDs.  Used by startup reconciliation to clean up
     /// orphaned diary summaries and drawers from previous failed writes.
@@ -2548,6 +2572,7 @@ fn parse_status(raw: String) -> rusqlite::Result<IngestRunStatus> {
         "pending" => Ok(IngestRunStatus::Pending),
         "committed" => Ok(IngestRunStatus::Committed),
         "failed" => Ok(IngestRunStatus::Failed),
+        "finalized" => Ok(IngestRunStatus::Finalized),
         _ => Err(rusqlite::Error::FromSqlConversionFailure(
             0,
             rusqlite::types::Type::Text,
@@ -3267,6 +3292,94 @@ mod tests {
         store.mark_run_failed(run.id, "interrupted", datetime!(2026-04-11 00:05:00 UTC)).unwrap();
         let stale_after = store.stale_pending_runs(datetime!(2026-04-12 00:00:00 UTC)).unwrap();
         assert!(stale_after.is_empty());
+    }
+
+    #[test]
+    fn parse_status_round_trips_every_status() {
+        for status in [
+            IngestRunStatus::Pending,
+            IngestRunStatus::Committed,
+            IngestRunStatus::Failed,
+            IngestRunStatus::Finalized,
+        ] {
+            assert_eq!(super::parse_status(status.as_str().to_owned()).unwrap(), status);
+        }
+        assert!(super::parse_status("bogus".to_owned()).is_err());
+    }
+
+    #[test]
+    fn finalized_diary_runs_are_not_selected_again() {
+        let tempdir = tempdir().unwrap();
+        let store = SqliteOperationalStore::new(tempdir.path().join("storage.sqlite3"));
+        store.ensure_schema().unwrap();
+
+        let manifest = |id: &str| IngestManifestEntry {
+            run_id: 0,
+            drawer_id: DrawerId::new(id).unwrap(),
+            source_file: "diary:test".to_owned(),
+            content_hash: "hash".to_owned(),
+            status: IngestRunStatus::Pending,
+        };
+        let failed = store
+            .create_pending_run(
+                "diary",
+                "diary:failed_entry",
+                &[manifest("failed_entry")],
+                datetime!(2026-04-10 00:00:00 UTC),
+            )
+            .unwrap();
+        store
+            .mark_run_failed(failed.id, "interrupted", datetime!(2026-04-10 01:00:00 UTC))
+            .unwrap();
+        let pending = store
+            .create_pending_run(
+                "diary",
+                "diary:pending_entry",
+                &[manifest("pending_entry")],
+                datetime!(2026-04-10 00:00:00 UTC),
+            )
+            .unwrap();
+
+        let stale = store.stale_failed_diary_runs(datetime!(2026-04-11 00:00:00 UTC)).unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].run.id, failed.id);
+
+        let finalized_at = datetime!(2026-04-11 00:10:00 UTC);
+        assert!(store.mark_run_finalized(failed.id, finalized_at).unwrap());
+        // A second caller (e.g. a concurrent reconcile) changes nothing.
+        assert!(!store.mark_run_finalized(failed.id, finalized_at).unwrap());
+        // Only a failed run is finalized; a pending one is left alone.
+        assert!(!store.mark_run_finalized(pending.id, finalized_at).unwrap());
+
+        assert!(
+            store.stale_failed_diary_runs(datetime!(2030-01-01 00:00:00 UTC)).unwrap().is_empty()
+        );
+        let still_pending = store.stale_pending_runs(datetime!(2030-01-01 00:00:00 UTC)).unwrap();
+        assert_eq!(still_pending.len(), 1);
+        assert_eq!(still_pending[0].run.id, pending.id);
+
+        let (status, reason): (String, Option<String>) = store
+            .open_connection()
+            .unwrap()
+            .query_row(
+                "SELECT status, failed_reason FROM ingest_runs WHERE id = ?1",
+                [failed.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(super::parse_status(status).unwrap(), IngestRunStatus::Finalized);
+        assert_eq!(reason.as_deref(), Some("interrupted"), "failure reason is kept");
+
+        let manifest_status: String = store
+            .open_connection()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM ingest_manifests WHERE run_id = ?1",
+                [failed.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(manifest_status, "failed", "manifest rows keep their failed status");
     }
 
     #[test]
