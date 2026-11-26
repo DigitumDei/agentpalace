@@ -106,7 +106,7 @@ These apply only when building from source — the prebuilt stable or nightly in
 
 - Rust 1.88+
 - `protobuf-compiler` (for storage layer)
-- On Linux, also a C toolchain, `pkg-config`, `libssl-dev` and `libdbus-1-dev`; see [docs/Cloud-Environment.md](docs/Cloud-Environment.md#system-packages) for why each is needed
+- On Linux, also a C toolchain, `pkg-config`, `libprotobuf-dev`, `libssl-dev` and `libdbus-1-dev`; see [docs/Cloud-Environment.md](docs/Cloud-Environment.md#system-packages) for why each is needed
 
 ONNX Runtime is downloaded by the build and statically linked into the executable.
 

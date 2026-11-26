@@ -3,7 +3,8 @@
 Everything needed to stand up a cloud sandbox — Claude Code on the web, a CI runner, or any
 fresh Linux box — that can build and test this workspace.
 
-The short version — on Ubuntu 24.04, with the domains below reachable:
+The short version — on Ubuntu 24.04, with the domains below reachable, from the repository
+root:
 
 ```bash
 bash scripts/cloud-setup.sh
