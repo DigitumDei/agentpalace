@@ -4,3 +4,7 @@
 demo-hub/.env
 demo-hub/secrets/
 demo-hub/local/
+
+# Local agent worktrees and deployment scratch; never part of the repository.
+.worktrees/
+.deployment/
