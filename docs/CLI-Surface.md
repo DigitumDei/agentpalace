@@ -264,7 +264,8 @@ Flags:
 Behavior:
 - Each result prints its drawer ID as `ID:     <drawer_id>` on the line after `Source:`, the
   same value MCP `agentpalace_search` returns as `drawer_id`, so a found drawer can be passed
-  to a delete. The line is omitted for a result that has no drawer ID.
+  to MCP `agentpalace_delete_drawer`. The CLI has no command that deletes a drawer by ID.
+  The line is omitted for a result that has no drawer ID.
 - Each result prints when it was written: `Filed:  YYYY-MM-DD HH:MM UTC`, or `Mined:` for
   rows from `projects`/`convos` mining (whose time is the mining time, not when the content
   was authored), plus `Dated:  YYYY-MM-DD` when the drawer records an authored date. Age is
