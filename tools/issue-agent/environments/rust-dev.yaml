@@ -1,0 +1,31 @@
+# Sandbox for the issue-to-PR agent (agents/issue-to-pr.md).
+#
+# The container ships rustc, cargo, cc and git but not protoc (probe run of
+# 2026-11-26), so the apt list mirrors what .github/workflows/ci.yml installs.
+#
+# Networking is deny-by-default. The agent declares no MCP servers and has both
+# web tools off, so the only egress it needs is for building the workspace.
+# `cargo fetch --locked` succeeded with this host list; it is not yet known
+# which entries allow_package_managers already covers. cdn.pyke.io serves the
+# ONNX Runtime binary that the `ort-sys` build script downloads: without it the
+# first issue run (#109) had to set ORT_SKIP_DOWNLOAD=1 for check and clippy,
+# and could not have linked tests for the crates that depend on embeddings.
+name: agentpalace-rust-dev
+description: Cloud sandbox with limited networking for building and testing the AgentPalace Rust workspace.
+config:
+  type: cloud
+  packages:
+    apt:
+      - protobuf-compiler
+      - libdbus-1-dev
+      - pkg-config
+  networking:
+    type: limited
+    allow_package_managers: true
+    allowed_hosts:
+      - static.rust-lang.org
+      - sh.rustup.rs
+      - crates.io
+      - static.crates.io
+      - index.crates.io
+      - cdn.pyke.io

@@ -1,0 +1,5 @@
+node_modules/
+out/
+# Written by `ant apply`. It records IDs from the contributor's own Claude
+# workspace, which are no use to anyone else, so it stays local.
+claude-lock.json
