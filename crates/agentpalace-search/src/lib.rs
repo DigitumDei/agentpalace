@@ -620,6 +620,9 @@ pub fn render_search_results(
             result.room.as_str()
         ));
         lines.push(format!("      Source: {}", result.source_file));
+        if let Some(drawer_id) = result.drawer_id.as_ref().map(|id| id.as_str()) {
+            lines.push(format!("      ID:     {drawer_id}"));
+        }
         if let Some(filed_at) = result.filed_at {
             // Mined rows carry ingest time, which says nothing about authorship.
             let label = if result.ingest_mode.as_deref().is_some_and(is_mined_ingest_mode) {
@@ -2016,7 +2019,7 @@ mod tests {
             "auth migration parity",
             &[
                 agentpalace_core::SearchResult {
-                    drawer_id: None,
+                    drawer_id: Some(agentpalace_core::DrawerId::new("drawer_abc123").unwrap()),
                     wing: WingId::new("wing_team").unwrap(),
                     room: RoomId::new("auth-migration").unwrap(),
                     score: 0.49,
@@ -2056,6 +2059,9 @@ mod tests {
         assert!(rendered.contains("[1] wing_team / auth-migration"));
         assert!(rendered.contains("Match:  0.49"));
         assert!(rendered.contains("Match:  0.069"));
+        // Only the first result has an id; the second must not print an empty ID line.
+        assert_eq!(rendered.matches("ID:     ").count(), 1);
+        assert!(rendered.contains("      Source: team.txt\n      ID:     drawer_abc123\n"));
     }
 
     #[test]
