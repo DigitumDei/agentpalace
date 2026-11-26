@@ -89,6 +89,9 @@ pub enum IngestRunStatus {
     Pending,
     Committed,
     Failed,
+    /// A failed diary run whose leftovers reconcile has already cleaned up.
+    /// Terminal: reconcile never selects it again.
+    Finalized,
 }
 
 impl IngestRunStatus {
@@ -97,6 +100,7 @@ impl IngestRunStatus {
             Self::Pending => "pending",
             Self::Committed => "committed",
             Self::Failed => "failed",
+            Self::Finalized => "finalized",
         }
     }
 }

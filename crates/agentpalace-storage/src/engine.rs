@@ -373,9 +373,12 @@ impl StorageEngine {
             )?;
         }
 
-        // Log stale failed diary runs that were cleaned up.
+        // Stale failed diary runs are cleaned up; move them to the terminal
+        // `finalized` status so later reconciles do not select them again.
         for retryable in stale_failed_diary {
             warn!(run_id = retryable.run.id, "finalizing stale failed diary ingest run");
+            self.operational_store
+                .mark_run_finalized(retryable.run.id, OffsetDateTime::now_utc())?;
         }
 
         Ok(())
@@ -1594,6 +1597,17 @@ mod tests {
         // Drawer should be pruned.
         let drawers = engine.drawer_store().list_drawers(&DrawerFilter::default()).await.unwrap();
         assert!(drawers.is_empty(), "drawer should be pruned by reconcile");
+
+        // The run is finalized, so no cutoff selects it again (issue #109).
+        let far_future = time::OffsetDateTime::now_utc() + time::Duration::days(1);
+        assert!(
+            engine.operational_store().stale_failed_diary_runs(far_future).unwrap().is_empty(),
+            "reconcile must move the cleaned-up run out of the failed status"
+        );
+
+        // A second reconcile has nothing left to finalize.
+        engine.reconcile().await.unwrap();
+        assert!(engine.operational_store().stale_failed_diary_runs(far_future).unwrap().is_empty());
     }
 
     // ─── replace_source_drawers tests ─────────────────────────────────────────
