@@ -439,6 +439,11 @@ table. Runs untouched for more than one hour are handled as follows:
   Each run logs this warning once; later opens skip it. The row and its `failed_reason`
   stay for diagnosis.
 
+A stale `pending` diary run goes through both steps on two separate opens. The first open
+removes its leftovers, marks it `failed` and logs the first warning. An open at least an
+hour later selects it again as a stale failed diary run, removes any leftovers again,
+finalizes it and logs the second warning. Both warnings for the same `run_id` are expected.
+
 Older binaries ignore `finalized` rows, so downgrading does not require any cleanup.
 
 ## Durable Replication Recovery

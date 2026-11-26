@@ -375,10 +375,15 @@ impl StorageEngine {
 
         // Stale failed diary runs are cleaned up; move them to the terminal
         // `finalized` status so later reconciles do not select them again.
+        // Only the process whose update changed the row logs, so a run
+        // finalized by two processes opening the palace at once warns once.
         for retryable in stale_failed_diary {
-            warn!(run_id = retryable.run.id, "finalizing stale failed diary ingest run");
-            self.operational_store
-                .mark_run_finalized(retryable.run.id, OffsetDateTime::now_utc())?;
+            if self
+                .operational_store
+                .mark_run_finalized(retryable.run.id, OffsetDateTime::now_utc())?
+            {
+                warn!(run_id = retryable.run.id, "finalizing stale failed diary ingest run");
+            }
         }
 
         Ok(())
