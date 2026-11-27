@@ -42,7 +42,7 @@ Each claim is labelled *traced* (read in the code at `main` 7dd887d, file and li
 | 2 | Only HTTP-server writes populate it. Local MCP writes always store `provenance: None`, so every locally filed drawer has none. | traced, `crates/agentpalace-mcp/src/lib.rs:4928`; `crates/agentpalace-server/src/lib.rs:1967` |
 | 3 | The search core puts provenance into `SearchResult`, but both local MCP search formatters drop it. Local results have no attribution at all. | traced, `crates/agentpalace-search/src/lib.rs:452`; `crates/agentpalace-mcp/src/lib.rs:3220` (combined), `:3304` (local only) |
 | 4 | `added_by`, the only attribution a local drawer has, is not in `SearchResult`, so no search output shows it. The HTTP server sends `added_by: None` on every result. | traced, `crates/agentpalace-core/src/search.rs:163`; `crates/agentpalace-server/src/lib.rs:1738` |
-| 5 | The HTTP server stores `added_by` as `"<token name>:<claimed name>"`. That one string mixes the credential-authenticated token identity with a caller assertion. It does not set `creator.agent`. | traced, `crates/agentpalace-server/src/lib.rs:1790`, `:2361` |
+| 5 | The HTTP server stores `added_by` in one of two shapes. It is `"<token name>:<claimed name>"` when the caller claims a name that differs from the token name, and the bare token name when no name is claimed or the claimed name equals it. Callers using a local `added_by` send it as the claimed name, so either shape can appear. In the joined form, one string mixes the credential-authenticated token identity with a caller assertion. In the bare form, the value is the credential identity and carries no caller claim at all. A claimed name containing `:` makes the joined form ambiguous. Token names have been rejected if they contain `:` since 95bbe9a (2026-09-19), but nothing on a stored row says whether that rule applied when it was written. The server does not set `creator.agent`. | traced, `crates/agentpalace-server/src/lib.rs:1790-1792`, `:644`, `:2361` |
 | 6 | Every palace calls itself `StorageOrigin::Local { origin_id: "local" }`. A remote result's `storage_origin` arrives at the client as `local`, meaning local to the hub, and the client passes it through unchanged. | traced, `crates/agentpalace-server/src/lib.rs:2361`; `crates/agentpalace-mcp/src/federation.rs:2806` |
 | 7 | The meaning of `StorageOrigin` is itself unclear. The enum doc says "where a record was originally created", but `PersistedProvenance.storage_origin` says "where this copy is stored". Those are two different facts, and #191 needs both. | traced, `crates/agentpalace-core/src/provenance.rs:1557`, `:2181` |
 | 8 | Two origin spellings. Drawer search annotates `origin` as `local` or the bare remote name (`alpha`), while the change feed and wake-up use `remote:<name>`. `docs/Federation.md` documents both. | traced, `crates/agentpalace-mcp/src/federation.rs:2585`, `:2806`; `docs/Federation.md` lines 46 and 927 |
@@ -103,9 +103,16 @@ no storage migration (but see open question 2).
    source. This is item 5.
 2. **Never upgrade.** An owner is `authenticated` only when stored provenance says so. Legacy rows
    and rows without stored provenance report `owner.status: "unknown"`. A legacy `added_by` is
-   reported verbatim as one `caller_asserted` agent. That includes a hub row's `"alice:claude"`,
-   because a claimed name can itself contain `:`. A label is never split after the fact into a
-   credential identity. This is item 4.
+   reported verbatim as one `caller_asserted` agent, whatever its shape (finding 5):
+   - a local label such as `"claude"`;
+   - a hub row's joined `"alice:claude"`. This is not split, because a claimed name can contain
+     `:` and a row does not say whether the token-name rule applied when it was written;
+   - a hub row's bare token name `"alice"`. This is really a credential identity, but it cannot be
+     told apart from a claimed name, so it is still reported as an asserted label and is never
+     promoted to `credential`.
+
+   `credential` is filled only from structured stored provenance written by 0.3 or later. Under-
+   claiming authentication for old rows is the safe direction. This is item 4.
 3. **Credential and agent are separate fields.** `credential` is the identity that the transport
    authenticated: on the HTTP server, the token name, with assurance
    `credential_authenticated`. It identifies the holder of a token, not a human or a model.
@@ -167,8 +174,9 @@ deliberate for one release; open question 4 asks whether `origin` changes spelli
   load. **Downgrade risk:** the wire types use `deny_unknown_fields`, so an older binary would
   reject a row written by 0.3. That is acceptable for 0.3 and will be named in the release notes.
 - HTTP `POST /v1/drawers` stores `creator.credential = <token name>` and
-  `creator.agent = <claimed added_by>` (caller asserted). The legacy `added_by` column keeps its
-  current `"<token>:<claimed>"` value so nothing that reads it breaks.
+  `creator.agent = <claimed added_by>` (caller asserted, and absent when no name is claimed or
+  the claimed name equals the token name). The legacy `added_by` column keeps its current value,
+  in either shape from finding 5, so nothing that reads it breaks.
 - `StorageOrigin` docs are corrected. The stored field means content origin ("first filed"), and
   "held by" is never stored (finding 7).
 
@@ -177,7 +185,10 @@ deliberate for one release; open question 4 asks whether `origin` changes spelli
 - Legacy row with no stored provenance: `owner.status: unknown`, verbatim asserted agent, nulls
   present; identical on local MCP, HTTP, and through a remote.
 - Hub write with a token and a claimed `added_by`: `credential` is authenticated, `agent` is
-  asserted, never merged. A legacy hub row with `"alice:claude"` stays one asserted label.
+  asserted, never merged. Hub write with no claimed name, or a claimed name equal to the token:
+  `credential` set and `agent: null`.
+- Legacy hub rows in all three shapes, `"alice:claude"`, `"alice:a:b"` (claimed name with a colon)
+  and bare `"alice"`: each stays one asserted label, verbatim, with `credential: null`.
 - Copied external content: `source.refs` and `source.author` survive local MCP → HTTP → MCP client
   merge unchanged inside `upstream`, and the outer object reports `federated(remote:<name>)`.
 - Old server (no `provenance_v1`): result reports `federated(remote:<name>)`, with the old
